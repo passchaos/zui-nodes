@@ -88,166 +88,6 @@ fn compatiblePortTypes(value: anytype) []const NodeEditorPortType {
     return if (@TypeOf(value) == []const NodeEditorPortType) value else &.{};
 }
 
-const core_port_any = [_]zui.NodeEditorPortType{.any};
-const core_port_flow = [_]zui.NodeEditorPortType{.flow};
-const core_port_float = [_]zui.NodeEditorPortType{.float};
-const core_port_vector = [_]zui.NodeEditorPortType{.vector};
-const core_port_color = [_]zui.NodeEditorPortType{.color};
-const core_port_image = [_]zui.NodeEditorPortType{.image};
-const core_port_mask = [_]zui.NodeEditorPortType{.mask};
-const core_port_geometry = [_]zui.NodeEditorPortType{.geometry};
-
-pub fn coreSelectionStateFrom(value: @import("commands.zig").SelectionCommandState) zui.SelectionCommandState {
-    return .{
-        .selected_id = value.selected_id,
-        .last_renamed_id = value.last_renamed_id,
-        .last_deleted_id = value.last_deleted_id,
-        .last_duplicated_id = value.last_duplicated_id,
-        .last_focused_id = value.last_focused_id,
-        .duplicate_count = value.duplicate_count,
-    };
-}
-
-pub fn selectionStateFromCore(value: zui.SelectionCommandState) @import("commands.zig").SelectionCommandState {
-    return .{
-        .selected_id = value.selected_id,
-        .last_renamed_id = value.last_renamed_id,
-        .last_deleted_id = value.last_deleted_id,
-        .last_duplicated_id = value.last_duplicated_id,
-        .last_focused_id = value.last_focused_id,
-        .duplicate_count = value.duplicate_count,
-    };
-}
-
-pub fn corePortTypeFrom(value: NodeEditorPortType) zui.NodeEditorPortType {
-    return switch (value) {
-        .any => .any,
-        .flow => .flow,
-        .float => .float,
-        .vector => .vector,
-        .color => .color,
-        .image => .image,
-        .mask => .mask,
-        .geometry => .geometry,
-    };
-}
-
-pub fn corePortTypesFrom(value: []const NodeEditorPortType) []const zui.NodeEditorPortType {
-    if (value.len == 0) return &.{};
-    if (value.len == 1) return switch (value[0]) {
-        .any => &core_port_any,
-        .flow => &core_port_flow,
-        .float => &core_port_float,
-        .vector => &core_port_vector,
-        .color => &core_port_color,
-        .image => &core_port_image,
-        .mask => &core_port_mask,
-        .geometry => &core_port_geometry,
-    };
-    return &.{};
-}
-
-pub fn coreNodeFrom(value: NodeEditorNode) zui.NodeEditorNode {
-    return .{
-        .id = value.id,
-        .title = value.title,
-        .pos = value.pos,
-        .size = value.size,
-        .color = value.color,
-        .input_count = value.input_count,
-        .output_count = value.output_count,
-        .input_labels = value.input_labels,
-        .output_labels = value.output_labels,
-        .input_types = corePortTypesFrom(value.input_types),
-        .output_types = corePortTypesFrom(value.output_types),
-    };
-}
-
-pub fn coreConnectionFrom(value: NodeEditorConnection) zui.NodeEditorConnection {
-    return .{ .from_id = value.from_id, .to_id = value.to_id, .from_port = value.from_port, .to_port = value.to_port, .color = value.color };
-}
-
-pub fn coreGroupFrom(value: NodeEditorGroup) zui.NodeEditorGroup {
-    return .{
-        .id = value.id,
-        .title = value.title,
-        .rect = value.rect,
-        .color = value.color,
-        .border_color = value.border_color,
-        .text_color = value.text_color,
-        .title_height = value.title_height,
-        .radius = value.radius,
-    };
-}
-
-pub fn coreTemplateFrom(value: NodeEditorNodeTemplate) zui.NodeEditorNodeTemplate {
-    return .{
-        .title = value.title,
-        .size = value.size,
-        .color = value.color,
-        .input_count = value.input_count,
-        .output_count = value.output_count,
-        .input_labels = value.input_labels,
-        .output_labels = value.output_labels,
-        .input_types = corePortTypesFrom(value.input_types),
-        .output_types = corePortTypesFrom(value.output_types),
-    };
-}
-
-pub fn coreChainTemplateFrom(nodes: []const NodeEditorNodeTemplate, connections: []const NodeEditorConnection, core_nodes: []zui.NodeEditorNodeTemplate, core_connections: []zui.NodeEditorConnection, start_pos: [2]f32, node_gap: [2]f32) zui.NodeEditorChainTemplate {
-    _ = copyCoreTemplatesFrom(nodes, core_nodes);
-    _ = copyCoreConnectionsFrom(connections, core_connections);
-    return .{ .nodes = core_nodes[0..@min(nodes.len, core_nodes.len)], .connections = core_connections[0..@min(connections.len, core_connections.len)], .start_pos = start_pos, .node_gap = node_gap };
-}
-
-pub fn copyCoreNodesFrom(source: []const NodeEditorNode, out: []zui.NodeEditorNode) usize {
-    const count = @min(source.len, out.len);
-    for (source[0..count], 0..) |item, index| out[index] = coreNodeFrom(item);
-    return count;
-}
-
-pub fn copyCoreConnectionsFrom(source: []const NodeEditorConnection, out: []zui.NodeEditorConnection) usize {
-    const count = @min(source.len, out.len);
-    for (source[0..count], 0..) |item, index| out[index] = coreConnectionFrom(item);
-    return count;
-}
-
-pub fn copyCoreGroupsFrom(source: []const NodeEditorGroup, out: []zui.NodeEditorGroup) usize {
-    const count = @min(source.len, out.len);
-    for (source[0..count], 0..) |item, index| out[index] = coreGroupFrom(item);
-    return count;
-}
-
-pub fn copyCoreTemplatesFrom(source: []const NodeEditorNodeTemplate, out: []zui.NodeEditorNodeTemplate) usize {
-    const count = @min(source.len, out.len);
-    for (source[0..count], 0..) |item, index| out[index] = coreTemplateFrom(item);
-    return count;
-}
-
-pub fn coreClipboardFrom(value: node_editor.Clipboard) zui.NodeEditorClipboard {
-    var out = zui.NodeEditorClipboard{};
-    out.node_len = @min(value.node_len, out.nodes.len);
-    out.connection_len = @min(value.connection_len, out.connections.len);
-    if (out.node_len > 0) _ = copyCoreNodesFrom(value.nodes[0..out.node_len], &out.nodes);
-    if (out.connection_len > 0) _ = copyCoreConnectionsFrom(value.connections[0..out.connection_len], &out.connections);
-    out.source_ids = value.source_ids;
-    out.copied_bounds = value.copied_bounds;
-    out.paste_count = value.paste_count;
-    return out;
-}
-
-pub fn clipboardFromCore(value: zui.NodeEditorClipboard) node_editor.Clipboard {
-    var out = node_editor.Clipboard{};
-    out.node_len = @min(value.node_len, out.nodes.len);
-    out.connection_len = @min(value.connection_len, out.connections.len);
-    if (out.node_len > 0) _ = copyNodesFrom(zui.NodeEditorNode, value.nodes[0..out.node_len], &out.nodes);
-    if (out.connection_len > 0) _ = copyConnectionsFrom(zui.NodeEditorConnection, value.connections[0..out.connection_len], &out.connections);
-    out.source_ids = value.source_ids;
-    out.copied_bounds = value.copied_bounds;
-    out.paste_count = value.paste_count;
-    return out;
-}
-
 pub fn copyNodesFrom(comptime SourceNode: type, source: []const SourceNode, out: []NodeEditorNode) usize {
     const count = @min(source.len, out.len);
     for (source[0..count], 0..) |item, index| out[index] = nodeFrom(item);
@@ -266,48 +106,30 @@ pub fn copyGroupsFrom(comptime SourceGroup: type, source: []const SourceGroup, o
     return count;
 }
 
-test "zui-nodes adapters convert zui core node editor model values" {
-    const core_nodes = [_]zui.NodeEditorNode{
+test "zui-nodes adapters copy native node editor model values" {
+    const source_nodes = [_]NodeEditorNode{
         .{ .id = 1, .title = "A", .pos = .{ 0, 0 }, .output_types = &.{.image} },
         .{ .id = 2, .title = "B", .pos = .{ 100, 0 }, .input_types = &.{.image} },
     };
-    const core_connections = [_]zui.NodeEditorConnection{
+    const source_connections = [_]NodeEditorConnection{
         .{ .from_id = 1, .to_id = 2 },
     };
-    const core_groups = [_]zui.NodeEditorGroup{
+    const source_groups = [_]NodeEditorGroup{
         .{ .id = 7, .title = "Group", .rect = .{ .x = 0, .y = 0, .w = 120, .h = 80 } },
     };
     var nodes: [2]NodeEditorNode = undefined;
     var connections: [1]NodeEditorConnection = undefined;
     var groups: [1]NodeEditorGroup = undefined;
 
-    try @import("std").testing.expectEqual(@as(usize, 2), copyNodesFrom(zui.NodeEditorNode, &core_nodes, &nodes));
-    try @import("std").testing.expectEqual(@as(usize, 1), copyConnectionsFrom(zui.NodeEditorConnection, &core_connections, &connections));
-    try @import("std").testing.expectEqual(@as(usize, 1), copyGroupsFrom(zui.NodeEditorGroup, &core_groups, &groups));
+    try @import("std").testing.expectEqual(@as(usize, 2), copyNodesFrom(NodeEditorNode, &source_nodes, &nodes));
+    try @import("std").testing.expectEqual(@as(usize, 1), copyConnectionsFrom(NodeEditorConnection, &source_connections, &connections));
+    try @import("std").testing.expectEqual(@as(usize, 1), copyGroupsFrom(NodeEditorGroup, &source_groups, &groups));
     try @import("std").testing.expectEqual(@as(u32, 1), nodes[0].id);
-    const core_selection = zui.SelectionCommandState{ .selected_id = 2, .duplicate_count = 3 };
-    const extension_selection = selectionStateFromCore(core_selection);
-    try @import("std").testing.expectEqual(core_selection.selected_id, extension_selection.selected_id);
-    try @import("std").testing.expectEqual(core_selection.duplicate_count, coreSelectionStateFrom(extension_selection).duplicate_count);
-    try @import("std").testing.expectEqual(NodeEditorPortType.image, portTypeFrom(core_nodes[0].output_types[0]));
-    const native_node = NodeEditorNode{ .id = 9, .title = "Native", .pos = .{ 0, 0 }, .output_types = &.{.image} };
-    try @import("std").testing.expectEqual(zui.NodeEditorPortType.image, corePortTypeFrom(native_node.output_types[0]));
-    try @import("std").testing.expectEqual(@as(usize, 1), coreNodeFrom(native_node).output_types.len);
+    try @import("std").testing.expectEqual(NodeEditorPortType.image, portTypeFrom(source_nodes[0].output_types[0]));
     try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
-    var core_node_out: [2]zui.NodeEditorNode = undefined;
-    var core_connection_out: [1]zui.NodeEditorConnection = undefined;
-    var core_group_out: [1]zui.NodeEditorGroup = undefined;
-    try @import("std").testing.expectEqual(@as(usize, 2), copyCoreNodesFrom(&nodes, &core_node_out));
-    try @import("std").testing.expectEqual(@as(usize, 1), copyCoreConnectionsFrom(&connections, &core_connection_out));
-    try @import("std").testing.expectEqual(@as(usize, 1), copyCoreGroupsFrom(&groups, &core_group_out));
-    var clipboard = node_editor.Clipboard{};
-    clipboard.nodes[0] = nodes[0];
-    clipboard.node_len = 1;
-    const core_clipboard = coreClipboardFrom(clipboard);
-    try @import("std").testing.expectEqual(@as(usize, 1), core_clipboard.node_len);
-    try @import("std").testing.expectEqual(@as(usize, 1), clipboardFromCore(core_clipboard).node_len);
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
 }
+
 
 pub fn Helpers(comptime NodeEditorElement: type) type {
     return struct {
