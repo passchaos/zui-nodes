@@ -9,6 +9,7 @@ pub const node_editor_adapters = @import("node_editor_adapters.zig");
 pub const view = @import("view.zig");
 pub const command_dispatch = @import("command_dispatch.zig");
 pub const command_surface = @import("command_surface.zig");
+pub const command_targets = @import("command_targets.zig");
 
 pub const CommandId = commands.CommandId;
 pub const SelectionCommand = commands.SelectionCommand;
@@ -57,6 +58,19 @@ pub const nodeEditorHistoryCommandRegistryForContext = command_surface.nodeEdito
 pub const nodeEditorAllCommandRegistryForContext = command_surface.nodeEditorAllCommandRegistryForContext;
 pub const nodeEditorContextMenuModel = command_surface.nodeEditorContextMenuModel;
 pub const summarizeNodeEditorContextMenu = command_surface.summarizeNodeEditorContextMenu;
+pub const nodeEditorRoutedCommandPredicate = command_targets.nodeEditorRoutedCommandPredicate;
+pub const nodeEditorRoutedCommandHandler = command_targets.nodeEditorRoutedCommandHandler;
+pub const nodeEditorRoutedCommandDisabledReason = command_targets.nodeEditorRoutedCommandDisabledReason;
+pub const nodeEditorRoutedCommandTargetHandler = command_targets.nodeEditorRoutedCommandTargetHandler;
+pub const nodeEditorSelectionCommandTargetHandler = command_targets.nodeEditorSelectionCommandTargetHandler;
+pub const nodeEditorCommandTargetHandler = command_targets.nodeEditorCommandTargetHandler;
+pub const nodeEditorHistoryCommandTargetHandler = command_targets.nodeEditorHistoryCommandTargetHandler;
+pub const nodeEditorSelectionCommandTargetHandlers = command_targets.nodeEditorSelectionCommandTargetHandlers;
+pub const nodeEditorCommandTargetHandlers = command_targets.nodeEditorCommandTargetHandlers;
+pub const nodeEditorHistoryCommandTargetHandlers = command_targets.nodeEditorHistoryCommandTargetHandlers;
+pub const nodeEditorAllCommandTargetHandlers = command_targets.nodeEditorAllCommandTargetHandlers;
+pub const nodeEditorCanDispatchRoutedCommand = command_targets.canDispatchRoutedCommand;
+pub const dispatchNodeEditorRoutedCommand = command_targets.dispatchRoutedCommand;
 
 pub const GroupResizeEdges = node_editor.GroupResizeEdges;
 pub const ContextTarget = node_editor.ContextTarget;
