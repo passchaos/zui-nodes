@@ -21,6 +21,10 @@ pub const nodeEditorCommandFromId = command_dispatch.commandFromId;
 pub const nodeEditorCanDispatch = command_dispatch.canDispatch;
 pub const dispatchNodeEditorCommand = command_dispatch.dispatch;
 pub const dispatchNodeEditorCommandId = command_dispatch.dispatchId;
+pub const nodeEditorHistoryCommandFromId = command_dispatch.historyCommandFromId;
+pub const nodeEditorCanDispatchHistory = command_dispatch.canDispatchHistory;
+pub const dispatchNodeEditorHistoryCommand = command_dispatch.dispatchHistory;
+pub const dispatchNodeEditorHistoryCommandId = command_dispatch.dispatchHistoryId;
 
 pub const GroupResizeEdges = node_editor.GroupResizeEdges;
 pub const ContextTarget = node_editor.ContextTarget;
