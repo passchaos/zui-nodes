@@ -147,6 +147,14 @@ fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent) bool {
     const editor = binding.editor();
     switch (event.*) {
         .mouse_move => |mouse| {
+            if (editor.state.dragging_connection_from_id != null) {
+                editor.state.connection_preview = .{ mouse.x, mouse.y };
+                const input_hover = node_editor.inputPortAtPoint(node.rect, editor.state.*, editor.nodes, .{ mouse.x, mouse.y });
+                const input_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
+                const changed = editor.state.hover_input_node_id != input_id;
+                editor.state.hover_input_node_id = input_id;
+                return changed or true;
+            }
             if (editor.state.dragging_node_id) |id| {
                 return dragMutableNodeBy(editor, id, .{ mouse.dx, mouse.dy });
             }
@@ -174,6 +182,14 @@ fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent) bool {
             }
             if (mouse.button != .left) return false;
             const point = [2]f32{ mouse.x, mouse.y };
+            if (node_editor.outputPortAtPoint(node.rect, editor.state.*, editor.nodes, point)) |hit| {
+                editor.state.dragging_connection_from_id = editor.nodes[hit.node_index].id;
+                editor.state.dragging_connection_from_port = hit.port_index;
+                editor.state.connection_preview = point;
+                editor.state.connection_preview_valid = true;
+                editor.state.pending_connection = null;
+                return true;
+            }
             if (node_editor.nodeAtPoint(node.rect, editor.state.*, editor.nodes, point)) |index| {
                 const id = editor.nodes[index].id;
                 _ = editor.state.setSingleSelection(id);
@@ -183,6 +199,26 @@ fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent) bool {
         },
         .mouse_up => |mouse| {
             if (mouse.button != .left) return false;
+            const point = [2]f32{ mouse.x, mouse.y };
+            if (editor.state.dragging_connection_from_id) |from_id| {
+                const connected = if (node_editor.inputPortAtPoint(node.rect, editor.state.*, editor.nodes, point)) |to_hit| blk: {
+                    const to_id = editor.nodes[to_hit.node_index].id;
+                    if (from_id == to_id) break :blk false;
+                    const connection = node_editor.Connection{ .from_id = from_id, .from_port = editor.state.dragging_connection_from_port, .to_id = to_id, .to_port = to_hit.port_index };
+                    if (editor.mutable_connections) |connections| {
+                        if (editor.mutable_connection_len) |len| {
+                            break :blk editor.state.appendConnectionChecked(connections, len, connection, editor.nodes);
+                        }
+                    }
+                    editor.state.pending_connection = connection;
+                    break :blk true;
+                } else false;
+                editor.state.dragging_connection_from_id = null;
+                editor.state.dragging_connection_from_port = 0;
+                editor.state.connection_preview_valid = true;
+                editor.state.hover_input_node_id = null;
+                return connected;
+            }
             return editor.state.endDrag();
         },
         else => return false,
@@ -249,4 +285,31 @@ test "node editor view drags mutable nodes" {
     try std.testing.expect(nodes[1].pos[0] > before[0]);
     try std.testing.expect(nodes[1].pos[1] > before[1]);
     try std.testing.expect(state.dragging_node_id == null);
+}
+
+test "node editor view creates connections from output to input ports" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Input", .pos = .{ 0, 0 }, .output_types = &.{.image} },
+        .{ .id = 2, .title = "Output", .pos = .{ 180, 80 }, .input_types = &.{.image} },
+    };
+    var connections: [4]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 4;
+    var connection_len: usize = 0;
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9403, .state = &state, .nodes = &nodes, .mutable_connections = &connections, .mutable_connection_len = &connection_len, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+    const out = node_editor.outputPortPosition(editor_node.rect, state, nodes[0]);
+    const in = node_editor.inputPortPosition(editor_node.rect, state, nodes[1]);
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = out[0], .y = out[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down));
+    var move = ElementEvent{ .mouse_move = .{ .x = in[0], .y = in[1], .dx = in[0] - out[0], .dy = in[1] - out[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move));
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = in[0], .y = in[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up));
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(node_editor.Connection{ .from_id = 1, .to_id = 2 }, connections[0]);
+    try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
 }
