@@ -145,6 +145,19 @@ pub fn coreConnectionFrom(value: NodeEditorConnection) zui.NodeEditorConnection 
     return .{ .from_id = value.from_id, .to_id = value.to_id, .from_port = value.from_port, .to_port = value.to_port, .color = value.color };
 }
 
+pub fn coreGroupFrom(value: NodeEditorGroup) zui.NodeEditorGroup {
+    return .{
+        .id = value.id,
+        .title = value.title,
+        .rect = value.rect,
+        .color = value.color,
+        .border_color = value.border_color,
+        .text_color = value.text_color,
+        .title_height = value.title_height,
+        .radius = value.radius,
+    };
+}
+
 pub fn coreTemplateFrom(value: NodeEditorNodeTemplate) zui.NodeEditorNodeTemplate {
     return .{
         .title = value.title,
@@ -174,6 +187,12 @@ pub fn copyCoreNodesFrom(source: []const NodeEditorNode, out: []zui.NodeEditorNo
 pub fn copyCoreConnectionsFrom(source: []const NodeEditorConnection, out: []zui.NodeEditorConnection) usize {
     const count = @min(source.len, out.len);
     for (source[0..count], 0..) |item, index| out[index] = coreConnectionFrom(item);
+    return count;
+}
+
+pub fn copyCoreGroupsFrom(source: []const NodeEditorGroup, out: []zui.NodeEditorGroup) usize {
+    const count = @min(source.len, out.len);
+    for (source[0..count], 0..) |item, index| out[index] = coreGroupFrom(item);
     return count;
 }
 
@@ -227,8 +246,10 @@ test "zui-nodes adapters convert zui core node editor model values" {
     try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
     var core_node_out: [2]zui.NodeEditorNode = undefined;
     var core_connection_out: [1]zui.NodeEditorConnection = undefined;
+    var core_group_out: [1]zui.NodeEditorGroup = undefined;
     try @import("std").testing.expectEqual(@as(usize, 2), copyCoreNodesFrom(&nodes, &core_node_out));
     try @import("std").testing.expectEqual(@as(usize, 1), copyCoreConnectionsFrom(&connections, &core_connection_out));
+    try @import("std").testing.expectEqual(@as(usize, 1), copyCoreGroupsFrom(&groups, &core_group_out));
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
 }
 
