@@ -54,7 +54,10 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .disconnect_selected_link => context.state.canDisconnectSelectedLink(context.connections, connection_count),
         .disconnect_selected_inputs, .disconnect_selected_outputs, .disconnect_selected_links => context.connection_len != null and context.state.canDisconnectSelectedNodeLinks(context.connections, connection_count, context.nodes, node_count, command),
         .select_upstream_nodes, .select_downstream_nodes => context.state.canSelectConnectedNodes(context.connections, connection_count, context.nodes, node_count, command),
-        .group_selected_nodes, .ungroup_selected, .select_group_contents, .fit_group_to_selection => false,
+        .group_selected_nodes => context.group_len != null and context.state.canGroupSelectedNodes(context.nodes, node_count, context.groups, activeGroupCount(context)),
+        .ungroup_selected => context.group_len != null and context.state.canUngroupSelected(context.groups, activeGroupCount(context)),
+        .select_group_contents => context.state.canSelectGroupContents(context.nodes, node_count, context.groups, activeGroupCount(context)),
+        .fit_group_to_selection => context.group_len != null and context.state.canFitGroupToSelection(context.nodes, node_count, context.groups, activeGroupCount(context)),
         .open_context_menu => true,
         .close_context_menu => context.state.context_menu.open,
         .disconnect_context_port_links => context.connection_len != null and context.state.canDisconnectContextPortLinks(context.connections, connection_count),
@@ -81,7 +84,10 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .disconnect_selected_link => disconnectSelectedLink(context),
         .disconnect_selected_inputs, .disconnect_selected_outputs, .disconnect_selected_links => disconnectSelectedNodeLinks(context, command),
         .select_upstream_nodes, .select_downstream_nodes => context.state.selectConnectedNodes(context.connections, activeConnectionCount(context), context.nodes, node_count, command),
-        .group_selected_nodes, .ungroup_selected, .select_group_contents, .fit_group_to_selection => false,
+        .group_selected_nodes => groupSelected(context),
+        .ungroup_selected => ungroupSelected(context),
+        .select_group_contents => context.state.selectGroupContents(context.nodes, node_count, context.groups, activeGroupCount(context)),
+        .fit_group_to_selection => fitGroupToSelection(context),
         .open_context_menu => context.state.openContextMenu(.canvas, .{ 0, 0 }),
         .close_context_menu => context.state.closeContextMenu(),
         .disconnect_context_port_links => disconnectContextPortLinks(context),
@@ -160,16 +166,27 @@ fn disconnectSelectedNodeLinks(context: *CommandContext, command: NodeEditorComm
     return context.state.disconnectSelectedNodeLinks(context.connections, connection_len, command);
 }
 
+fn groupSelected(context: *CommandContext) bool {
+    const group_len = context.group_len orelse return false;
+    pushHistory(context);
+    return context.state.groupSelectedNodes(context.nodes, activeNodeCount(context), context.groups, group_len, "Group");
+}
+
+fn ungroupSelected(context: *CommandContext) bool {
+    const group_len = context.group_len orelse return false;
+    pushHistory(context);
+    return context.state.ungroupSelected(context.groups, group_len);
+}
+
+fn fitGroupToSelection(context: *CommandContext) bool {
+    pushHistory(context);
+    return context.state.fitSelectedGroupToSelection(context.nodes, activeNodeCount(context), context.groups, activeGroupCount(context));
+}
+
 fn disconnectContextPortLinks(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     pushHistory(context);
     return context.state.disconnectContextPortLinks(context.connections, connection_len);
-}
-
-fn uniqueGroupId(context: *const CommandContext) u32 {
-    var max_id: u32 = 0;
-    for (context.groups[0..activeGroupCount(context)]) |group| max_id = @max(max_id, group.id);
-    return max_id +% 1;
 }
 
 test "zui-nodes command dispatch handles selection mutation and insertion" {
@@ -201,4 +218,30 @@ test "zui-nodes command dispatch copies and deletes selected nodes" {
     try std.testing.expect(clipboard.hasNodes());
     try std.testing.expect(dispatch(&ctx, .clear_selection));
     try std.testing.expect(dispatchId(&ctx, NodeEditorCommand.clear_selection.commandId()) == false);
+}
+
+test "zui-nodes command dispatch handles group lifecycle" {
+    var selected: [8]u32 = .{0} ** 8;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [8]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 8;
+    nodes[0] = .{ .id = 1, .title = "A", .pos = .{ 0, 0 } };
+    nodes[1] = .{ .id = 2, .title = "B", .pos = .{ 100, 0 } };
+    var node_len: usize = 2;
+    var groups: [4]node_editor.Group = .{node_editor.Group{ .id = 0, .title = "", .rect = .zero }} ** 4;
+    var group_len: usize = 0;
+    var ctx = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .groups = &groups, .group_len = &group_len };
+    try std.testing.expect(dispatch(&ctx, .select_all));
+    try std.testing.expect(dispatch(&ctx, .group_selected_nodes));
+    try std.testing.expectEqual(@as(usize, 1), group_len);
+    try std.testing.expectEqual(@as(?u32, groups[0].id), state.selected_group_id);
+    try std.testing.expect(dispatch(&ctx, .select_group_contents));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+    _ = state.selectAllNodes(&nodes, node_len);
+    state.selected_group_id = groups[0].id;
+    groups[0].rect = .{ .x = 0, .y = 0, .w = 20, .h = 20 };
+    const before = groups[0].rect;
+    try std.testing.expect(dispatch(&ctx, .fit_group_to_selection));
+    try std.testing.expect(groups[0].rect.w >= before.w * 0.5);
+    try std.testing.expect(dispatch(&ctx, .ungroup_selected));
+    try std.testing.expectEqual(@as(usize, 0), group_len);
 }
