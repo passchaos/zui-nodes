@@ -18,6 +18,104 @@ const NodeEditorConnection = node_editor.Connection;
 const NodeEditorPortType = node_editor.PortType;
 const NodeEditorMinimapSnapshot = node_editor.MinimapSnapshot;
 
+pub fn nodeFrom(value: anytype) NodeEditorNode {
+    return .{
+        .id = value.id,
+        .title = value.title,
+        .pos = value.pos,
+        .size = value.size,
+        .color = value.color,
+        .input_count = value.input_count,
+        .output_count = value.output_count,
+        .input_labels = value.input_labels,
+        .output_labels = value.output_labels,
+        .input_types = compatiblePortTypes(value.input_types),
+        .output_types = compatiblePortTypes(value.output_types),
+    };
+}
+
+pub fn connectionFrom(value: anytype) NodeEditorConnection {
+    return .{
+        .from_id = value.from_id,
+        .to_id = value.to_id,
+        .from_port = value.from_port,
+        .to_port = value.to_port,
+        .color = value.color,
+    };
+}
+
+pub fn groupFrom(value: anytype) NodeEditorGroup {
+    return .{
+        .id = value.id,
+        .title = value.title,
+        .rect = value.rect,
+        .color = value.color,
+        .border_color = value.border_color,
+        .text_color = value.text_color,
+        .title_height = value.title_height,
+        .radius = value.radius,
+    };
+}
+
+pub fn templateFrom(value: anytype) NodeEditorNodeTemplate {
+    return .{
+        .title = value.title,
+        .size = value.size,
+        .color = value.color,
+        .input_count = value.input_count,
+        .output_count = value.output_count,
+        .input_labels = value.input_labels,
+        .output_labels = value.output_labels,
+        .input_types = compatiblePortTypes(value.input_types),
+        .output_types = compatiblePortTypes(value.output_types),
+    };
+}
+
+fn compatiblePortTypes(value: anytype) []const NodeEditorPortType {
+    return if (@TypeOf(value) == []const NodeEditorPortType) value else &.{};
+}
+
+pub fn copyNodesFrom(comptime SourceNode: type, source: []const SourceNode, out: []NodeEditorNode) usize {
+    const count = @min(source.len, out.len);
+    for (source[0..count], 0..) |item, index| out[index] = nodeFrom(item);
+    return count;
+}
+
+pub fn copyConnectionsFrom(comptime SourceConnection: type, source: []const SourceConnection, out: []NodeEditorConnection) usize {
+    const count = @min(source.len, out.len);
+    for (source[0..count], 0..) |item, index| out[index] = connectionFrom(item);
+    return count;
+}
+
+pub fn copyGroupsFrom(comptime SourceGroup: type, source: []const SourceGroup, out: []NodeEditorGroup) usize {
+    const count = @min(source.len, out.len);
+    for (source[0..count], 0..) |item, index| out[index] = groupFrom(item);
+    return count;
+}
+
+test "zui-nodes adapters convert zui core node editor model values" {
+    const core_nodes = [_]zui.NodeEditorNode{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 }, .output_types = &.{.image} },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 }, .input_types = &.{.image} },
+    };
+    const core_connections = [_]zui.NodeEditorConnection{
+        .{ .from_id = 1, .to_id = 2 },
+    };
+    const core_groups = [_]zui.NodeEditorGroup{
+        .{ .id = 7, .title = "Group", .rect = .{ .x = 0, .y = 0, .w = 120, .h = 80 } },
+    };
+    var nodes: [2]NodeEditorNode = undefined;
+    var connections: [1]NodeEditorConnection = undefined;
+    var groups: [1]NodeEditorGroup = undefined;
+
+    try @import("std").testing.expectEqual(@as(usize, 2), copyNodesFrom(zui.NodeEditorNode, &core_nodes, &nodes));
+    try @import("std").testing.expectEqual(@as(usize, 1), copyConnectionsFrom(zui.NodeEditorConnection, &core_connections, &connections));
+    try @import("std").testing.expectEqual(@as(usize, 1), copyGroupsFrom(zui.NodeEditorGroup, &core_groups, &groups));
+    try @import("std").testing.expectEqual(@as(u32, 1), nodes[0].id);
+    try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
+    try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
+}
+
 pub fn Helpers(comptime NodeEditorElement: type) type {
     return struct {
         pub fn nodeEditorGraphToScreen(rect: Rect, state: NodeEditorState, point: [2]f32) [2]f32 {

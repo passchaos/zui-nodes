@@ -99,6 +99,14 @@ pub const Options = node_editor.Options;
 pub const NodeEditorViewOptions = view.NodeEditorViewOptions;
 pub const nodeEditorView = view.nodeEditorView;
 
+pub const nodeFrom = node_editor_adapters.nodeFrom;
+pub const connectionFrom = node_editor_adapters.connectionFrom;
+pub const groupFrom = node_editor_adapters.groupFrom;
+pub const templateFrom = node_editor_adapters.templateFrom;
+pub const copyNodesFrom = node_editor_adapters.copyNodesFrom;
+pub const copyConnectionsFrom = node_editor_adapters.copyConnectionsFrom;
+pub const copyGroupsFrom = node_editor_adapters.copyGroupsFrom;
+
 pub const graphToScreen = node_editor.graphToScreen;
 pub const screenToGraph = node_editor.screenToGraph;
 pub const nodeGraphRect = node_editor.nodeGraphRect;
