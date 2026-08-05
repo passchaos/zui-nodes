@@ -1,0 +1,10 @@
+.{
+    .name = .zui_nodes,
+    .version = "0.0.1",
+    .fingerprint = 0x5fdd83e43c35508b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zui = .{ .path = "../zui" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
