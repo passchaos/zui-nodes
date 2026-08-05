@@ -147,6 +147,9 @@ fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent) bool {
     const editor = binding.editor();
     switch (event.*) {
         .mouse_move => |mouse| {
+            if (editor.state.dragging_node_id) |id| {
+                return dragMutableNodeBy(editor, id, .{ mouse.dx, mouse.dy });
+            }
             const hit = node_editor.nodeAtPoint(node.rect, editor.state.*, editor.nodes, .{ mouse.x, mouse.y });
             const hover_id = if (hit) |index| editor.nodes[index].id else null;
             const changed = editor.state.hover_node_id != hover_id;
@@ -172,12 +175,32 @@ fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent) bool {
             if (mouse.button != .left) return false;
             const point = [2]f32{ mouse.x, mouse.y };
             if (node_editor.nodeAtPoint(node.rect, editor.state.*, editor.nodes, point)) |index| {
-                return editor.state.setSingleSelection(editor.nodes[index].id);
+                const id = editor.nodes[index].id;
+                _ = editor.state.setSingleSelection(id);
+                return editor.state.beginNodeDrag(id);
             }
             return editor.state.clearSelection();
         },
+        .mouse_up => |mouse| {
+            if (mouse.button != .left) return false;
+            return editor.state.endDrag();
+        },
         else => return false,
     }
+}
+
+fn dragMutableNodeBy(editor: anytype, id: u32, delta_screen: [2]f32) bool {
+    const nodes = editor.mutable_nodes orelse return false;
+    const zoom = @max(0.001, editor.state.zoom);
+    const delta = [2]f32{ delta_screen[0] / zoom, delta_screen[1] / zoom };
+    var changed = false;
+    for (nodes) |*node_item| {
+        if (node_item.id != id and !editor.state.isNodeSelected(node_item.id)) continue;
+        node_item.pos[0] += delta[0];
+        node_item.pos[1] += delta[1];
+        changed = true;
+    }
+    return changed;
 }
 
 test "node editor view builds on zui custom paint primitives" {
@@ -191,11 +214,39 @@ test "node editor view builds on zui custom paint primitives" {
     defer view.deinit();
     var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 320, .h = 180 } }, .user = null };
     const node = try nodeEditorView(&ctx, .{ .tag = 9401, .state = &state, .nodes = &nodes, .style = .{ .width = .{ .px = 300 }, .height = .{ .px = 160 } } });
+    node.rect = .{ .x = 0, .y = 0, .w = 300, .h = 160 };
     try std.testing.expectEqual(@as(u32, 9401), node.id);
     try std.testing.expect(node.focusable);
     const node_rect = node_editor.nodeRectFromState(.{ .x = 0, .y = 0, .w = 300, .h = 160 }, state, nodes[0]);
     const click = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
     var event = ElementEvent{ .mouse_down = .{ .button = .left, .x = click[0], .y = click[1] } };
     try std.testing.expect(nodeEditorViewEvent(node, &event));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+}
+
+test "node editor view drags mutable nodes" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "Output", .pos = .{ 180, 80 } },
+    };
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9402, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+    const before = nodes[1].pos;
+    const node_rect = node_editor.nodeRectFromState(.{ .x = 0, .y = 0, .w = 340, .h = 200 }, state, nodes[1]);
+    const start = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down));
+    var move = ElementEvent{ .mouse_move = .{ .x = start[0] + 24, .y = start[1] + 12, .dx = 24, .dy = 12 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move));
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = start[0] + 24, .y = start[1] + 12 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up));
     try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    try std.testing.expect(nodes[1].pos[0] > before[0]);
+    try std.testing.expect(nodes[1].pos[1] > before[1]);
+    try std.testing.expect(state.dragging_node_id == null);
 }
