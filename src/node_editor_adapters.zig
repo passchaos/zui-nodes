@@ -88,6 +88,77 @@ fn compatiblePortTypes(value: anytype) []const NodeEditorPortType {
     return if (@TypeOf(value) == []const NodeEditorPortType) value else &.{};
 }
 
+const core_port_any = [_]zui.NodeEditorPortType{.any};
+const core_port_flow = [_]zui.NodeEditorPortType{.flow};
+const core_port_float = [_]zui.NodeEditorPortType{.float};
+const core_port_vector = [_]zui.NodeEditorPortType{.vector};
+const core_port_color = [_]zui.NodeEditorPortType{.color};
+const core_port_image = [_]zui.NodeEditorPortType{.image};
+const core_port_mask = [_]zui.NodeEditorPortType{.mask};
+const core_port_geometry = [_]zui.NodeEditorPortType{.geometry};
+
+pub fn corePortTypeFrom(value: NodeEditorPortType) zui.NodeEditorPortType {
+    return switch (value) {
+        .any => .any,
+        .flow => .flow,
+        .float => .float,
+        .vector => .vector,
+        .color => .color,
+        .image => .image,
+        .mask => .mask,
+        .geometry => .geometry,
+    };
+}
+
+pub fn corePortTypesFrom(value: []const NodeEditorPortType) []const zui.NodeEditorPortType {
+    if (value.len == 0) return &.{};
+    if (value.len == 1) return switch (value[0]) {
+        .any => &core_port_any,
+        .flow => &core_port_flow,
+        .float => &core_port_float,
+        .vector => &core_port_vector,
+        .color => &core_port_color,
+        .image => &core_port_image,
+        .mask => &core_port_mask,
+        .geometry => &core_port_geometry,
+    };
+    return &.{};
+}
+
+pub fn coreNodeFrom(value: NodeEditorNode) zui.NodeEditorNode {
+    return .{
+        .id = value.id,
+        .title = value.title,
+        .pos = value.pos,
+        .size = value.size,
+        .color = value.color,
+        .input_count = value.input_count,
+        .output_count = value.output_count,
+        .input_labels = value.input_labels,
+        .output_labels = value.output_labels,
+        .input_types = corePortTypesFrom(value.input_types),
+        .output_types = corePortTypesFrom(value.output_types),
+    };
+}
+
+pub fn coreConnectionFrom(value: NodeEditorConnection) zui.NodeEditorConnection {
+    return .{ .from_id = value.from_id, .to_id = value.to_id, .from_port = value.from_port, .to_port = value.to_port, .color = value.color };
+}
+
+pub fn coreTemplateFrom(value: NodeEditorNodeTemplate) zui.NodeEditorNodeTemplate {
+    return .{
+        .title = value.title,
+        .size = value.size,
+        .color = value.color,
+        .input_count = value.input_count,
+        .output_count = value.output_count,
+        .input_labels = value.input_labels,
+        .output_labels = value.output_labels,
+        .input_types = corePortTypesFrom(value.input_types),
+        .output_types = corePortTypesFrom(value.output_types),
+    };
+}
+
 pub fn copyNodesFrom(comptime SourceNode: type, source: []const SourceNode, out: []NodeEditorNode) usize {
     const count = @min(source.len, out.len);
     for (source[0..count], 0..) |item, index| out[index] = nodeFrom(item);
@@ -126,6 +197,9 @@ test "zui-nodes adapters convert zui core node editor model values" {
     try @import("std").testing.expectEqual(@as(usize, 1), copyGroupsFrom(zui.NodeEditorGroup, &core_groups, &groups));
     try @import("std").testing.expectEqual(@as(u32, 1), nodes[0].id);
     try @import("std").testing.expectEqual(NodeEditorPortType.image, portTypeFrom(core_nodes[0].output_types[0]));
+    const native_node = NodeEditorNode{ .id = 9, .title = "Native", .pos = .{ 0, 0 }, .output_types = &.{.image} };
+    try @import("std").testing.expectEqual(zui.NodeEditorPortType.image, corePortTypeFrom(native_node.output_types[0]));
+    try @import("std").testing.expectEqual(@as(usize, 1), coreNodeFrom(native_node).output_types.len);
     try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
 }
