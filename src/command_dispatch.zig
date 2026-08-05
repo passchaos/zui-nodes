@@ -62,7 +62,8 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .close_context_menu => context.state.context_menu.open,
         .disconnect_context_port_links => context.connection_len != null and context.state.canDisconnectContextPortLinks(context.connections, connection_count),
         .select_context_port_peers => context.state.canSelectContextPortPeers(context.connections, connection_count, context.nodes, node_count),
-        .reconnect_to_previous, .reconnect_to_next => false,
+        .reconnect_to_previous => context.connection_len != null and context.state.canReconnectSelectedConnectionToPreviousNode(context.connections, connection_count, context.nodes, node_count),
+        .reconnect_to_next => context.connection_len != null and context.state.canReconnectSelectedConnectionToNextNode(context.connections, connection_count, context.nodes, node_count),
     };
 }
 
@@ -92,8 +93,39 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .close_context_menu => context.state.closeContextMenu(),
         .disconnect_context_port_links => disconnectContextPortLinks(context),
         .select_context_port_peers => context.state.selectContextPortPeers(context.connections, activeConnectionCount(context), context.nodes, node_count),
-        .reconnect_to_previous, .reconnect_to_next => false,
+        .reconnect_to_previous => reconnectPrevious(context),
+        .reconnect_to_next => reconnectNext(context),
     };
+}
+
+pub fn historyCommandFromId(command_id: CommandId) ?HistoryCommand {
+    if (command_id < commands.history_command_id_base) return null;
+    const raw = command_id - commands.history_command_id_base;
+    if (raw > @intFromEnum(HistoryCommand.redo)) return null;
+    return @enumFromInt(raw);
+}
+
+pub fn canDispatchHistory(context: *const CommandContext, command: HistoryCommand) bool {
+    const history = context.history orelse return false;
+    return switch (command) {
+        .undo => history.canUndo(),
+        .redo => history.canRedo(),
+    };
+}
+
+pub fn dispatchHistory(context: *CommandContext, command: HistoryCommand) bool {
+    if (!canDispatchHistory(context, command)) return false;
+    const history = context.history orelse return false;
+    const connection_len = context.connection_len orelse return false;
+    return switch (command) {
+        .undo => history.undoWithGroups(context.state, context.nodes, context.node_len, context.groups, context.group_len, context.connections, connection_len),
+        .redo => history.redoWithGroups(context.state, context.nodes, context.node_len, context.groups, context.group_len, context.connections, connection_len),
+    };
+}
+
+pub fn dispatchHistoryId(context: *CommandContext, command_id: CommandId) bool {
+    const command = historyCommandFromId(command_id) orelse return false;
+    return dispatchHistory(context, command);
 }
 
 pub fn dispatchId(context: *CommandContext, command_id: CommandId) bool {
@@ -183,6 +215,18 @@ fn fitGroupToSelection(context: *CommandContext) bool {
     return context.state.fitSelectedGroupToSelection(context.nodes, activeNodeCount(context), context.groups, activeGroupCount(context));
 }
 
+fn reconnectPrevious(context: *CommandContext) bool {
+    const connection_len = context.connection_len orelse return false;
+    pushHistory(context);
+    return context.state.reconnectSelectedConnectionToPreviousNode(context.connections, connection_len, context.nodes, activeNodeCount(context));
+}
+
+fn reconnectNext(context: *CommandContext) bool {
+    const connection_len = context.connection_len orelse return false;
+    pushHistory(context);
+    return context.state.reconnectSelectedConnectionToNextNode(context.connections, connection_len, context.nodes, activeNodeCount(context));
+}
+
 fn disconnectContextPortLinks(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     pushHistory(context);
@@ -244,4 +288,28 @@ test "zui-nodes command dispatch handles group lifecycle" {
     try std.testing.expect(groups[0].rect.w >= before.w * 0.5);
     try std.testing.expect(dispatch(&ctx, .ungroup_selected));
     try std.testing.expectEqual(@as(usize, 0), group_len);
+}
+
+test "zui-nodes command dispatch reconnects selected connection and supports history" {
+    var selected: [8]u32 = .{0} ** 8;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [8]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 8;
+    nodes[0] = .{ .id = 1, .title = "A", .pos = .{ 0, 0 } };
+    nodes[1] = .{ .id = 2, .title = "B", .pos = .{ 100, 0 } };
+    nodes[2] = .{ .id = 3, .title = "C", .pos = .{ 200, 0 } };
+    var node_len: usize = 3;
+    var connections: [4]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 4;
+    connections[0] = .{ .from_id = 1, .to_id = 2 };
+    var connection_len: usize = 1;
+    var groups: [2]node_editor.Group = .{node_editor.Group{ .id = 0, .title = "", .rect = .zero }} ** 2;
+    var group_len: usize = 0;
+    var history = node_editor.History{};
+    _ = state.setConnectionSelection(connections[0]);
+    var ctx = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len, .groups = &groups, .group_len = &group_len, .history = &history };
+    try std.testing.expect(dispatch(&ctx, .reconnect_to_next));
+    try std.testing.expectEqual(@as(u32, 3), connections[0].to_id);
+    try std.testing.expect(dispatchHistory(&ctx, .undo));
+    try std.testing.expectEqual(@as(u32, 2), connections[0].to_id);
+    try std.testing.expect(dispatchHistoryId(&ctx, HistoryCommand.redo.commandId()));
+    try std.testing.expectEqual(@as(u32, 3), connections[0].to_id);
 }
