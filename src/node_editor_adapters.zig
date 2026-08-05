@@ -71,6 +71,19 @@ pub fn templateFrom(value: anytype) NodeEditorNodeTemplate {
     };
 }
 
+pub fn portTypeFrom(value: anytype) NodeEditorPortType {
+    return switch (value) {
+        .any => .any,
+        .flow => .flow,
+        .float => .float,
+        .vector => .vector,
+        .color => .color,
+        .image => .image,
+        .mask => .mask,
+        .geometry => .geometry,
+    };
+}
+
 fn compatiblePortTypes(value: anytype) []const NodeEditorPortType {
     return if (@TypeOf(value) == []const NodeEditorPortType) value else &.{};
 }
@@ -112,6 +125,7 @@ test "zui-nodes adapters convert zui core node editor model values" {
     try @import("std").testing.expectEqual(@as(usize, 1), copyConnectionsFrom(zui.NodeEditorConnection, &core_connections, &connections));
     try @import("std").testing.expectEqual(@as(usize, 1), copyGroupsFrom(zui.NodeEditorGroup, &core_groups, &groups));
     try @import("std").testing.expectEqual(@as(u32, 1), nodes[0].id);
+    try @import("std").testing.expectEqual(NodeEditorPortType.image, portTypeFrom(core_nodes[0].output_types[0]));
     try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
 }

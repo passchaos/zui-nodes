@@ -103,6 +103,7 @@ pub const nodeFrom = node_editor_adapters.nodeFrom;
 pub const connectionFrom = node_editor_adapters.connectionFrom;
 pub const groupFrom = node_editor_adapters.groupFrom;
 pub const templateFrom = node_editor_adapters.templateFrom;
+pub const portTypeFrom = node_editor_adapters.portTypeFrom;
 pub const copyNodesFrom = node_editor_adapters.copyNodesFrom;
 pub const copyConnectionsFrom = node_editor_adapters.copyConnectionsFrom;
 pub const copyGroupsFrom = node_editor_adapters.copyGroupsFrom;
