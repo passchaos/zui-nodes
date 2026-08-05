@@ -224,6 +224,30 @@ pub fn copyCoreTemplatesFrom(source: []const NodeEditorNodeTemplate, out: []zui.
     return count;
 }
 
+pub fn coreClipboardFrom(value: node_editor.Clipboard) zui.NodeEditorClipboard {
+    var out = zui.NodeEditorClipboard{};
+    out.node_len = @min(value.node_len, out.nodes.len);
+    out.connection_len = @min(value.connection_len, out.connections.len);
+    if (out.node_len > 0) _ = copyCoreNodesFrom(value.nodes[0..out.node_len], &out.nodes);
+    if (out.connection_len > 0) _ = copyCoreConnectionsFrom(value.connections[0..out.connection_len], &out.connections);
+    out.source_ids = value.source_ids;
+    out.copied_bounds = value.copied_bounds;
+    out.paste_count = value.paste_count;
+    return out;
+}
+
+pub fn clipboardFromCore(value: zui.NodeEditorClipboard) node_editor.Clipboard {
+    var out = node_editor.Clipboard{};
+    out.node_len = @min(value.node_len, out.nodes.len);
+    out.connection_len = @min(value.connection_len, out.connections.len);
+    if (out.node_len > 0) _ = copyNodesFrom(zui.NodeEditorNode, value.nodes[0..out.node_len], &out.nodes);
+    if (out.connection_len > 0) _ = copyConnectionsFrom(zui.NodeEditorConnection, value.connections[0..out.connection_len], &out.connections);
+    out.source_ids = value.source_ids;
+    out.copied_bounds = value.copied_bounds;
+    out.paste_count = value.paste_count;
+    return out;
+}
+
 pub fn copyNodesFrom(comptime SourceNode: type, source: []const SourceNode, out: []NodeEditorNode) usize {
     const count = @min(source.len, out.len);
     for (source[0..count], 0..) |item, index| out[index] = nodeFrom(item);
@@ -276,6 +300,12 @@ test "zui-nodes adapters convert zui core node editor model values" {
     try @import("std").testing.expectEqual(@as(usize, 2), copyCoreNodesFrom(&nodes, &core_node_out));
     try @import("std").testing.expectEqual(@as(usize, 1), copyCoreConnectionsFrom(&connections, &core_connection_out));
     try @import("std").testing.expectEqual(@as(usize, 1), copyCoreGroupsFrom(&groups, &core_group_out));
+    var clipboard = node_editor.Clipboard{};
+    clipboard.nodes[0] = nodes[0];
+    clipboard.node_len = 1;
+    const core_clipboard = coreClipboardFrom(clipboard);
+    try @import("std").testing.expectEqual(@as(usize, 1), core_clipboard.node_len);
+    try @import("std").testing.expectEqual(@as(usize, 1), clipboardFromCore(core_clipboard).node_len);
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
 }
 
