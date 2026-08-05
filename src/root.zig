@@ -3,6 +3,34 @@
 //! Zui core intentionally stays focused on base UI primitives. This package
 //! hosts node-graph/editor functionality built on top of those primitives.
 
+const std = @import("std");
+const zui = @import("zui");
+
+pub const extension_id = "zui-nodes";
+
+pub const extension_capabilities = [_]zui.ExtensionCapability{
+    .{ .area = .node_graph, .name = "node graph editor" },
+    .{ .area = .node_graph, .name = "node graph command surface" },
+};
+
+pub const extension_contributions = [_]zui.ExtensionContribution{
+    .{ .kind = .widget, .id = extension_id ++ ".node-editor", .title = "Node Editor" },
+    .{ .kind = .command, .id = extension_id ++ ".command-surface", .title = "Node Editor Commands" },
+    .{ .kind = .panel, .id = extension_id ++ ".context-menu", .title = "Node Editor Context Menu" },
+};
+
+pub const extension_descriptor = zui.ExtensionDescriptor{
+    .id = extension_id,
+    .name = "Zui Nodes",
+    .version = "0.0.1",
+    .capabilities = &extension_capabilities,
+    .contributions = &extension_contributions,
+};
+
+pub fn extensionDescriptor() zui.ExtensionDescriptor {
+    return extension_descriptor;
+}
+
 pub const commands = @import("commands.zig");
 pub const node_editor = @import("node_editor.zig");
 pub const node_editor_adapters = @import("node_editor_adapters.zig");
@@ -125,5 +153,24 @@ pub fn adoptionNote() []const u8 {
 }
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    std.testing.refAllDecls(@This());
+}
+
+test "zui-nodes extension descriptor registers node graph capabilities" {
+    const descriptor_value = extensionDescriptor();
+    try std.testing.expectEqualStrings(extension_id, descriptor_value.id);
+    const registry = zui.ExtensionRegistry{ .extensions = &.{descriptor_value} };
+
+    try registry.validate();
+    try std.testing.expect(registry.contains(extension_id));
+    try std.testing.expectEqual(@as(usize, 1), registry.countByArea(.node_graph));
+    try std.testing.expectEqual(@as(usize, 1), registry.countContributions(.command));
+    try std.testing.expectEqual(@as(usize, 1), registry.countContributions(.panel));
+    try std.testing.expectEqual(@as(usize, 1), registry.countContributions(.widget));
+    try std.testing.expect(registry.contributes(extension_id, .widget, extension_id ++ ".node-editor"));
+    try std.testing.expect(registry.contributes(extension_id, .command, extension_id ++ ".command-surface"));
+
+    const node_editor_contribution = registry.findContribution(.widget, extension_id ++ ".node-editor") orelse return error.MissingNodeEditorContribution;
+    try std.testing.expectEqualStrings("Node Editor", node_editor_contribution.contribution.title);
+    try std.testing.expectEqual(zui.ExtensionBoundaryDecision.extension_package, zui.defaultExtensionBoundary(.node_graph));
 }
