@@ -159,6 +159,30 @@ pub fn coreTemplateFrom(value: NodeEditorNodeTemplate) zui.NodeEditorNodeTemplat
     };
 }
 
+pub fn coreChainTemplateFrom(nodes: []const NodeEditorNodeTemplate, connections: []const NodeEditorConnection, core_nodes: []zui.NodeEditorNodeTemplate, core_connections: []zui.NodeEditorConnection, start_pos: [2]f32, node_gap: [2]f32) zui.NodeEditorChainTemplate {
+    _ = copyCoreTemplatesFrom(nodes, core_nodes);
+    _ = copyCoreConnectionsFrom(connections, core_connections);
+    return .{ .nodes = core_nodes[0..@min(nodes.len, core_nodes.len)], .connections = core_connections[0..@min(connections.len, core_connections.len)], .start_pos = start_pos, .node_gap = node_gap };
+}
+
+pub fn copyCoreNodesFrom(source: []const NodeEditorNode, out: []zui.NodeEditorNode) usize {
+    const count = @min(source.len, out.len);
+    for (source[0..count], 0..) |item, index| out[index] = coreNodeFrom(item);
+    return count;
+}
+
+pub fn copyCoreConnectionsFrom(source: []const NodeEditorConnection, out: []zui.NodeEditorConnection) usize {
+    const count = @min(source.len, out.len);
+    for (source[0..count], 0..) |item, index| out[index] = coreConnectionFrom(item);
+    return count;
+}
+
+pub fn copyCoreTemplatesFrom(source: []const NodeEditorNodeTemplate, out: []zui.NodeEditorNodeTemplate) usize {
+    const count = @min(source.len, out.len);
+    for (source[0..count], 0..) |item, index| out[index] = coreTemplateFrom(item);
+    return count;
+}
+
 pub fn copyNodesFrom(comptime SourceNode: type, source: []const SourceNode, out: []NodeEditorNode) usize {
     const count = @min(source.len, out.len);
     for (source[0..count], 0..) |item, index| out[index] = nodeFrom(item);
@@ -201,6 +225,10 @@ test "zui-nodes adapters convert zui core node editor model values" {
     try @import("std").testing.expectEqual(zui.NodeEditorPortType.image, corePortTypeFrom(native_node.output_types[0]));
     try @import("std").testing.expectEqual(@as(usize, 1), coreNodeFrom(native_node).output_types.len);
     try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
+    var core_node_out: [2]zui.NodeEditorNode = undefined;
+    var core_connection_out: [1]zui.NodeEditorConnection = undefined;
+    try @import("std").testing.expectEqual(@as(usize, 2), copyCoreNodesFrom(&nodes, &core_node_out));
+    try @import("std").testing.expectEqual(@as(usize, 1), copyCoreConnectionsFrom(&connections, &core_connection_out));
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
 }
 
