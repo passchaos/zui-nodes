@@ -5,6 +5,7 @@
 //! arrays; graph evaluation/runtime remains outside both zui and zui-nodes.
 
 const std = @import("std");
+const zui = @import("zui");
 const commands = @import("commands.zig");
 const node_editor = @import("node_editor.zig");
 
@@ -28,6 +29,7 @@ pub const CommandContext = struct {
     insert_processing_node: node_editor.NodeTemplate = .{ .title = "Process" },
     insert_output_node: node_editor.NodeTemplate = .{ .title = "Output" },
     insert_chain: node_editor.ChainTemplate = .{ .nodes = &.{} },
+    viewport: ?zui.Rect = null,
     duplicate_id_offset: u32 = 1000,
     duplicate_offset: [2]f32 = .{ 32.0, 24.0 },
 };
@@ -106,8 +108,14 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
     return switch (command) {
         .clear_selection => context.state.clearSelection(),
         .select_all => context.state.selectAllNodes(context.nodes, node_count),
-        .focus_selection => context.state.lastSelectedNodeId() != null,
-        .frame_all => context.state.centerViewportOnGraphPoint(.{ .x = 0, .y = 0, .w = 640, .h = 360 }, .{ 0, 0 }),
+        .focus_selection => if (context.viewport) |viewport|
+            context.state.focusSelectionInViewport(viewport, context.nodes, node_count, context.groups[0..activeGroupCount(context)])
+        else
+            context.state.lastSelectedNodeId() != null,
+        .frame_all => if (context.viewport) |viewport|
+            context.state.frameAllInViewport(viewport, context.nodes, node_count, context.groups[0..activeGroupCount(context)])
+        else
+            context.state.centerViewportOnGraphPoint(.{ .x = 0, .y = 0, .w = 640, .h = 360 }, .{ 0, 0 }),
         .copy_selection => copySelection(context),
         .paste_clipboard => pasteSelection(context),
         .insert_image_input => insertTemplate(context, context.insert_image_input),
@@ -251,7 +259,9 @@ fn insertChain(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     _ = connection_len;
     pushHistory(context);
-    return context.state.insertNodeChain(context.nodes, context.node_len, context.connections, context.connection_len.?, context.insert_chain);
+    var chain = context.insert_chain;
+    chain.start_pos = node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)]);
+    return context.state.insertNodeChain(context.nodes, context.node_len, context.connections, context.connection_len.?, chain);
 }
 
 fn arrange(context: *CommandContext, command: NodeEditorCommand) bool {

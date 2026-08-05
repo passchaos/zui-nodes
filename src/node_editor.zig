@@ -2901,20 +2901,25 @@ fn groupResizeAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?GroupR
     return groupResizeAtPoint(rect, editor.state.*, editor.groups, editor.group_resize_margin, point);
 }
 
-pub fn handleElementEvent(node: anytype, event: anytype) bool {
-    if (node.element != .node_editor) return false;
-    const editor = node.element.node_editor;
+pub const EventInputModifiers = struct {
+    shift_down: bool = false,
+    control_down: bool = false,
+    super_down: bool = false,
+    alt_down: bool = false,
+};
+
+pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype, event: anytype) bool {
     switch (event.*) {
         .mouse_move => |m| {
             if (editor.state.dragging_minimap) {
-                const snapshot = minimapSnapshot(node.rect, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
-                return editor.state.updateMinimapDrag(node.rect, snapshot, .{ m.x, m.y });
+                const snapshot = minimapSnapshot(rect, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
+                return editor.state.updateMinimapDrag(rect, snapshot, .{ m.x, m.y });
             }
             if (editor.state.box_selecting) return editor.state.updateBoxSelect(.{ m.x, m.y });
             if (editor.state.reconnecting_connection != null) {
                 const changed = editor.state.updateReconnectPreview(.{ m.x, m.y });
-                const input_hover = inputPortAtElementPoint(node.rect, editor, .{ m.x, m.y });
-                const output_hover = outputPortAtElementPoint(node.rect, editor, .{ m.x, m.y });
+                const input_hover = inputPortAtElementPoint(rect, editor, .{ m.x, m.y });
+                const output_hover = outputPortAtElementPoint(rect, editor, .{ m.x, m.y });
                 editor.state.hover_input_node_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
                 editor.state.hover_output_node_id = if (output_hover) |hit| editor.nodes[hit.node_index].id else null;
                 const valid = reconnectPreviewCompatible(editor, input_hover, output_hover);
@@ -2924,7 +2929,7 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
             }
             if (editor.state.dragging_connection_from_id != null) {
                 editor.state.connection_preview = .{ m.x, m.y };
-                const input_hover = inputPortAtElementPoint(node.rect, editor, .{ m.x, m.y });
+                const input_hover = inputPortAtElementPoint(rect, editor, .{ m.x, m.y });
                 const input_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
                 editor.state.hover_input_node_id = input_id;
                 const valid = dragPreviewCompatible(editor, input_hover);
@@ -2944,15 +2949,15 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
                 return dragGroupBy(editor, id, .{ m.dx, m.dy });
             }
             if (editor.state.dragging_canvas) return editor.state.panBy(.{ m.dx, m.dy });
-            const input_hover = inputPortAtElementPoint(node.rect, editor, .{ m.x, m.y });
-            const output_hover = outputPortAtElementPoint(node.rect, editor, .{ m.x, m.y });
+            const input_hover = inputPortAtElementPoint(rect, editor, .{ m.x, m.y });
+            const output_hover = outputPortAtElementPoint(rect, editor, .{ m.x, m.y });
             const input_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
             const output_id = if (output_hover) |hit| editor.nodes[hit.node_index].id else null;
-            const hit = nodeAtElementPoint(node.rect, editor, .{ m.x, m.y });
+            const hit = nodeAtElementPoint(rect, editor, .{ m.x, m.y });
             const hover_id = if (hit) |index| editor.nodes[index].id else null;
-            const group_hit = if (hit == null and input_hover == null and output_hover == null) groupAtElementPoint(node.rect, editor, .{ m.x, m.y }) else null;
+            const group_hit = if (hit == null and input_hover == null and output_hover == null) groupAtElementPoint(rect, editor, .{ m.x, m.y }) else null;
             const group_hover_id = if (group_hit) |index| editor.groups[index].id else null;
-            const hover_connection = if (hit == null and group_hit == null and input_hover == null and output_hover == null) connectionAtElementPoint(node.rect, editor, .{ m.x, m.y }) else null;
+            const hover_connection = if (hit == null and group_hit == null and input_hover == null and output_hover == null) connectionAtElementPoint(rect, editor, .{ m.x, m.y }) else null;
             const changed = editor.state.hover_node_id != hover_id or
                 editor.state.hover_group_id != group_hover_id or
                 editor.state.hover_input_node_id != input_id or
@@ -2976,21 +2981,21 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
         .mouse_down => |m| {
             if (m.button == .right) {
                 const point = [2]f32{ m.x, m.y };
-                if (inputPortAtElementPoint(node.rect, editor, point)) |hit| {
+                if (inputPortAtElementPoint(rect, editor, point)) |hit| {
                     editor.state.context_menu.node_id = editor.nodes[hit.node_index].id;
                     editor.state.context_menu.port_index = hit.port_index;
                     editor.state.context_menu.group_id = null;
                     editor.state.context_menu.connection = null;
                     return editor.state.openContextMenu(.input_port, point);
                 }
-                if (outputPortAtElementPoint(node.rect, editor, point)) |hit| {
+                if (outputPortAtElementPoint(rect, editor, point)) |hit| {
                     editor.state.context_menu.node_id = editor.nodes[hit.node_index].id;
                     editor.state.context_menu.port_index = hit.port_index;
                     editor.state.context_menu.group_id = null;
                     editor.state.context_menu.connection = null;
                     return editor.state.openContextMenu(.output_port, point);
                 }
-                if (nodeAtElementPoint(node.rect, editor, point)) |index| {
+                if (nodeAtElementPoint(rect, editor, point)) |index| {
                     const id = editor.nodes[index].id;
                     if (!editor.state.isNodeSelected(id)) _ = editor.state.setSingleSelection(id);
                     editor.state.context_menu.node_id = id;
@@ -2998,14 +3003,14 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
                     editor.state.context_menu.connection = null;
                     return editor.state.openContextMenu(.node, point);
                 }
-                if (connectionAtElementPoint(node.rect, editor, point)) |connection| {
+                if (connectionAtElementPoint(rect, editor, point)) |connection| {
                     _ = editor.state.setConnectionSelection(connection);
                     editor.state.context_menu.connection = connection;
                     editor.state.context_menu.node_id = null;
                     editor.state.context_menu.group_id = null;
                     return editor.state.openContextMenu(.connection, point);
                 }
-                if (groupAtElementPoint(node.rect, editor, point)) |index| {
+                if (groupAtElementPoint(rect, editor, point)) |index| {
                     const id = editor.groups[index].id;
                     _ = editor.state.setGroupSelection(id);
                     editor.state.context_menu.group_id = id;
@@ -3021,25 +3026,25 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
             if (m.button != .left) return false;
             if (editor.show_minimap) {
                 const point = [2]f32{ m.x, m.y };
-                const snapshot = minimapSnapshot(node.rect, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
+                const snapshot = minimapSnapshot(rect, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
                 if (snapshot.contains(point)) {
                     _ = editor.state.closeContextMenu();
-                    return editor.state.beginMinimapDrag(node.rect, snapshot, point);
+                    return editor.state.beginMinimapDrag(rect, snapshot, point);
                 }
             }
             if (editor.state.selected_connection) |selected_connection| {
-                if (outputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| {
+                if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
                     if (editor.nodes[hit.node_index].id == selected_connection.from_id and hit.port_index == selected_connection.from_port) {
                         return editor.state.beginReconnectConnection(selected_connection, .from, .{ m.x, m.y });
                     }
                 }
-                if (inputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| {
+                if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
                     if (editor.nodes[hit.node_index].id == selected_connection.to_id and hit.port_index == selected_connection.to_port) {
                         return editor.state.beginReconnectConnection(selected_connection, .to, .{ m.x, m.y });
                     }
                 }
             }
-            if (outputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| {
+            if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
                 editor.state.dragging_connection_from_id = editor.nodes[hit.node_index].id;
                 editor.state.dragging_connection_from_port = hit.port_index;
                 editor.state.connection_preview = .{ m.x, m.y };
@@ -3047,27 +3052,27 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
                 editor.state.pending_connection = null;
                 return true;
             }
-            if (!node.input_shift_down) {
-                if (nodeAtElementPoint(node.rect, editor, .{ m.x, m.y })) |index| {
+            if (!input.shift_down) {
+                if (nodeAtElementPoint(rect, editor, .{ m.x, m.y })) |index| {
                     const id = editor.nodes[index].id;
                     return editor.state.beginNodeDrag(id);
                 }
             }
-            if (groupResizeAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| {
+            if (groupResizeAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
                 return editor.state.beginGroupResize(editor.groups[hit.group_index].id, hit.edges);
             }
-            if (connectionAtElementPoint(node.rect, editor, .{ m.x, m.y })) |connection| {
+            if (connectionAtElementPoint(rect, editor, .{ m.x, m.y })) |connection| {
                 return editor.state.setConnectionSelection(connection);
             }
-            if (groupAtElementPoint(node.rect, editor, .{ m.x, m.y })) |index| {
+            if (groupAtElementPoint(rect, editor, .{ m.x, m.y })) |index| {
                 return editor.state.beginGroupDrag(editor.groups[index].id);
             }
-            if (node.input_shift_down) {
-                const mode: BoxSelectMode = if ((node.input_control_down or node.input_super_down) and node.input_alt_down)
+            if (input.shift_down) {
+                const mode: BoxSelectMode = if ((input.control_down or input.super_down) and input.alt_down)
                     .toggle
-                else if (node.input_alt_down)
+                else if (input.alt_down)
                     .subtract
-                else if (node.input_control_down or node.input_super_down)
+                else if (input.control_down or input.super_down)
                     .add
                 else
                     .replace;
@@ -3086,7 +3091,7 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
             }
             if (editor.state.box_selecting) {
                 editor.state.box_select_end = .{ m.x, m.y };
-                return editor.state.applyBoxSelection(editor.nodes, editor.state.boxSelectRect(), node.rect, editor.state.zoom, editor.state.pan);
+                return editor.state.applyBoxSelection(editor.nodes, editor.state.boxSelectRect(), rect, editor.state.zoom, editor.state.pan);
             }
             if (editor.state.reconnecting_connection) |connection| {
                 const endpoint = editor.state.reconnecting_connection_end;
@@ -3094,12 +3099,12 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
                 if (editor.mutable_connections) |connections| {
                     if (editor.mutable_connection_len) |len| {
                         const target_id = switch (endpoint) {
-                            .from => if (outputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
-                            .to => if (inputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
+                            .from => if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
+                            .to => if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
                         };
                         const target_port = switch (endpoint) {
-                            .from => if (outputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| hit.port_index else 0,
-                            .to => if (inputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |hit| hit.port_index else 0,
+                            .from => if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| hit.port_index else 0,
+                            .to => if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| hit.port_index else 0,
                         };
                         if (target_id) |id| {
                             if (editor.history) |history| {
@@ -3122,7 +3127,7 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
                 return changed;
             }
             if (editor.state.dragging_connection_from_id) |from_id| {
-                if (inputPortAtElementPoint(node.rect, editor, .{ m.x, m.y })) |to_hit| {
+                if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |to_hit| {
                     const to_id = editor.nodes[to_hit.node_index].id;
                     if (from_id != to_id) {
                         const connection = Connection{ .from_id = from_id, .from_port = editor.state.dragging_connection_from_port, .to_id = to_id, .to_port = to_hit.port_index };
@@ -3151,12 +3156,12 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
             return editor.state.endDrag();
         },
         .mouse_wheel => |w| {
-            if (!node.rect.contains(.{ w.x, w.y })) return false;
+            if (!rect.contains(.{ w.x, w.y })) return false;
             return editor.state.panBy(.{ @floatCast(w.delta_x), @floatCast(w.delta_y) });
         },
         .mouse_pinch => |p| {
-            if (!node.rect.contains(.{ p.x, p.y })) return false;
-            return editor.state.zoomAt(node.rect, .{ p.x, p.y }, @floatCast(p.scale_delta));
+            if (!rect.contains(.{ p.x, p.y })) return false;
+            return editor.state.zoomAt(rect, .{ p.x, p.y }, @floatCast(p.scale_delta));
         },
         .key_down => |key| switch (key) {
             .home => {
@@ -3170,6 +3175,17 @@ pub fn handleElementEvent(node: anytype, event: anytype) bool {
         },
         else => return false,
     }
+}
+
+
+pub fn handleElementEvent(node: anytype, event: anytype) bool {
+    if (node.element != .node_editor) return false;
+    return handleEditorEvent(node.rect, .{
+        .shift_down = node.input_shift_down,
+        .control_down = node.input_control_down,
+        .super_down = node.input_super_down,
+        .alt_down = node.input_alt_down,
+    }, node.element.node_editor, event);
 }
 
 test "NodeEditor geometry transforms hit nodes ports and groups" {

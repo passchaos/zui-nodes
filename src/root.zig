@@ -129,6 +129,11 @@ pub const nodeGraphRect = node_editor.nodeGraphRect;
 pub const defaultInsertPosition = node_editor.defaultInsertPosition;
 pub const appendNodeEditor = node_editor.appendNodeEditor;
 pub const appendNodeEditorConnectionOverlay = node_editor.appendNodeEditorConnectionOverlay;
+pub const nodeRectFromState = node_editor.nodeRectFromState;
+pub const inputPortPositionAt = node_editor.inputPortPositionAt;
+pub const outputPortPositionAt = node_editor.outputPortPositionAt;
+pub const minimapSnapshot = node_editor.minimapSnapshot;
+pub const handleNodeEditorEvent = node_editor.handleEditorEvent;
 
 pub fn adoptionNote() []const u8 {
     return "Use zui-nodes for node graph/editor functionality; Zui core keeps base UI primitives.";
