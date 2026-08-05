@@ -18,17 +18,27 @@ pub const CommandId = commands.CommandId;
 pub const CommandRegistry = zui.CommandRegistry;
 pub const MenuItem = zui.MenuItem;
 pub const MenuModel = zui.MenuModel;
+pub const SelectionCommand = commands.SelectionCommand;
 pub const NodeEditorCommand = commands.NodeEditorCommand;
 pub const HistoryCommand = commands.HistoryCommand;
 pub const CommandContext = command_dispatch.CommandContext;
 pub const ContextTarget = node_editor.ContextTarget;
 
 pub const node_editor_command_category = "node editor";
+pub const node_editor_selection_category = "node editor selection";
 pub const node_editor_history_category = "node editor history";
+pub const node_editor_selection_command_count: usize = @intFromEnum(SelectionCommand.focus) + 1;
 pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.select_context_port_peers) + 1;
 pub const node_editor_history_command_count: usize = @intFromEnum(HistoryCommand.redo) + 1;
-pub const node_editor_all_command_count: usize = node_editor_command_count + node_editor_history_command_count;
+pub const node_editor_all_command_count: usize = node_editor_selection_command_count + node_editor_command_count + node_editor_history_command_count;
 pub const node_editor_context_menu_capacity: usize = 40;
+
+pub const node_editor_selection_commands = [_]Command{
+    .{ .id = SelectionCommand.rename.commandId(), .title = "Rename Selected Node", .description = "Begin renaming the active node selection", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "Enter" },
+    .{ .id = SelectionCommand.delete.commandId(), .title = "Delete Selected Nodes", .description = "Delete selected nodes or the selected node link", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "Delete", .destructive = true },
+    .{ .id = SelectionCommand.duplicate.commandId(), .title = "Duplicate Selected Nodes", .description = "Duplicate selected nodes and their internal links", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "Ctrl+D", .pinned = true },
+    .{ .id = SelectionCommand.focus.commandId(), .title = "Focus Selection", .description = "Focus the active node selection", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "F" },
+};
 
 pub const node_editor_commands = [_]Command{
     .{ .id = NodeEditorCommand.clear_selection.commandId(), .title = "Clear Node Selection", .description = "Clear the current node-editor selection", .category = node_editor_command_category, .panel_role = .viewport, .default_shortcut = "Esc" },
@@ -72,7 +82,8 @@ pub const node_editor_history_commands = [_]Command{
     .{ .id = HistoryCommand.redo.commandId(), .title = "Redo Node Edit", .description = "Redo the last undone node-editor mutation", .category = node_editor_history_category, .panel_role = .viewport, .default_shortcut = "Ctrl+Shift+Z", .pinned = true },
 };
 
-pub const node_editor_all_commands = node_editor_commands ++ node_editor_history_commands;
+pub const node_editor_all_commands = node_editor_selection_commands ++ node_editor_commands ++ node_editor_history_commands;
+pub const node_editor_selection_command_registry = CommandRegistry{ .commands = &node_editor_selection_commands };
 pub const node_editor_command_registry = CommandRegistry{ .commands = &node_editor_commands };
 pub const node_editor_history_command_registry = CommandRegistry{ .commands = &node_editor_history_commands };
 pub const node_editor_all_command_registry = CommandRegistry{ .commands = &node_editor_all_commands };
@@ -105,6 +116,10 @@ pub fn nodeEditorCommandRegistry() CommandRegistry {
     return node_editor_command_registry;
 }
 
+pub fn nodeEditorSelectionCommandRegistry() CommandRegistry {
+    return node_editor_selection_command_registry;
+}
+
 pub fn nodeEditorHistoryCommandRegistry() CommandRegistry {
     return node_editor_history_command_registry;
 }
@@ -123,6 +138,15 @@ pub fn nodeEditorCommandRegistryForContext(context: *const CommandContext, out: 
     return .{ .commands = out };
 }
 
+pub fn nodeEditorSelectionCommandRegistryForContext(context: *const CommandContext, out: *[node_editor_selection_command_count]Command) CommandRegistry {
+    out.* = node_editor_selection_commands;
+    for (out) |*command| {
+        const selection_command = command_dispatch.selectionCommandFromId(command.id) orelse continue;
+        command.enabled = command_dispatch.canDispatchSelection(context, selection_command);
+    }
+    return .{ .commands = out };
+}
+
 pub fn nodeEditorHistoryCommandRegistryForContext(context: *const CommandContext, out: *[node_editor_history_command_count]Command) CommandRegistry {
     out.* = node_editor_history_commands;
     for (out) |*command| {
@@ -133,14 +157,19 @@ pub fn nodeEditorHistoryCommandRegistryForContext(context: *const CommandContext
 }
 
 pub fn nodeEditorAllCommandRegistryForContext(context: *const CommandContext, out: *[node_editor_all_command_count]Command) CommandRegistry {
-    for (node_editor_commands, 0..) |command, index| {
+    for (node_editor_selection_commands, 0..) |command, index| {
         out[index] = command;
     }
+    for (node_editor_commands, 0..) |command, index| {
+        out[node_editor_selection_command_count + index] = command;
+    }
     for (node_editor_history_commands, 0..) |command, index| {
-        out[node_editor_command_count + index] = command;
+        out[node_editor_selection_command_count + node_editor_command_count + index] = command;
     }
     for (out) |*command| {
-        if (command_dispatch.commandFromId(command.id)) |node_command| {
+        if (command_dispatch.selectionCommandFromId(command.id)) |selection_command| {
+            command.enabled = command_dispatch.canDispatchSelection(context, selection_command);
+        } else if (command_dispatch.commandFromId(command.id)) |node_command| {
             command.enabled = command_dispatch.canDispatch(context, node_command);
             command.checked = nodeEditorCommandChecked(context, node_command);
         } else if (command_dispatch.historyCommandFromId(command.id)) |history_command| {
@@ -168,6 +197,9 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
                 builder.appendSeparator();
             }
             if (options.include_selection) {
+                builder.appendSelection(.duplicate);
+                builder.appendSelection(.delete);
+                builder.appendSeparator();
                 builder.appendCommand(.select_all);
                 builder.appendCommand(.clear_selection);
                 builder.appendCommand(.focus_selection);
@@ -188,6 +220,10 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
                 builder.appendSeparator();
             }
             if (options.include_selection) {
+                builder.appendSelection(.duplicate);
+                builder.appendSelection(.delete);
+                builder.appendSelection(.rename);
+                builder.appendSeparator();
                 builder.appendCommand(.clear_selection);
                 builder.appendCommand(.focus_selection);
                 builder.appendCommand(.frame_all);
@@ -226,6 +262,7 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
         },
         .connection => {
             if (options.include_connection) {
+                builder.appendSelection(.delete);
                 builder.appendCommand(.reconnect_to_previous);
                 builder.appendCommand(.reconnect_to_next);
                 builder.appendCommand(.disconnect_selected_link);
@@ -296,6 +333,13 @@ const MenuBuilder = struct {
         });
     }
 
+    fn appendSelection(self: *MenuBuilder, command: SelectionCommand) void {
+        self.appendRaw(.{
+            .command_id = command.commandId(),
+            .enabled = command_dispatch.canDispatchSelection(self.context, command),
+        });
+    }
+
     fn appendHistory(self: *MenuBuilder, command: HistoryCommand) void {
         self.appendRaw(.{
             .command_id = command.commandId(),
@@ -330,10 +374,24 @@ fn menuContainsCommand(model: MenuModel, command: NodeEditorCommand) bool {
     return false;
 }
 
+fn menuContainsSelectionCommand(model: MenuModel, command: SelectionCommand) bool {
+    const id = command.commandId();
+    for (model.items) |item| {
+        if (item.command_id != null and item.command_id.? == id) return true;
+    }
+    return false;
+}
+
 test "zui-nodes command surface exposes stable node editor metadata" {
+    try std.testing.expectEqual(node_editor_selection_command_count, node_editor_selection_commands.len);
     try std.testing.expectEqual(node_editor_command_count, node_editor_commands.len);
     try std.testing.expectEqual(node_editor_history_command_count, node_editor_history_commands.len);
     try std.testing.expectEqual(node_editor_all_command_count, node_editor_all_commands.len);
+
+    const selection_registry = nodeEditorSelectionCommandRegistry();
+    const duplicate = selection_registry.find(SelectionCommand.duplicate.commandId()) orelse return error.MissingDuplicateMetadata;
+    try std.testing.expectEqualStrings("Duplicate Selected Nodes", duplicate.title);
+    try std.testing.expectEqualStrings(node_editor_selection_category, duplicate.category);
 
     const registry = nodeEditorCommandRegistry();
     const select_all = registry.find(NodeEditorCommand.select_all.commandId()) orelse return error.MissingSelectAllMetadata;
@@ -341,6 +399,10 @@ test "zui-nodes command surface exposes stable node editor metadata" {
     try std.testing.expectEqualStrings(node_editor_command_category, select_all.category);
     try std.testing.expect(select_all.pinned);
 
+    for (node_editor_selection_commands, 0..) |command, index| {
+        try std.testing.expectEqual(commands.selection_command_id_base + @as(u32, @intCast(index)), command.id);
+        try std.testing.expect(command_dispatch.selectionCommandFromId(command.id) != null);
+    }
     for (node_editor_commands, 0..) |command, index| {
         try std.testing.expectEqual(commands.node_editor_command_id_base + @as(u32, @intCast(index)), command.id);
         try std.testing.expect(command_dispatch.commandFromId(command.id) != null);
@@ -360,14 +422,20 @@ test "zui-nodes dynamic command registry mirrors dispatch availability" {
     var node_len: usize = 2;
     var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len };
     var storage: [node_editor_command_count]Command = undefined;
+    var selection_storage: [node_editor_selection_command_count]Command = undefined;
 
     var registry = nodeEditorCommandRegistryForContext(&context, &storage);
+    var selection_registry = nodeEditorSelectionCommandRegistryForContext(&context, &selection_storage);
     try std.testing.expect(registry.isEnabled(NodeEditorCommand.select_all.commandId()));
     try std.testing.expect(!registry.isEnabled(NodeEditorCommand.clear_selection.commandId()));
+    try std.testing.expect(!selection_registry.isEnabled(SelectionCommand.delete.commandId()));
 
     try std.testing.expect(command_dispatch.dispatchId(&context, NodeEditorCommand.select_all.commandId()));
     registry = nodeEditorCommandRegistryForContext(&context, &storage);
+    selection_registry = nodeEditorSelectionCommandRegistryForContext(&context, &selection_storage);
     try std.testing.expect(registry.isEnabled(NodeEditorCommand.clear_selection.commandId()));
+    try std.testing.expect(selection_registry.isEnabled(SelectionCommand.delete.commandId()));
+    try std.testing.expect(selection_registry.isEnabled(SelectionCommand.duplicate.commandId()));
     try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
 }
 
@@ -392,6 +460,8 @@ test "zui-nodes context menu model resolves through command registry" {
     try std.testing.expect(summary.separator_count >= 2);
     try std.testing.expect(summary.selectable_count >= 4);
     try std.testing.expect(summary.disabled_count >= 1);
+    try std.testing.expect(menuContainsSelectionCommand(model, .duplicate));
+    try std.testing.expect(menuContainsSelectionCommand(model, .delete));
     try std.testing.expect(menuContainsCommand(model, .select_all));
     try std.testing.expect(menuContainsCommand(model, .insert_processing_node));
     for (model.items, 0..) |item, index| {

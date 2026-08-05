@@ -15,6 +15,7 @@ pub const CommandId = commands.CommandId;
 
 pub const CommandContext = struct {
     state: *node_editor.State,
+    selection_state: ?*commands.SelectionCommandState = null,
     nodes: []node_editor.Node,
     node_len: *usize,
     connections: []node_editor.Connection = &.{},
@@ -36,6 +37,38 @@ pub fn commandFromId(command_id: CommandId) ?NodeEditorCommand {
     const raw = command_id - commands.node_editor_command_id_base;
     if (raw > @intFromEnum(NodeEditorCommand.select_context_port_peers)) return null;
     return @enumFromInt(raw);
+}
+
+pub fn selectionCommandFromId(command_id: CommandId) ?SelectionCommand {
+    if (command_id < commands.selection_command_id_base) return null;
+    const raw = command_id - commands.selection_command_id_base;
+    if (raw > @intFromEnum(SelectionCommand.focus)) return null;
+    return @enumFromInt(raw);
+}
+
+pub fn canDispatchSelection(context: *const CommandContext, command: SelectionCommand) bool {
+    const node_count = activeNodeCount(context);
+    const connection_count = activeConnectionCount(context);
+    return switch (command) {
+        .delete, .duplicate => if (context.connection_len != null)
+            context.state.canMutateSelectedNodeGraph(command, context.nodes, node_count, context.connections, connection_count)
+        else
+            context.state.canMutateSelectedNodes(command, context.nodes, node_count),
+        .rename, .focus => context.state.canMutateSelectedNodes(command, context.nodes, node_count),
+    };
+}
+
+pub fn dispatchSelection(context: *CommandContext, command: SelectionCommand) bool {
+    if (!canDispatchSelection(context, command)) return false;
+    return switch (command) {
+        .delete, .duplicate => dispatchSelectionMutation(context, command),
+        .rename, .focus => dispatchSelectionStateOnly(context, command),
+    };
+}
+
+pub fn dispatchSelectionId(context: *CommandContext, command_id: CommandId) bool {
+    const command = selectionCommandFromId(command_id) orelse return false;
+    return dispatchSelection(context, command);
 }
 
 pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) bool {
@@ -156,6 +189,46 @@ fn activeGroupCount(context: *const CommandContext) usize {
 fn pushHistory(context: *CommandContext) void {
     const history = context.history orelse return;
     history.pushBeforeWithGroups(context.state.*, context.nodes, activeNodeCount(context), context.groups[0..activeGroupCount(context)], context.connections, activeConnectionCount(context));
+}
+
+fn dispatchSelectionStateOnly(context: *CommandContext, command: SelectionCommand) bool {
+    var local_selection = commands.SelectionCommandState{};
+    const selection = context.selection_state orelse &local_selection;
+    const result = context.state.handleSelectionCommand(command, selection);
+    return result.handled;
+}
+
+fn dispatchSelectionMutation(context: *CommandContext, command: SelectionCommand) bool {
+    const node_count = activeNodeCount(context);
+    const selected_before = switch (command) {
+        .delete => context.state.lastSelectedStoredNodeId(context.nodes, node_count) orelse context.state.lastSelectedNodeId(),
+        else => context.state.lastSelectedNodeId(),
+    };
+    pushHistory(context);
+    const changed = if (context.connection_len) |connection_len|
+        switch (command) {
+            .delete => context.state.deleteSelectedNodesAndConnections(context.nodes, context.node_len, context.connections, connection_len),
+            .duplicate => context.state.duplicateSelectedNodesAndConnections(context.nodes, context.node_len, context.connections, connection_len, context.duplicate_id_offset, context.duplicate_offset),
+            .rename, .focus => false,
+        }
+    else switch (command) {
+        .delete => context.state.deleteSelectedNodes(context.nodes, context.node_len),
+        .duplicate => context.state.duplicateSelectedNodes(context.nodes, context.node_len, context.duplicate_id_offset, context.duplicate_offset),
+        .rename, .focus => false,
+    };
+    if (!changed) return false;
+    if (context.selection_state) |selection| {
+        selection.selected_id = context.state.selected_node_id;
+        switch (command) {
+            .delete => selection.last_deleted_id = selected_before,
+            .duplicate => {
+                selection.last_duplicated_id = selection.selected_id;
+                selection.duplicate_count +%= 1;
+            },
+            .rename, .focus => {},
+        }
+    }
+    return true;
 }
 
 fn copySelection(context: *CommandContext) bool {
@@ -312,4 +385,49 @@ test "zui-nodes command dispatch reconnects selected connection and supports his
     try std.testing.expectEqual(@as(u32, 2), connections[0].to_id);
     try std.testing.expect(dispatchHistoryId(&ctx, HistoryCommand.redo.commandId()));
     try std.testing.expectEqual(@as(u32, 3), connections[0].to_id);
+}
+
+test "zui-nodes selection dispatch duplicates, deletes, and records history" {
+    var selected: [8]u32 = .{0} ** 8;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var selection_state = commands.SelectionCommandState{};
+    var nodes: [8]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 8;
+    nodes[0] = .{ .id = 1, .title = "A", .pos = .{ 0, 0 } };
+    nodes[1] = .{ .id = 2, .title = "B", .pos = .{ 100, 0 } };
+    var node_len: usize = 2;
+    var connections: [8]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 8;
+    connections[0] = .{ .from_id = 1, .to_id = 2 };
+    var connection_len: usize = 1;
+    var groups: [2]node_editor.Group = .{node_editor.Group{ .id = 0, .title = "", .rect = .zero }} ** 2;
+    var group_len: usize = 0;
+    var history = node_editor.History{};
+    var ctx = CommandContext{
+        .state = &state,
+        .selection_state = &selection_state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .groups = &groups,
+        .group_len = &group_len,
+        .history = &history,
+    };
+
+    try std.testing.expect(selectionCommandFromId(SelectionCommand.duplicate.commandId()) == .duplicate);
+    try std.testing.expect(dispatch(&ctx, .select_all));
+    try std.testing.expect(canDispatchSelection(&ctx, .duplicate));
+    try std.testing.expect(dispatchSelection(&ctx, .duplicate));
+    try std.testing.expectEqual(@as(usize, 4), node_len);
+    try std.testing.expectEqual(@as(usize, 2), connection_len);
+    try std.testing.expectEqual(@as(u32, 1), selection_state.duplicate_count);
+    try std.testing.expect(selection_state.last_duplicated_id != null);
+
+    try std.testing.expect(dispatchHistory(&ctx, .undo));
+    try std.testing.expectEqual(@as(usize, 2), node_len);
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(dispatchSelectionId(&ctx, SelectionCommand.delete.commandId()));
+    try std.testing.expectEqual(@as(usize, 2), node_len);
+    try std.testing.expectEqual(@as(usize, 0), connection_len);
 }
