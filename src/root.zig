@@ -6,6 +6,7 @@
 pub const commands = @import("commands.zig");
 pub const node_editor = @import("node_editor.zig");
 pub const node_editor_adapters = @import("node_editor_adapters.zig");
+pub const view = @import("view.zig");
 
 pub const CommandId = commands.CommandId;
 pub const SelectionCommand = commands.SelectionCommand;
@@ -37,6 +38,8 @@ pub const PortType = node_editor.PortType;
 pub const HistorySnapshot = node_editor.HistorySnapshot;
 pub const History = node_editor.History;
 pub const Options = node_editor.Options;
+pub const NodeEditorViewOptions = view.NodeEditorViewOptions;
+pub const nodeEditorView = view.nodeEditorView;
 
 pub const graphToScreen = node_editor.graphToScreen;
 pub const screenToGraph = node_editor.screenToGraph;
