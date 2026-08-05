@@ -112,6 +112,44 @@ pub const NodeEditorContextMenuSummary = struct {
     }
 };
 
+pub const NodeEditorContextMenuCapabilities = struct {
+    target: ContextTarget = .canvas,
+    can_copy: bool = false,
+    can_paste: bool = false,
+    has_nodes: bool = false,
+    has_selection: bool = false,
+    can_duplicate: bool = false,
+    can_delete: bool = false,
+    can_frame_all: bool = false,
+    can_focus_selection: bool = false,
+    can_insert_image_input: bool = false,
+    can_insert_processing_node: bool = false,
+    can_insert_output_node: bool = false,
+    can_insert_processing_chain: bool = false,
+    can_align_left: bool = false,
+    can_align_center_x: bool = false,
+    can_align_right: bool = false,
+    can_align_top: bool = false,
+    can_align_center_y: bool = false,
+    can_align_bottom: bool = false,
+    can_distribute_horizontal: bool = false,
+    can_distribute_vertical: bool = false,
+    can_group_selected_nodes: bool = false,
+    can_select_group_contents: bool = false,
+    can_fit_group_to_selection: bool = false,
+    can_ungroup_selected: bool = false,
+    can_disconnect_selected_link: bool = false,
+    can_disconnect_selected_inputs: bool = false,
+    can_disconnect_selected_outputs: bool = false,
+    can_disconnect_selected_links: bool = false,
+    can_disconnect_context_port_links: bool = false,
+    can_select_context_port_peers: bool = false,
+    can_select_upstream_nodes: bool = false,
+    can_select_downstream_nodes: bool = false,
+    can_reconnect_to_previous: bool = false,
+    can_reconnect_to_next: bool = false,
+};
+
 pub fn nodeEditorCommandRegistry() CommandRegistry {
     return node_editor_command_registry;
 }
@@ -299,6 +337,123 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
     return .{ .items = out[0..builder.count] };
 }
 
+pub fn nodeEditorContextMenuModelForCapabilities(capabilities: NodeEditorContextMenuCapabilities, options: NodeEditorContextMenuOptions, out: []MenuItem) MenuModel {
+    var builder = CapabilityMenuBuilder{ .capabilities = capabilities, .out = out };
+    const target = options.target orelse capabilities.target;
+    if (options.include_history) {
+        builder.appendHistory(.undo, false);
+        builder.appendHistory(.redo, false);
+        builder.appendSeparator();
+    }
+    switch (target) {
+        .canvas => {
+            if (options.include_clipboard) {
+                builder.appendCommand(.paste_clipboard, capabilities.can_paste);
+                builder.appendCommand(.copy_selection, capabilities.can_copy);
+                builder.appendSeparator();
+            }
+            if (options.include_selection) {
+                builder.appendSelection(.duplicate, capabilities.can_duplicate);
+                builder.appendSelection(.delete, capabilities.can_delete);
+                builder.appendSeparator();
+                builder.appendCommand(.select_all, capabilities.has_nodes);
+                builder.appendCommand(.clear_selection, capabilities.has_selection);
+                builder.appendCommand(.focus_selection, capabilities.can_focus_selection);
+                builder.appendCommand(.frame_all, capabilities.can_frame_all);
+                builder.appendSeparator();
+            }
+            if (options.include_insert) {
+                builder.appendCommand(.insert_image_input, capabilities.can_insert_image_input);
+                builder.appendCommand(.insert_processing_node, capabilities.can_insert_processing_node);
+                builder.appendCommand(.insert_output_node, capabilities.can_insert_output_node);
+                builder.appendCommand(.insert_processing_chain, capabilities.can_insert_processing_chain);
+            }
+        },
+        .node => {
+            if (options.include_clipboard) {
+                builder.appendCommand(.copy_selection, capabilities.can_copy);
+                builder.appendCommand(.paste_clipboard, capabilities.can_paste);
+                builder.appendSeparator();
+            }
+            if (options.include_selection) {
+                builder.appendSelection(.duplicate, capabilities.can_duplicate);
+                builder.appendSelection(.delete, capabilities.can_delete);
+                builder.appendSelection(.rename, capabilities.has_selection);
+                builder.appendSeparator();
+                builder.appendCommand(.clear_selection, capabilities.has_selection);
+                builder.appendCommand(.focus_selection, capabilities.can_focus_selection);
+                builder.appendCommand(.frame_all, capabilities.can_frame_all);
+                builder.appendSeparator();
+            }
+            if (options.include_arrange) {
+                builder.appendCommand(.align_left, capabilities.can_align_left);
+                builder.appendCommand(.align_center_x, capabilities.can_align_center_x);
+                builder.appendCommand(.align_right, capabilities.can_align_right);
+                builder.appendCommand(.align_top, capabilities.can_align_top);
+                builder.appendCommand(.align_center_y, capabilities.can_align_center_y);
+                builder.appendCommand(.align_bottom, capabilities.can_align_bottom);
+                builder.appendCommand(.distribute_horizontal, capabilities.can_distribute_horizontal);
+                builder.appendCommand(.distribute_vertical, capabilities.can_distribute_vertical);
+                builder.appendSeparator();
+            }
+            if (options.include_group) {
+                builder.appendCommand(.group_selected_nodes, capabilities.can_group_selected_nodes);
+                builder.appendCommand(.select_group_contents, capabilities.can_select_group_contents);
+                builder.appendCommand(.fit_group_to_selection, capabilities.can_fit_group_to_selection);
+                builder.appendCommand(.ungroup_selected, capabilities.can_ungroup_selected);
+                builder.appendSeparator();
+            }
+            if (options.include_connection) {
+                builder.appendCommand(.disconnect_selected_inputs, capabilities.can_disconnect_selected_inputs);
+                builder.appendCommand(.disconnect_selected_outputs, capabilities.can_disconnect_selected_outputs);
+                builder.appendCommand(.disconnect_selected_links, capabilities.can_disconnect_selected_links);
+            }
+        },
+        .group => {
+            if (options.include_group) {
+                builder.appendCommand(.select_group_contents, capabilities.can_select_group_contents);
+                builder.appendCommand(.fit_group_to_selection, capabilities.can_fit_group_to_selection);
+                builder.appendCommand(.ungroup_selected, capabilities.can_ungroup_selected);
+            }
+        },
+        .connection => {
+            if (options.include_connection) {
+                builder.appendSelection(.delete, capabilities.can_delete);
+                builder.appendCommand(.reconnect_to_previous, capabilities.can_reconnect_to_previous);
+                builder.appendCommand(.reconnect_to_next, capabilities.can_reconnect_to_next);
+                builder.appendCommand(.disconnect_selected_link, capabilities.can_disconnect_selected_link);
+                builder.appendSeparator();
+                builder.appendCommand(.select_upstream_nodes, capabilities.can_select_upstream_nodes);
+                builder.appendCommand(.select_downstream_nodes, capabilities.can_select_downstream_nodes);
+            }
+        },
+        .input_port => {
+            if (options.include_port_actions) {
+                builder.appendCommand(.disconnect_context_port_links, capabilities.can_disconnect_context_port_links);
+                builder.appendCommand(.select_context_port_peers, capabilities.can_select_context_port_peers);
+                builder.appendSeparator();
+            }
+            if (options.include_connection) {
+                builder.appendCommand(.disconnect_selected_inputs, capabilities.can_disconnect_selected_inputs);
+                builder.appendCommand(.select_upstream_nodes, capabilities.can_select_upstream_nodes);
+            }
+        },
+        .output_port => {
+            if (options.include_port_actions) {
+                builder.appendCommand(.disconnect_context_port_links, capabilities.can_disconnect_context_port_links);
+                builder.appendCommand(.select_context_port_peers, capabilities.can_select_context_port_peers);
+                builder.appendSeparator();
+            }
+            if (options.include_connection) {
+                builder.appendCommand(.disconnect_selected_outputs, capabilities.can_disconnect_selected_outputs);
+                builder.appendCommand(.select_downstream_nodes, capabilities.can_select_downstream_nodes);
+            }
+        },
+    }
+    builder.trimTrailingSeparator();
+    return .{ .items = out[0..builder.count] };
+}
+
 pub fn summarizeNodeEditorContextMenu(model: MenuModel, registry: CommandRegistry) NodeEditorContextMenuSummary {
     var summary = NodeEditorContextMenuSummary{ .item_count = model.items.len };
     for (model.items, 0..) |item, index| {
@@ -366,12 +521,69 @@ const MenuBuilder = struct {
     }
 };
 
+const CapabilityMenuBuilder = struct {
+    capabilities: NodeEditorContextMenuCapabilities,
+    out: []MenuItem,
+    count: usize = 0,
+
+    fn appendCommand(self: *CapabilityMenuBuilder, command: NodeEditorCommand, enabled: bool) void {
+        _ = self.capabilities;
+        self.appendRaw(.{ .command_id = command.commandId(), .enabled = enabled });
+    }
+
+    fn appendSelection(self: *CapabilityMenuBuilder, command: SelectionCommand, enabled: bool) void {
+        self.appendRaw(.{ .command_id = command.commandId(), .enabled = enabled });
+    }
+
+    fn appendHistory(self: *CapabilityMenuBuilder, command: HistoryCommand, enabled: bool) void {
+        self.appendRaw(.{ .command_id = command.commandId(), .enabled = enabled });
+    }
+
+    fn appendSeparator(self: *CapabilityMenuBuilder) void {
+        if (self.count == 0) return;
+        if (self.out[self.count - 1].kind == .separator) return;
+        self.appendRaw(MenuItem.separator());
+    }
+
+    fn appendRaw(self: *CapabilityMenuBuilder, item: MenuItem) void {
+        if (self.count >= self.out.len) return;
+        self.out[self.count] = item;
+        self.count += 1;
+    }
+
+    fn trimTrailingSeparator(self: *CapabilityMenuBuilder) void {
+        while (self.count > 0 and self.out[self.count - 1].kind == .separator) {
+            self.count -= 1;
+        }
+    }
+};
+
 fn menuContainsCommand(model: MenuModel, command: NodeEditorCommand) bool {
     const id = command.commandId();
     for (model.items) |item| {
         if (item.command_id != null and item.command_id.? == id) return true;
     }
     return false;
+}
+
+test "zui-nodes context menu capabilities build legacy-compatible menu without state type coupling" {
+    var items: [node_editor_context_menu_capacity]MenuItem = undefined;
+    const model = nodeEditorContextMenuModelForCapabilities(.{
+        .target = .output_port,
+        .can_disconnect_context_port_links = true,
+        .can_select_context_port_peers = true,
+        .can_disconnect_selected_outputs = true,
+        .can_select_downstream_nodes = true,
+    }, .{}, &items);
+    const registry = nodeEditorAllCommandRegistry();
+    const summary = summarizeNodeEditorContextMenu(model, registry);
+    try std.testing.expectEqual(@as(usize, 5), summary.item_count);
+    try std.testing.expectEqual(@as(usize, 4), summary.command_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.separator_count);
+    try std.testing.expect(menuContainsCommand(model, .disconnect_context_port_links));
+    try std.testing.expect(menuContainsCommand(model, .select_context_port_peers));
+    try std.testing.expect(menuContainsCommand(model, .disconnect_selected_outputs));
+    try std.testing.expect(menuContainsCommand(model, .select_downstream_nodes));
 }
 
 fn menuContainsSelectionCommand(model: MenuModel, command: SelectionCommand) bool {
