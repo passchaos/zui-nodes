@@ -97,6 +97,28 @@ const core_port_image = [_]zui.NodeEditorPortType{.image};
 const core_port_mask = [_]zui.NodeEditorPortType{.mask};
 const core_port_geometry = [_]zui.NodeEditorPortType{.geometry};
 
+pub fn coreSelectionStateFrom(value: @import("commands.zig").SelectionCommandState) zui.SelectionCommandState {
+    return .{
+        .selected_id = value.selected_id,
+        .last_renamed_id = value.last_renamed_id,
+        .last_deleted_id = value.last_deleted_id,
+        .last_duplicated_id = value.last_duplicated_id,
+        .last_focused_id = value.last_focused_id,
+        .duplicate_count = value.duplicate_count,
+    };
+}
+
+pub fn selectionStateFromCore(value: zui.SelectionCommandState) @import("commands.zig").SelectionCommandState {
+    return .{
+        .selected_id = value.selected_id,
+        .last_renamed_id = value.last_renamed_id,
+        .last_deleted_id = value.last_deleted_id,
+        .last_duplicated_id = value.last_duplicated_id,
+        .last_focused_id = value.last_focused_id,
+        .duplicate_count = value.duplicate_count,
+    };
+}
+
 pub fn corePortTypeFrom(value: NodeEditorPortType) zui.NodeEditorPortType {
     return switch (value) {
         .any => .any,
@@ -239,6 +261,10 @@ test "zui-nodes adapters convert zui core node editor model values" {
     try @import("std").testing.expectEqual(@as(usize, 1), copyConnectionsFrom(zui.NodeEditorConnection, &core_connections, &connections));
     try @import("std").testing.expectEqual(@as(usize, 1), copyGroupsFrom(zui.NodeEditorGroup, &core_groups, &groups));
     try @import("std").testing.expectEqual(@as(u32, 1), nodes[0].id);
+    const core_selection = zui.SelectionCommandState{ .selected_id = 2, .duplicate_count = 3 };
+    const extension_selection = selectionStateFromCore(core_selection);
+    try @import("std").testing.expectEqual(core_selection.selected_id, extension_selection.selected_id);
+    try @import("std").testing.expectEqual(core_selection.duplicate_count, coreSelectionStateFrom(extension_selection).duplicate_count);
     try @import("std").testing.expectEqual(NodeEditorPortType.image, portTypeFrom(core_nodes[0].output_types[0]));
     const native_node = NodeEditorNode{ .id = 9, .title = "Native", .pos = .{ 0, 0 }, .output_types = &.{.image} };
     try @import("std").testing.expectEqual(zui.NodeEditorPortType.image, corePortTypeFrom(native_node.output_types[0]));
