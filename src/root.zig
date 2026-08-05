@@ -7,6 +7,7 @@ pub const commands = @import("commands.zig");
 pub const node_editor = @import("node_editor.zig");
 pub const node_editor_adapters = @import("node_editor_adapters.zig");
 pub const view = @import("view.zig");
+pub const command_dispatch = @import("command_dispatch.zig");
 
 pub const CommandId = commands.CommandId;
 pub const SelectionCommand = commands.SelectionCommand;
@@ -15,6 +16,11 @@ pub const SelectionCommandState = commands.SelectionCommandState;
 pub const NodeEditorCommand = commands.NodeEditorCommand;
 pub const node_editor_command_id_base = commands.node_editor_command_id_base;
 pub const nodeEditorCommandId = commands.nodeEditorCommandId;
+pub const NodeEditorCommandContext = command_dispatch.CommandContext;
+pub const nodeEditorCommandFromId = command_dispatch.commandFromId;
+pub const nodeEditorCanDispatch = command_dispatch.canDispatch;
+pub const dispatchNodeEditorCommand = command_dispatch.dispatch;
+pub const dispatchNodeEditorCommandId = command_dispatch.dispatchId;
 
 pub const GroupResizeEdges = node_editor.GroupResizeEdges;
 pub const ContextTarget = node_editor.ContextTarget;
