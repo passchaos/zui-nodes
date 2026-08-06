@@ -39,6 +39,7 @@ pub const command_dispatch = @import("command_dispatch.zig");
 pub const command_surface = @import("command_surface.zig");
 pub const command_targets = @import("command_targets.zig");
 pub const migration_manifest_mod = @import("migration_manifest.zig");
+pub const devtools = @import("devtools.zig");
 
 pub const MigrationStatus = migration_manifest_mod.MigrationStatus;
 pub const MigrationArea = migration_manifest_mod.MigrationArea;
@@ -47,6 +48,11 @@ pub const MigrationSummary = migration_manifest_mod.MigrationSummary;
 pub const migration_manifest = migration_manifest_mod.migration_manifest;
 pub const summarizeMigration = migration_manifest_mod.summarize;
 pub const migrationHasItem = migration_manifest_mod.hasItem;
+pub const DevtoolsSummary = devtools.Summary;
+pub const DevtoolsSummaryOptions = devtools.SummaryOptions;
+pub const DevtoolsPanelOptions = devtools.PanelOptions;
+pub const summarizeDevtools = devtools.summarize;
+pub const devtoolsPanel = devtools.panel;
 
 pub const CommandId = commands.CommandId;
 pub const SelectionCommand = commands.SelectionCommand;
@@ -188,5 +194,5 @@ test "zui-nodes migration manifest documents node editor ownership" {
     const summary = summarizeMigration(&migration_manifest);
     try std.testing.expect(summary.native_count > summary.bridge_count);
     try std.testing.expect(migrationHasItem(&migration_manifest, "node editor model", .native));
-    try std.testing.expect(migrationHasItem(&migration_manifest, "node graph devtools", .bridge));
+    try std.testing.expect(migrationHasItem(&migration_manifest, "node graph devtools", .native));
 }
