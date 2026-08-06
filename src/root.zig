@@ -7,6 +7,7 @@ const std = @import("std");
 const zui = @import("zui");
 
 pub const extension_id = "zui-nodes";
+pub const extension_command_surface_command_id: zui.CommandId = 0x5A4E_0001;
 
 pub const extension_capabilities = [_]zui.ExtensionCapability{
     .{ .area = .node_graph, .name = "node graph editor" },
@@ -16,7 +17,7 @@ pub const extension_capabilities = [_]zui.ExtensionCapability{
 
 pub const extension_contributions = [_]zui.ExtensionContribution{
     .{ .kind = .widget, .id = extension_id ++ ".node-editor", .title = "Node Editor", .payload = .{ .widget = .{ .widget_id = "node-editor", .view_adapter = "zui-nodes.nodeEditorView" } } },
-    .{ .kind = .command, .id = extension_id ++ ".command-surface", .title = "Node Editor Commands", .payload = .{ .command = .{ .registry_id = "node-editor", .category = "node graph" } } },
+    .{ .kind = .command, .id = extension_id ++ ".command-surface", .title = "Node Editor Commands", .payload = .{ .command = .{ .command_id = extension_command_surface_command_id, .registry_id = "node-editor", .category = "node graph" } } },
     .{ .kind = .keymap, .id = extension_id ++ ".keymap", .title = "Node Editor Keymap", .payload = .{ .keymap = .{ .binding_count = node_editor_all_command_count, .profile = "node-editor" } } },
     .{ .kind = .menu, .id = extension_id ++ ".context-menu", .title = "Node Editor Context Menu", .payload = .{ .menu = .{ .menu_id = "node-editor.context", .location = "canvas" } } },
     .{ .kind = .workspace_panel, .id = extension_id ++ ".workspace-panel", .title = "Node Editor Workspace Panel", .payload = .{ .workspace_panel = .{ .panel_id = "node-editor", .role = "editor", .default_area = "center" } } },
@@ -221,6 +222,8 @@ test "zui-nodes extension descriptor registers node graph capabilities" {
     const node_editor_contribution = registry.findContribution(.widget, extension_id ++ ".node-editor") orelse return error.MissingNodeEditorContribution;
     try std.testing.expectEqualStrings("Node Editor", node_editor_contribution.contribution.title);
     try std.testing.expectEqual(zui.ExtensionContributionKind.widget, node_editor_contribution.contribution.payload.contributionKind().?);
+    const command_surface_contribution = registry.findContribution(.command, extension_id ++ ".command-surface") orelse return error.MissingNodeCommandSurfaceContribution;
+    try std.testing.expectEqual(@as(?zui.CommandId, extension_command_surface_command_id), command_surface_contribution.contribution.payload.command.command_id);
     const workspace_panel = registry.findContribution(.workspace_panel, extension_id ++ ".workspace-panel") orelse return error.MissingNodeWorkspacePanelContribution;
     try std.testing.expectEqualStrings("center", workspace_panel.contribution.payload.workspace_panel.default_area);
     try std.testing.expectEqual(zui.ExtensionBoundaryDecision.extension_package, zui.defaultExtensionBoundary(.node_graph));
