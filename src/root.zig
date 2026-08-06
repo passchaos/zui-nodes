@@ -38,6 +38,15 @@ pub const view = @import("view.zig");
 pub const command_dispatch = @import("command_dispatch.zig");
 pub const command_surface = @import("command_surface.zig");
 pub const command_targets = @import("command_targets.zig");
+pub const migration_manifest_mod = @import("migration_manifest.zig");
+
+pub const MigrationStatus = migration_manifest_mod.MigrationStatus;
+pub const MigrationArea = migration_manifest_mod.MigrationArea;
+pub const MigrationItem = migration_manifest_mod.MigrationItem;
+pub const MigrationSummary = migration_manifest_mod.MigrationSummary;
+pub const migration_manifest = migration_manifest_mod.migration_manifest;
+pub const summarizeMigration = migration_manifest_mod.summarize;
+pub const migrationHasItem = migration_manifest_mod.hasItem;
 
 pub const CommandId = commands.CommandId;
 pub const SelectionCommand = commands.SelectionCommand;
@@ -173,4 +182,11 @@ test "zui-nodes extension descriptor registers node graph capabilities" {
     const node_editor_contribution = registry.findContribution(.widget, extension_id ++ ".node-editor") orelse return error.MissingNodeEditorContribution;
     try std.testing.expectEqualStrings("Node Editor", node_editor_contribution.contribution.title);
     try std.testing.expectEqual(zui.ExtensionBoundaryDecision.extension_package, zui.defaultExtensionBoundary(.node_graph));
+}
+
+test "zui-nodes migration manifest documents node editor ownership" {
+    const summary = summarizeMigration(&migration_manifest);
+    try std.testing.expect(summary.native_count > summary.bridge_count);
+    try std.testing.expect(migrationHasItem(&migration_manifest, "node editor model", .native));
+    try std.testing.expect(migrationHasItem(&migration_manifest, "node graph devtools", .bridge));
 }
