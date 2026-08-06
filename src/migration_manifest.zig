@@ -24,6 +24,7 @@ pub const MigrationArea = enum(u8) {
     commands,
     routing,
     adapters,
+    persistence,
     diagnostics,
 };
 
@@ -42,6 +43,7 @@ pub const migration_manifest = [_]MigrationItem{
     .{ .name = "node editor command surface", .area = .commands, .status = .native, .note = "registries, context menu model" },
     .{ .name = "node editor command targets", .area = .routing, .status = .native, .note = "CommandRouter handlers" },
     .{ .name = "node editor adapters", .area = .adapters, .status = .native, .note = "copy/convert from compatible node payloads" },
+    .{ .name = "node graph document persistence", .area = .persistence, .status = .native, .note = "JSON snapshot capture/restore owned by zui-nodes" },
     .{ .name = "zui core compatibility imports", .area = .adapters, .status = .bridge, .note = "temporary compatibility for downstream migration" },
     .{ .name = "node graph devtools", .area = .diagnostics, .status = .native, .note = "extension-owned summary and panel" },
 };
@@ -85,6 +87,7 @@ test "zui-nodes migration manifest tracks native and bridge coverage" {
     try std.testing.expect(!summary.complete());
     try std.testing.expect(summary.nativeRatio() > 0.6);
     try std.testing.expect(hasItem(&migration_manifest, "node editor command dispatch", .native));
+    try std.testing.expect(hasItem(&migration_manifest, "node graph document persistence", .native));
     try std.testing.expect(hasItem(&migration_manifest, "node graph devtools", .native));
     try std.testing.expect(hasItem(&migration_manifest, "zui core compatibility imports", .bridge));
 }

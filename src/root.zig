@@ -11,12 +11,14 @@ pub const extension_id = "zui-nodes";
 pub const extension_capabilities = [_]zui.ExtensionCapability{
     .{ .area = .node_graph, .name = "node graph editor" },
     .{ .area = .node_graph, .name = "node graph command surface" },
+    .{ .area = .node_graph, .name = "node graph document persistence" },
 };
 
 pub const extension_contributions = [_]zui.ExtensionContribution{
     .{ .kind = .widget, .id = extension_id ++ ".node-editor", .title = "Node Editor" },
     .{ .kind = .command, .id = extension_id ++ ".command-surface", .title = "Node Editor Commands" },
     .{ .kind = .panel, .id = extension_id ++ ".context-menu", .title = "Node Editor Context Menu" },
+    .{ .kind = .asset_loader, .id = extension_id ++ ".document-snapshot", .title = "Node Graph Document Snapshot" },
 };
 
 pub const extension_descriptor = zui.ExtensionDescriptor{
@@ -40,6 +42,7 @@ pub const command_surface = @import("command_surface.zig");
 pub const command_targets = @import("command_targets.zig");
 pub const migration_manifest_mod = @import("migration_manifest.zig");
 pub const devtools = @import("devtools.zig");
+pub const document_snapshot = @import("document_snapshot.zig");
 
 pub const MigrationStatus = migration_manifest_mod.MigrationStatus;
 pub const MigrationArea = migration_manifest_mod.MigrationArea;
@@ -53,6 +56,19 @@ pub const DevtoolsSummaryOptions = devtools.SummaryOptions;
 pub const DevtoolsPanelOptions = devtools.PanelOptions;
 pub const summarizeDevtools = devtools.summarize;
 pub const devtoolsPanel = devtools.panel;
+pub const DocumentSnapshot = document_snapshot.DocumentSnapshot;
+pub const DocumentSnapshotVersion = document_snapshot.DocumentSnapshotVersion;
+pub const DocumentSnapshotCaptureOptions = document_snapshot.CaptureOptions;
+pub const DocumentSnapshotApplyOptions = document_snapshot.ApplyOptions;
+pub const DocumentSnapshotApplyResult = document_snapshot.ApplyResult;
+pub const DocumentSnapshotValidationReport = document_snapshot.ValidationReport;
+pub const DocumentSnapshotSummary = document_snapshot.Summary;
+pub const captureDocumentSnapshot = document_snapshot.captureDocumentSnapshot;
+pub const applyDocumentSnapshot = document_snapshot.applyDocumentSnapshot;
+pub const summarizeDocumentSnapshot = document_snapshot.summarizeDocumentSnapshot;
+pub const validateDocumentSnapshot = document_snapshot.validateDocumentSnapshot;
+pub const writeDocumentSnapshotJson = document_snapshot.writeDocumentSnapshotJson;
+pub const parseDocumentSnapshotJson = document_snapshot.parseDocumentSnapshotJson;
 
 pub const CommandId = commands.CommandId;
 pub const SelectionCommand = commands.SelectionCommand;
@@ -154,6 +170,7 @@ pub const copyGroupsFrom = node_editor_adapters.copyGroupsFrom;
 pub const graphToScreen = node_editor.graphToScreen;
 pub const screenToGraph = node_editor.screenToGraph;
 pub const nodeGraphRect = node_editor.nodeGraphRect;
+pub const graphBounds = node_editor.graphBounds;
 pub const defaultInsertPosition = node_editor.defaultInsertPosition;
 pub const appendNodeEditor = node_editor.appendNodeEditor;
 pub const appendNodeEditorConnectionOverlay = node_editor.appendNodeEditorConnectionOverlay;
@@ -182,8 +199,10 @@ test "zui-nodes extension descriptor registers node graph capabilities" {
     try std.testing.expectEqual(@as(usize, 1), registry.countContributions(.command));
     try std.testing.expectEqual(@as(usize, 1), registry.countContributions(.panel));
     try std.testing.expectEqual(@as(usize, 1), registry.countContributions(.widget));
+    try std.testing.expectEqual(@as(usize, 1), registry.countContributions(.asset_loader));
     try std.testing.expect(registry.contributes(extension_id, .widget, extension_id ++ ".node-editor"));
     try std.testing.expect(registry.contributes(extension_id, .command, extension_id ++ ".command-surface"));
+    try std.testing.expect(registry.contributes(extension_id, .asset_loader, extension_id ++ ".document-snapshot"));
 
     const node_editor_contribution = registry.findContribution(.widget, extension_id ++ ".node-editor") orelse return error.MissingNodeEditorContribution;
     try std.testing.expectEqualStrings("Node Editor", node_editor_contribution.contribution.title);
