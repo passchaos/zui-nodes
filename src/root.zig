@@ -18,7 +18,7 @@ pub const extension_capabilities = [_]zui.ExtensionCapability{
 pub const extension_contributions = [_]zui.ExtensionContribution{
     .{ .kind = .widget, .id = extension_id ++ ".node-editor", .title = "Node Editor", .payload = .{ .widget = .{ .widget_id = "node-editor", .view_adapter = "zui-nodes.nodeEditorView" } } },
     .{ .kind = .command, .id = extension_id ++ ".command-surface", .title = "Node Editor Commands", .payload = .{ .command = .{ .command_id = extension_command_surface_command_id, .registry_id = "node-editor", .category = "node graph" } } },
-    .{ .kind = .keymap, .id = extension_id ++ ".keymap", .title = "Node Editor Keymap", .payload = .{ .keymap = .{ .binding_count = node_editor_all_command_count, .profile = "node-editor" } } },
+    .{ .kind = .keymap, .id = extension_id ++ ".keymap", .title = "Node Editor Keymap", .payload = .{ .keymap = .{ .binding_count = node_editor_all_command_count, .profile = "node-editor", .bindings = &.{.{ .key = "n", .modifiers = "super", .command_id = extension_command_surface_command_id }} } } },
     .{ .kind = .menu, .id = extension_id ++ ".context-menu", .title = "Node Editor Context Menu", .payload = .{ .menu = .{ .menu_id = "node-editor.context", .location = "canvas" } } },
     .{ .kind = .workspace_panel, .id = extension_id ++ ".workspace-panel", .title = "Node Editor Workspace Panel", .payload = .{ .workspace_panel = .{ .panel_id = "node-editor", .role = "editor", .default_area = "center" } } },
     .{ .kind = .devtools_panel, .id = extension_id ++ ".devtools", .title = "Node Editor Devtools", .payload = .{ .devtools_panel = .{ .panel_id = "node-editor", .scope = "node graph" } } },
