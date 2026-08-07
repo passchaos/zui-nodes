@@ -1,7 +1,7 @@
 //! Zui view adapter for the zui-nodes extension.
 //!
 //! The extension owns node graph/editor UI.  Zui core only provides reusable
-//! viewport/custom-paint, event bubbling, focus and layout primitives.
+//! canvas/custom-paint, event bubbling, focus and layout primitives.
 
 const std = @import("std");
 const zui = @import("zui");
@@ -15,8 +15,38 @@ pub const Color = zui.Color;
 pub const Rect = zui.Rect;
 pub const DrawCmd = zui.DrawCmd;
 
+pub const NodeEditorCanvasHitKind = enum(u8) {
+    node,
+    group,
+    input_port,
+    output_port,
+    connection,
+
+    pub fn label(self: NodeEditorCanvasHitKind) []const u8 {
+        return switch (self) {
+            .node => "node",
+            .group => "group",
+            .input_port => "input_port",
+            .output_port => "output_port",
+            .connection => "connection",
+        };
+    }
+};
+
+/// Canvas hit ids are domain-owned by zui-nodes.  The high byte stores the
+/// logical hit kind so generic Zui diagnostics can report stable hover/capture
+/// transitions without knowing node graph semantics.
+pub fn packCanvasHitId(kind: NodeEditorCanvasHitKind, local_id: u32) u64 {
+    return (@as(u64, @intFromEnum(kind)) << 56) | @as(u64, local_id);
+}
+
 pub const NodeEditorViewOptions = struct {
     tag: u32 = 0,
+    /// Optional host canvas state supplied by applications that want shared Zui
+    /// diagnostics, dirty-region tracking, and generic hover/capture summaries.
+    /// The node graph transform remains in `node_editor.State` because it uses
+    /// graph-centered coordinates and owns node-editor domain invariants.
+    canvas_state: ?*zui.CanvasState = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -45,6 +75,7 @@ pub const NodeEditorViewOptions = struct {
 };
 
 const Binding = struct {
+    canvas_state: ?*zui.CanvasState = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -70,7 +101,7 @@ const Binding = struct {
     minimap_size: zui.ui_base.Size = .{ .w = 150.0, .h = 96.0 },
     clipboard: ?*node_editor.Clipboard = null,
 
-    fn editor(self: *Binding) node_editor.Options(node_editor.State) {
+    fn editor(self: *const Binding) node_editor.Options(node_editor.State) {
         return .{
             .state = self.state,
             .nodes = self.nodes,
@@ -103,6 +134,7 @@ const Binding = struct {
 pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*ElementNode {
     const binding = try ctx.allocator.create(Binding);
     binding.* = .{
+        .canvas_state = options.canvas_state,
         .state = options.state,
         .nodes = options.nodes,
         .connections = options.connections,
@@ -132,8 +164,10 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
     if (style.background.a == 0 and style.background_paint == .none) style.background = options.background;
     return try zui.canvasView(ctx, .{
         .tag = options.tag,
+        .state = options.canvas_state,
         .paint = paintNodeEditor,
         .event = nodeEditorViewEvent,
+        .hit_test = nodeEditorCanvasHitTest,
         .user_data = binding,
         .cursor_shape = .default,
         .style = style,
@@ -147,13 +181,89 @@ fn paintNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), r
 
 fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent, user_data: ?*anyopaque) bool {
     const binding: *Binding = if (user_data) |ptr| @ptrCast(@alignCast(ptr)) else return false;
+    const before = InteractionSnapshot.capture(binding.state);
     const editor = binding.editor();
-    return node_editor.handleEditorEvent(node.rect, .{
+    const changed = node_editor.handleEditorEvent(node.rect, .{
         .shift_down = node.input_shift_down,
         .control_down = node.input_control_down,
         .super_down = node.input_super_down,
         .alt_down = node.input_alt_down,
     }, editor, event);
+    markCanvasInvalidation(binding, node.rect, event.*, before, changed);
+    return changed;
+}
+
+fn nodeEditorCanvasHitTest(node: *const ElementNode, point: [2]f32, user_data: ?*anyopaque) ?u64 {
+    const binding: *const Binding = if (user_data) |ptr| @ptrCast(@alignCast(ptr)) else return null;
+    const editor = binding.editor();
+    if (node_editor.inputPortAtPoint(node.rect, editor.state.*, editor.nodes, point)) |hit| {
+        return packCanvasHitId(.input_port, editor.nodes[hit.node_index].id);
+    }
+    if (node_editor.outputPortAtPoint(node.rect, editor.state.*, editor.nodes, point)) |hit| {
+        return packCanvasHitId(.output_port, editor.nodes[hit.node_index].id);
+    }
+    if (node_editor.nodeAtPoint(node.rect, editor.state.*, editor.nodes, point)) |index| {
+        return packCanvasHitId(.node, editor.nodes[index].id);
+    }
+    if (node_editor.groupAtPoint(node.rect, editor.state.*, editor.groups, point)) |index| {
+        return packCanvasHitId(.group, editor.groups[index].id);
+    }
+    const mutable_connection_len = if (editor.mutable_connection_len) |len| len.* else null;
+    if (node_editor.connectionAtPoint(node.rect, editor.state.*, editor.nodes, editor.mutable_connections, mutable_connection_len, editor.connections, point)) |connection| {
+        return packCanvasHitId(.connection, connectionHash(connection));
+    }
+    return null;
+}
+
+const InteractionSnapshot = struct {
+    pan: [2]f32 = .{ 0.0, 0.0 },
+    zoom: f32 = 1.0,
+    structural_drag: bool = false,
+
+    fn capture(state: *const node_editor.State) InteractionSnapshot {
+        return .{
+            .pan = state.pan,
+            .zoom = state.zoom,
+            .structural_drag = state.dragging_node_id != null or
+                state.dragging_group_id != null or
+                state.resizing_group_id != null or
+                state.resizing_group_edges.any() or
+                state.dragging_connection_from_id != null or
+                state.reconnecting_connection != null or
+                state.box_selecting,
+        };
+    }
+
+    fn transformChanged(self: InteractionSnapshot, state: *const node_editor.State) bool {
+        return @abs(self.pan[0] - state.pan[0]) > 0.001 or
+            @abs(self.pan[1] - state.pan[1]) > 0.001 or
+            @abs(self.zoom - state.zoom) > 0.0001;
+    }
+};
+
+fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, before: InteractionSnapshot, changed: bool) void {
+    if (!changed) return;
+    const canvas_state = binding.canvas_state orelse return;
+    if (before.transformChanged(binding.state)) {
+        canvas_state.invalidate(.viewport_transform, null);
+        return;
+    }
+
+    var kinds = (zui.CanvasInvalidationSet{}).with(.paint);
+    switch (event) {
+        .mouse_move, .mouse_leave => kinds = kinds.with(.overlay),
+        .mouse_down, .mouse_up => kinds = kinds.with(.hit_test),
+        else => {},
+    }
+    if (before.structural_drag or binding.state.dragging_node_id != null or binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.reconnecting_connection != null) {
+        kinds = kinds.with(.data).with(.hit_test);
+    }
+
+    canvas_state.invalidateSet(kinds, rect);
+}
+
+fn connectionHash(connection: node_editor.Connection) u32 {
+    return connection.from_id *% 16_777_619 ^ connection.to_id *% 2_654_435_761 ^ @as(u32, connection.from_port) << 8 ^ @as(u32, connection.to_port);
 }
 
 test "node editor view builds on zui custom paint primitives" {
@@ -202,6 +312,56 @@ test "node editor view drags mutable nodes" {
     try std.testing.expect(nodes[1].pos[0] > before[0]);
     try std.testing.expect(nodes[1].pos[1] > before[1]);
     try std.testing.expect(state.dragging_node_id == null);
+}
+
+test "node editor view reports dirty canvas invalidation" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var canvas_state = zui.CanvasState{};
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "Output", .pos = .{ 180, 80 } },
+    };
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9412, .canvas_state = &canvas_state, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+
+    const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[1]);
+    const start = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var move = ElementEvent{ .mouse_move = .{ .x = start[0] + 24, .y = start[1] + 12, .dx = 24, .dy = 12 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+
+    const summary = canvas_state.dirtySummary();
+    try std.testing.expect(summary.needsPaint());
+    try std.testing.expect(summary.invalidation.contains(.paint));
+    try std.testing.expect(summary.invalidation.contains(.data));
+    try std.testing.expect(summary.invalidation.contains(.hit_test));
+    try std.testing.expectEqual(@as(?Rect, editor_node.rect), summary.dirty_bounds);
+}
+
+test "node editor canvas hit test feeds generic canvas hover" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var canvas_state = zui.CanvasState{};
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "Output", .pos = .{ 180, 80 } },
+    };
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9413, .canvas_state = &canvas_state, .state = &state, .nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+
+    const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    var move = ElementEvent{ .mouse_move = .{ .x = node_rect.x + 4, .y = node_rect.y + 4, .dx = 0, .dy = 0 } };
+    _ = editor_node.on_event.?(editor_node, &move);
+    try std.testing.expectEqual(@as(?u64, packCanvasHitId(.node, 1)), canvas_state.hovered_id);
+    try std.testing.expect(zui.summarizeCanvas(editor_node).has_hit_test_handler);
 }
 
 test "node editor view creates connections from output to input ports" {
