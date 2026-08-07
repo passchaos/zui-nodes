@@ -47,6 +47,9 @@ pub const NodeEditorViewOptions = struct {
     /// The node graph transform remains in `node_editor.State` because it uses
     /// graph-centered coordinates and owns node-editor domain invariants.
     canvas_state: ?*zui.CanvasState = null,
+    /// Optional generic canvas layer cache. zui-nodes owns the cached payload
+    /// semantics; Zui core only tracks layer ids, bounds, and typed invalidation.
+    canvas_layers: ?*zui.CanvasLayerCache = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -76,6 +79,7 @@ pub const NodeEditorViewOptions = struct {
 
 const Binding = struct {
     canvas_state: ?*zui.CanvasState = null,
+    canvas_layers: ?*zui.CanvasLayerCache = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -135,6 +139,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
     const binding = try ctx.allocator.create(Binding);
     binding.* = .{
         .canvas_state = options.canvas_state,
+        .canvas_layers = options.canvas_layers,
         .state = options.state,
         .nodes = options.nodes,
         .connections = options.connections,
@@ -260,6 +265,9 @@ fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, be
     }
 
     canvas_state.invalidateSet(kinds, rect);
+    if (binding.canvas_layers) |layers| {
+        _ = layers.invalidateForDirtySummary(canvas_state.dirtySummary());
+    }
 }
 
 fn connectionHash(connection: node_editor.Connection) u32 {
@@ -341,6 +349,35 @@ test "node editor view reports dirty canvas invalidation" {
     try std.testing.expect(summary.invalidation.contains(.data));
     try std.testing.expect(summary.invalidation.contains(.hit_test));
     try std.testing.expectEqual(@as(?Rect, editor_node.rect), summary.dirty_bounds);
+}
+
+test "node editor view invalidates shared canvas layer cache" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var canvas_state = zui.CanvasState{};
+    var canvas_layers = zui.CanvasLayerCache{};
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "Output", .pos = .{ 180, 80 } },
+    };
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9414, .canvas_state = &canvas_state, .canvas_layers = &canvas_layers, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+    _ = canvas_layers.ensure(1, editor_node.rect);
+
+    const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[1]);
+    const start = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var move = ElementEvent{ .mouse_move = .{ .x = start[0] + 24, .y = start[1] + 12, .dx = 24, .dy = 12 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+
+    const summary = canvas_layers.summary();
+    try std.testing.expectEqual(@as(usize, 0), summary.valid_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.invalid_count);
+    try std.testing.expect(canvas_layers.entries[0].invalidation.contains(.paint));
 }
 
 test "node editor canvas hit test feeds generic canvas hover" {
