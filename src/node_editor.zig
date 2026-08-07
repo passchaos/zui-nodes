@@ -487,6 +487,7 @@ pub fn Options(comptime StateType: type) type {
         show_minimap: bool = true,
         minimap_size: Size = .{ .w = 150.0, .h = 96.0 },
         clipboard: ?*Clipboard = null,
+        connection_path_cache: ?*ConnectionPathCache = null,
     };
 }
 
@@ -914,6 +915,120 @@ pub fn nodeInsideGraphRect(node: Node, rect: Rect) bool {
     return node.pos[0] >= rect.x and node.pos[1] >= rect.y and
         node.pos[0] + node.size.w <= rect.x + rect.w and
         node.pos[1] + node.size.h <= rect.y + rect.h;
+}
+
+pub const ConnectionPath = struct {
+    start: [2]f32 = .{ 0.0, 0.0 },
+    c0: [2]f32 = .{ 0.0, 0.0 },
+    c1: [2]f32 = .{ 0.0, 0.0 },
+    end: [2]f32 = .{ 0.0, 0.0 },
+};
+
+pub fn connectionPathForPoints(a: [2]f32, b: [2]f32) ConnectionPath {
+    const dx = @max(40.0, @abs(b[0] - a[0]) * 0.5);
+    return .{
+        .start = a,
+        .c0 = .{ a[0] + dx, a[1] },
+        .c1 = .{ b[0] - dx, b[1] },
+        .end = b,
+    };
+}
+
+pub const ConnectionPathCacheCapacity: usize = 128;
+
+pub const ConnectionPathCacheEntry = struct {
+    a: [2]f32 = .{ 0.0, 0.0 },
+    b: [2]f32 = .{ 0.0, 0.0 },
+    path: ConnectionPath = .{},
+    valid: bool = false,
+    last_used_generation: u64 = 0,
+};
+
+pub const ConnectionPathCacheSummary = struct {
+    entry_count: usize = 0,
+    valid_count: usize = 0,
+    hit_count: u64 = 0,
+    miss_count: u64 = 0,
+    rebuild_count: u64 = 0,
+    eviction_count: u64 = 0,
+    generation: u64 = 0,
+};
+
+pub const ConnectionPathCache = struct {
+    entries: [ConnectionPathCacheCapacity]ConnectionPathCacheEntry = [_]ConnectionPathCacheEntry{.{}} ** ConnectionPathCacheCapacity,
+    entry_count: usize = 0,
+    generation: u64 = 0,
+    hit_count: u64 = 0,
+    miss_count: u64 = 0,
+    rebuild_count: u64 = 0,
+    eviction_count: u64 = 0,
+
+    pub fn reset(self: *ConnectionPathCache) void {
+        self.* = .{};
+    }
+
+    pub fn pathFor(self: *ConnectionPathCache, a: [2]f32, b: [2]f32) ConnectionPath {
+        self.generation +%= 1;
+        if (self.findIndex(a, b)) |index| {
+            var entry = &self.entries[index];
+            entry.last_used_generation = self.generation;
+            self.hit_count +%= 1;
+            return entry.path;
+        }
+        self.miss_count +%= 1;
+        self.rebuild_count +%= 1;
+        const index = self.allocateIndex();
+        const path = connectionPathForPoints(a, b);
+        self.entries[index] = .{ .a = a, .b = b, .path = path, .valid = true, .last_used_generation = self.generation };
+        return path;
+    }
+
+    pub fn summary(self: *const ConnectionPathCache) ConnectionPathCacheSummary {
+        var valid_count: usize = 0;
+        for (self.entries[0..self.entry_count]) |entry| {
+            if (entry.valid) valid_count += 1;
+        }
+        return .{
+            .entry_count = self.entry_count,
+            .valid_count = valid_count,
+            .hit_count = self.hit_count,
+            .miss_count = self.miss_count,
+            .rebuild_count = self.rebuild_count,
+            .eviction_count = self.eviction_count,
+            .generation = self.generation,
+        };
+    }
+
+    fn findIndex(self: *const ConnectionPathCache, a: [2]f32, b: [2]f32) ?usize {
+        var i: usize = 0;
+        while (i < self.entry_count) : (i += 1) {
+            const entry = self.entries[i];
+            if (entry.valid and pointsEqual(entry.a, a) and pointsEqual(entry.b, b)) return i;
+        }
+        return null;
+    }
+
+    fn allocateIndex(self: *ConnectionPathCache) usize {
+        if (self.entry_count < ConnectionPathCacheCapacity) {
+            const index = self.entry_count;
+            self.entry_count += 1;
+            return index;
+        }
+        var oldest_index: usize = 0;
+        var oldest_generation = self.entries[0].last_used_generation;
+        for (self.entries[1..], 1..) |entry, index| {
+            if (entry.last_used_generation < oldest_generation) {
+                oldest_generation = entry.last_used_generation;
+                oldest_index = index;
+            }
+        }
+        self.eviction_count +%= 1;
+        return oldest_index;
+    }
+};
+
+fn pointsEqual(a: [2]f32, b: [2]f32) bool {
+    return a[0] == b[0] and a[1] == b[1];
 }
 
 const SelectionCommand = commands_mod.SelectionCommand;
@@ -2544,11 +2659,18 @@ fn groupRectFromElement(rect: Rect, editor: anytype, group: Group) Rect {
     return groupRect(rect, editor.state.*, group);
 }
 
+fn editorConnectionPathCache(editor: anytype) ?*ConnectionPathCache {
+    const Editor = @TypeOf(editor);
+    if (@hasField(Editor, "connection_path_cache")) return editor.connection_path_cache;
+    return null;
+}
+
 pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, layer: i32) !DrawCommandRange {
     if (rect.w <= 0.0 or rect.h <= 0.0) return .{};
     editor.state.clamp();
     try paint_primitives.appendFillRect(allocator, out, rect, editor.background, 0.0, layer);
     try out.append(allocator, .{ .clip_begin = rect });
+    const connection_path_cache = editorConnectionPathCache(editor);
     try appendNodeEditorGrid(allocator, out, rect, editor, layer + 1);
     for (editor.groups) |group| {
         try appendNodeEditorGroup(allocator, out, rect, editor, group, layer + 2);
@@ -2561,7 +2683,7 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
         const selected = editor.state.isConnectionSelected(connection);
         const hovered = editor.state.isConnectionHovered(connection);
         const color = if (selected) editor.selected_color else if (hovered) connection.color.lighten(0.12) else connection.color;
-        try appendNodeEditorConnection(allocator, out, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer + 3);
+        try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer + 3);
     }
     if (editor.mutable_connections) |connections| {
         const len = if (editor.mutable_connection_len) |value| @min(value.*, connections.len) else connections.len;
@@ -2573,7 +2695,7 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
             const selected = editor.state.isConnectionSelected(connection);
             const hovered = editor.state.isConnectionHovered(connection);
             const color = if (selected) editor.selected_color else if (hovered) connection.color.lighten(0.12) else connection.color;
-            try appendNodeEditorConnection(allocator, out, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer + 3);
+            try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer + 3);
         }
     }
     for (editor.nodes) |node_item| {
@@ -2687,7 +2809,7 @@ fn appendNodeEditorConnectionPreviewOverlay(allocator: std.mem.Allocator, out: *
     if (editor.state.dragging_connection_from_id) |from_id| {
         if (nodeById(editor.nodes, from_id)) |from| {
             const preview_color = nodeEditorPreviewConnectionColor(editor);
-            try appendNodeEditorConnection(allocator, out, outputPortPositionAt(rect, editor.state.*, from, editor.state.dragging_connection_from_port), editor.state.connection_preview, preview_color, if (editor.state.connection_preview_valid) 2.0 else 2.8, layer);
+            try appendNodeEditorConnection(allocator, out, editorConnectionPathCache(editor), outputPortPositionAt(rect, editor.state.*, from, editor.state.dragging_connection_from_port), editor.state.connection_preview, preview_color, if (editor.state.connection_preview_valid) 2.0 else 2.8, layer);
             return;
         }
     }
@@ -2698,12 +2820,12 @@ fn appendNodeEditorConnectionPreviewOverlay(allocator: std.mem.Allocator, out: *
                 const b = inputPortPositionAt(rect, editor.state.*, to, connection.to_port);
                 const start = if (editor.state.reconnecting_connection_end == .from) editor.state.connection_preview else a;
                 const end = if (editor.state.reconnecting_connection_end == .to) editor.state.connection_preview else b;
-                try appendNodeEditorConnection(allocator, out, start, end, nodeEditorPreviewConnectionColor(editor), if (editor.state.connection_preview_valid) 2.7 else 3.2, layer);
+                try appendNodeEditorConnection(allocator, out, editorConnectionPathCache(editor), start, end, nodeEditorPreviewConnectionColor(editor), if (editor.state.connection_preview_valid) 2.7 else 3.2, layer);
                 return;
             }
         }
     }
-    try appendNodeEditorConnection(allocator, out, .{ rect.x, rect.y }, .{ rect.x + 0.001, rect.y }, Color.transparent, 1.0, layer);
+    try appendNodeEditorConnection(allocator, out, editorConnectionPathCache(editor), .{ rect.x, rect.y }, .{ rect.x + 0.001, rect.y }, Color.transparent, 1.0, layer);
 }
 
 fn appendNodeEditorGroup(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, group: Group, layer: i32) !void {
@@ -2737,15 +2859,15 @@ fn appendNodeEditorGroup(allocator: std.mem.Allocator, out: *std.ArrayList(DrawC
     }
 }
 
-fn appendNodeEditorConnection(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), a: [2]f32, b: [2]f32, color: Color, width: f32, layer: i32) !void {
-    const dx = @max(40.0, @abs(b[0] - a[0]) * 0.5);
+fn appendNodeEditorConnection(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), cache: ?*ConnectionPathCache, a: [2]f32, b: [2]f32, color: Color, width: f32, layer: i32) !void {
+    const path = if (cache) |connection_cache| connection_cache.pathFor(a, b) else connectionPathForPoints(a, b);
     const commands = try allocator.alloc(render.PathCommand, 2);
     errdefer allocator.free(commands);
-    commands[0] = .{ .move_to = a };
+    commands[0] = .{ .move_to = path.start };
     commands[1] = .{ .cubic_to = .{
-        .c0 = .{ a[0] + dx, a[1] },
-        .c1 = .{ b[0] - dx, b[1] },
-        .end = b,
+        .c0 = path.c0,
+        .c1 = path.c1,
+        .end = path.end,
     } };
     try out.append(allocator, .{ .stroke_path = .{
         .commands = commands,
@@ -3177,7 +3299,6 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
     }
 }
 
-
 pub fn handleElementEvent(node: anytype, event: anytype) bool {
     if (node.element != .node_editor) return false;
     return handleEditorEvent(node.rect, .{
@@ -3243,4 +3364,50 @@ test "NodeEditor connection hit testing and port compatibility" {
     const mid = [2]f32{ (out[0] + in[0]) * 0.5, (out[1] + in[1]) * 0.5 };
     try std.testing.expect(connectionHit(viewport, state, &nodes, connection, mid));
     try std.testing.expectEqual(connection, connectionAtPoint(viewport, state, &nodes, null, null, &.{connection}, mid).?);
+}
+
+test "NodeEditor connection path cache reuses cubic controls" {
+    var cache = ConnectionPathCache{};
+    const a = [2]f32{ 10, 20 };
+    const b = [2]f32{ 140, 80 };
+    const first = cache.pathFor(a, b);
+    const second = cache.pathFor(a, b);
+    try std.testing.expectEqual(first, second);
+    var summary = cache.summary();
+    try std.testing.expectEqual(@as(u64, 1), summary.miss_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.hit_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.rebuild_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.valid_count);
+
+    _ = cache.pathFor(.{ 12, 20 }, b);
+    summary = cache.summary();
+    try std.testing.expectEqual(@as(usize, 2), summary.entry_count);
+    try std.testing.expectEqual(@as(u64, 2), summary.rebuild_count);
+}
+
+test "NodeEditor paint reuses connection path cache payload" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    var path_cache = ConnectionPathCache{};
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "Source", .pos = .{ -120, -30 }, .size = .{ .w = 80, .h = 60 }, .output_count = 1 },
+        .{ .id = 2, .title = "Sink", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 }, .input_count = 1 },
+    };
+    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    var out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (out.items) |cmd| draw_cmd.freePayload(std.testing.allocator, cmd);
+        out.deinit(std.testing.allocator);
+    }
+    const editor = Options(State){
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .connection_path_cache = &path_cache,
+    };
+    _ = try appendNodeEditor(std.testing.allocator, &out, .{ .x = 0, .y = 0, .w = 320, .h = 160 }, editor, 0);
+    _ = try appendNodeEditor(std.testing.allocator, &out, .{ .x = 0, .y = 0, .w = 320, .h = 160 }, editor, 0);
+    const summary = path_cache.summary();
+    try std.testing.expect(summary.rebuild_count > 0);
+    try std.testing.expect(summary.hit_count > 0);
 }

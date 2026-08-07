@@ -50,6 +50,7 @@ pub const NodeEditorViewOptions = struct {
     /// Optional generic canvas layer cache. zui-nodes owns the cached payload
     /// semantics; Zui core only tracks layer ids, bounds, and typed invalidation.
     canvas_layers: ?*zui.CanvasLayerCache = null,
+    connection_path_cache: ?*node_editor.ConnectionPathCache = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -80,6 +81,7 @@ pub const NodeEditorViewOptions = struct {
 const Binding = struct {
     canvas_state: ?*zui.CanvasState = null,
     canvas_layers: ?*zui.CanvasLayerCache = null,
+    connection_path_cache: ?*node_editor.ConnectionPathCache = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -131,6 +133,7 @@ const Binding = struct {
             .show_minimap = self.show_minimap,
             .minimap_size = self.minimap_size,
             .clipboard = self.clipboard,
+            .connection_path_cache = self.connection_path_cache,
         };
     }
 };
@@ -140,6 +143,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
     binding.* = .{
         .canvas_state = options.canvas_state,
         .canvas_layers = options.canvas_layers,
+        .connection_path_cache = options.connection_path_cache,
         .state = options.state,
         .nodes = options.nodes,
         .connections = options.connections,
