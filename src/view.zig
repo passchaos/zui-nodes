@@ -1,7 +1,7 @@
 //! Zui view adapter for the zui-nodes extension.
 //!
 //! The extension owns node graph/editor UI.  Zui core only provides reusable
-//! primitives such as custom paint, event bubbling and layout nodes.
+//! viewport/custom-paint, event bubbling, focus and layout primitives.
 
 const std = @import("std");
 const zui = @import("zui");
@@ -130,11 +130,14 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
     };
     var style = options.style;
     if (style.background.a == 0 and style.background_paint == .none) style.background = options.background;
-    const node = try ctx.customPaint(paintNodeEditor, binding, style);
-    node.id = options.tag;
-    node.focusable = true;
-    ctx.setEventHandler(node, nodeEditorViewEvent, binding);
-    return node;
+    return try zui.viewportView(ctx, .{
+        .tag = options.tag,
+        .paint = paintNodeEditor,
+        .event = nodeEditorViewEvent,
+        .user_data = binding,
+        .cursor_shape = .default,
+        .style = style,
+    });
 }
 
 fn paintNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, layer: i32, user_data: ?*anyopaque) anyerror!void {
@@ -142,8 +145,8 @@ fn paintNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), r
     _ = try node_editor.appendNodeEditor(allocator, out, rect, binding.editor(), layer);
 }
 
-fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent) bool {
-    const binding: *Binding = if (node.user_data) |ptr| @ptrCast(@alignCast(ptr)) else return false;
+fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent, user_data: ?*anyopaque) bool {
+    const binding: *Binding = if (user_data) |ptr| @ptrCast(@alignCast(ptr)) else return false;
     const editor = binding.editor();
     return node_editor.handleEditorEvent(node.rect, .{
         .shift_down = node.input_shift_down,
@@ -170,7 +173,7 @@ test "node editor view builds on zui custom paint primitives" {
     const node_rect = node_editor.nodeRectFromState(.{ .x = 0, .y = 0, .w = 300, .h = 160 }, state, nodes[0]);
     const click = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
     var event = ElementEvent{ .mouse_down = .{ .button = .left, .x = click[0], .y = click[1] } };
-    try std.testing.expect(nodeEditorViewEvent(node, &event));
+    try std.testing.expect(nodeEditorViewEvent(node, &event, node.paint_user_data));
     try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
 }
 
@@ -190,11 +193,11 @@ test "node editor view drags mutable nodes" {
     const node_rect = node_editor.nodeRectFromState(.{ .x = 0, .y = 0, .w = 340, .h = 200 }, state, nodes[1]);
     const start = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
     var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &down));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
     var move = ElementEvent{ .mouse_move = .{ .x = start[0] + 24, .y = start[1] + 12, .dx = 24, .dy = 12 } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &move));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
     var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = start[0] + 24, .y = start[1] + 12 } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &up));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
     try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
     try std.testing.expect(nodes[1].pos[0] > before[0]);
     try std.testing.expect(nodes[1].pos[1] > before[1]);
@@ -218,11 +221,11 @@ test "node editor view creates connections from output to input ports" {
     const out = node_editor.outputPortPosition(editor_node.rect, state, nodes[0]);
     const in = node_editor.inputPortPosition(editor_node.rect, state, nodes[1]);
     var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = out[0], .y = out[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &down));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
     var move = ElementEvent{ .mouse_move = .{ .x = in[0], .y = in[1], .dx = in[0] - out[0], .dy = in[1] - out[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &move));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
     var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = in[0], .y = in[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &up));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
     try std.testing.expectEqual(@as(usize, 1), connection_len);
     try std.testing.expectEqual(node_editor.Connection{ .from_id = 1, .to_id = 2 }, connections[0]);
     try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
@@ -246,9 +249,9 @@ test "node editor view handles minimap panning and shift box selection" {
     const minimap_point = [2]f32{ snapshot.minimap_rect.x + snapshot.minimap_rect.w * 0.98, snapshot.minimap_rect.y + snapshot.minimap_rect.h * 0.95 };
     const pan_before = state.pan;
     var minimap_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = minimap_point[0], .y = minimap_point[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &minimap_down));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &minimap_down, editor_node.paint_user_data));
     var minimap_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = minimap_point[0], .y = minimap_point[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &minimap_up));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &minimap_up, editor_node.paint_user_data));
     try std.testing.expect(@abs(state.pan[0] - pan_before[0]) > 0.001 or @abs(state.pan[1] - pan_before[1]) > 0.001);
 
     state.pan = .{ 0, 0 };
@@ -257,11 +260,11 @@ test "node editor view handles minimap panning and shift box selection" {
     const n0 = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
     const n1 = node_editor.nodeRectFromState(editor_node.rect, state, nodes[1]);
     var box_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = n0.x - 8, .y = n0.y - 8 } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &box_down));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &box_down, editor_node.paint_user_data));
     var box_move = ElementEvent{ .mouse_move = .{ .x = n1.x + n1.w + 8, .y = n1.y + n1.h + 8, .dx = n1.x - n0.x, .dy = n1.y - n0.y } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &box_move));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &box_move, editor_node.paint_user_data));
     var box_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = n1.x + n1.w + 8, .y = n1.y + n1.h + 8 } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &box_up));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &box_up, editor_node.paint_user_data));
     try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
     try std.testing.expect(state.isNodeSelected(1));
     try std.testing.expect(state.isNodeSelected(2));
@@ -289,11 +292,11 @@ test "node editor view handles groups and reconnect gestures through shared even
     const group_rect = node_editor.groupRect(editor_node.rect, state, groups[0]);
     const group_start = [2]f32{ group_rect.x + 12.0, group_rect.y + 12.0 };
     var group_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = group_start[0], .y = group_start[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &group_down));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &group_down, editor_node.paint_user_data));
     var group_move = ElementEvent{ .mouse_move = .{ .x = group_start[0] + 18, .y = group_start[1] + 9, .dx = 18, .dy = 9 } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &group_move));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &group_move, editor_node.paint_user_data));
     var group_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = group_start[0] + 18, .y = group_start[1] + 9 } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &group_up));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &group_up, editor_node.paint_user_data));
     try std.testing.expectEqual(@as(?u32, 8), state.selected_group_id);
     try std.testing.expect(groups[0].rect.x > -175);
     try std.testing.expect(history.undo_len > 0);
@@ -302,11 +305,11 @@ test "node editor view handles groups and reconnect gestures through shared even
     const input2 = node_editor.inputPortPosition(editor_node.rect, state, nodes[1]);
     const input3 = node_editor.inputPortPosition(editor_node.rect, state, nodes[2]);
     var reconnect_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = input2[0], .y = input2[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &reconnect_down));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &reconnect_down, editor_node.paint_user_data));
     var reconnect_move = ElementEvent{ .mouse_move = .{ .x = input3[0], .y = input3[1], .dx = input3[0] - input2[0], .dy = input3[1] - input2[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &reconnect_move));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &reconnect_move, editor_node.paint_user_data));
     var reconnect_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = input3[0], .y = input3[1] } };
-    try std.testing.expect(nodeEditorViewEvent(editor_node, &reconnect_up));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &reconnect_up, editor_node.paint_user_data));
     try std.testing.expectEqual(node_editor.Connection{ .from_id = 1, .to_id = 3 }, connections[0]);
     try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
 }
