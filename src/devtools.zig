@@ -25,6 +25,7 @@ pub const SummaryOptions = struct {
     groups: []const Group = &.{},
     viewport: Rect = .zero,
     minimap_size: zui.ui_base.Size = .{ .w = 150, .h = 96 },
+    connection_path_cache: ?*const node_editor.ConnectionPathCache = null,
 };
 
 pub const Summary = struct {
@@ -42,6 +43,7 @@ pub const Summary = struct {
     zoom: f32 = 1.0,
     pan: [2]f32 = .{ 0, 0 },
     minimap: MinimapSnapshot = .{},
+    connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
 
     pub fn hasSelection(self: Summary) bool {
         return self.selected_node_count > 0 or self.selected_group_id != null or self.has_selected_connection;
@@ -81,6 +83,7 @@ pub fn summarize(options: SummaryOptions) Summary {
         .zoom = state.zoom,
         .pan = state.pan,
         .minimap = minimap,
+        .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
     };
 }
 
@@ -119,7 +122,13 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.pan[1],
         options.summary.minimap.visible,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport });
+    const path_cache = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "paths={d} hits={d} misses={d} rebuilds={d}", .{
+        options.summary.connection_path_cache.entry_count,
+        options.summary.connection_path_cache.hit_count,
+        options.summary.connection_path_cache.miss_count,
+        options.summary.connection_path_cache.rebuild_count,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    try ctx.children(root, .{ title, counts, selection, viewport, path_cache });
     return root;
 }
 
@@ -138,16 +147,21 @@ test "zui-nodes devtools summarize node editor state" {
         .{ .id = 2, .title = "B", .pos = .{ 160, 64 } },
     };
     const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    var path_cache = node_editor.ConnectionPathCache{};
+    _ = path_cache.pathFor(.{ 0, 0 }, .{ 100, 20 });
+    _ = path_cache.pathFor(.{ 0, 0 }, .{ 100, 20 });
     try std.testing.expect(state.setSingleSelection(2));
     const summary = summarize(.{
         .state = &state,
         .nodes = &nodes,
         .connections = &connections,
         .viewport = .{ .x = 0, .y = 0, .w = 360, .h = 220 },
+        .connection_path_cache = &path_cache,
     });
     try std.testing.expectEqual(@as(usize, 2), summary.node_count);
     try std.testing.expectEqual(@as(usize, 1), summary.connection_count);
     try std.testing.expect(summary.hasSelection());
     try std.testing.expect(summary.minimap.visible);
+    try std.testing.expectEqual(@as(u64, 1), summary.connection_path_cache.hit_count);
     try std.testing.expectEqualStrings("selected", summary.statusText());
 }
