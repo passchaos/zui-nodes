@@ -130,7 +130,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
     };
     var style = options.style;
     if (style.background.a == 0 and style.background_paint == .none) style.background = options.background;
-    return try zui.viewportView(ctx, .{
+    return try zui.canvasView(ctx, .{
         .tag = options.tag,
         .paint = paintNodeEditor,
         .event = nodeEditorViewEvent,
