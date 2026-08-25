@@ -80,6 +80,7 @@ pub const ValidationReport = struct {
     duplicate_connection_count: usize = 0,
     orphan_connection_count: usize = 0,
     self_link_count: usize = 0,
+    input_fan_in_count: usize = 0,
     invalid_port_count: usize = 0,
     incompatible_port_type_count: usize = 0,
     cycle_count: usize = 0,
@@ -99,6 +100,7 @@ pub const ValidationReport = struct {
             (policy.allow_duplicate_links or self.duplicate_connection_count == 0) and
             (!policy.require_existing_nodes or self.orphan_connection_count == 0) and
             (policy.allow_self_links or self.self_link_count == 0) and
+            (policy.allow_multiple_links_to_input or self.input_fan_in_count == 0) and
             (!policy.enforce_port_ranges or self.invalid_port_count == 0) and
             (!policy.enforce_port_types or self.incompatible_port_type_count == 0) and
             (policy.allow_cycles or (self.cycle_count == 0 and self.cycle_check_truncated_count == 0)) and
@@ -259,6 +261,7 @@ pub fn validateDocumentSnapshotWithPolicy(snapshot: DocumentSnapshot, policy: no
     report.duplicate_connection_count = graph_report.duplicate_connection_count;
     report.orphan_connection_count = graph_report.orphan_connection_count;
     report.self_link_count = graph_report.self_link_count;
+    report.input_fan_in_count = graph_report.input_fan_in_count;
     report.invalid_port_count = graph_report.invalid_port_count;
     report.incompatible_port_type_count = graph_report.incompatible_port_type_count;
     report.cycle_count = graph_report.cycle_count;

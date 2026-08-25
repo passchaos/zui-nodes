@@ -137,10 +137,11 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.connection_path_cache.miss_count,
         options.summary.connection_path_cache.rebuild_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const graph = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "graph valid={} issues={d} dup={d} orphan={d} port={d} type={d} cycle={d}", .{
+    const graph = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "graph valid={} issues={d} dup={d} fanin={d} orphan={d} port={d} type={d} cycle={d}", .{
         options.summary.graph_valid,
         options.summary.graph_issue_count,
         options.summary.graph_validation.duplicate_connection_count,
+        options.summary.graph_validation.input_fan_in_count,
         options.summary.graph_validation.orphan_connection_count,
         options.summary.graph_validation.invalid_port_count,
         options.summary.graph_validation.incompatible_port_type_count,

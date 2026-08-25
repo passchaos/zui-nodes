@@ -12,6 +12,7 @@ pub const ConnectionPolicy = struct {
     require_existing_nodes: bool = true,
     allow_self_links: bool = false,
     allow_duplicate_links: bool = false,
+    allow_multiple_links_to_input: bool = true,
     enforce_port_ranges: bool = true,
     enforce_port_types: bool = true,
     allow_cycles: bool = true,
@@ -21,6 +22,7 @@ pub const ConnectionPolicy = struct {
         .require_existing_nodes = false,
         .allow_self_links = true,
         .allow_duplicate_links = true,
+        .allow_multiple_links_to_input = true,
         .enforce_port_ranges = false,
         .enforce_port_types = false,
         .allow_cycles = true,
@@ -29,6 +31,7 @@ pub const ConnectionPolicy = struct {
         .require_existing_nodes = true,
         .allow_self_links = false,
         .allow_duplicate_links = false,
+        .allow_multiple_links_to_input = false,
         .enforce_port_ranges = true,
         .allow_cycles = false,
     };
@@ -70,6 +73,7 @@ pub const ConnectionValidation = struct {
     port_types_compatible: bool = true,
     self_link: bool = false,
     duplicate_link: bool = false,
+    input_already_linked: bool = false,
     creates_cycle: bool = false,
     cycle_check_truncated: bool = false,
 
@@ -77,6 +81,7 @@ pub const ConnectionValidation = struct {
         if (policy.require_existing_nodes and (!self.from_node_present or !self.to_node_present)) return false;
         if (!policy.allow_self_links and self.self_link) return false;
         if (!policy.allow_duplicate_links and self.duplicate_link) return false;
+        if (!policy.allow_multiple_links_to_input and self.input_already_linked) return false;
         if (policy.enforce_port_ranges and (!self.from_port_present or !self.to_port_present)) return false;
         if (policy.enforce_port_types and !self.port_types_compatible) return false;
         if (!policy.allow_cycles and (self.creates_cycle or self.cycle_check_truncated)) return false;
@@ -88,6 +93,7 @@ pub const ConnectionValidation = struct {
         if (policy.require_existing_nodes and !self.to_node_present) return "target node missing";
         if (!policy.allow_self_links and self.self_link) return "self link disabled";
         if (!policy.allow_duplicate_links and self.duplicate_link) return "duplicate link";
+        if (!policy.allow_multiple_links_to_input and self.input_already_linked) return "input already linked";
         if (policy.enforce_port_ranges and !self.from_port_present) return "source port missing";
         if (policy.enforce_port_ranges and !self.to_port_present) return "target port missing";
         if (policy.enforce_port_types and !self.port_types_compatible) return "port type mismatch";
@@ -104,6 +110,7 @@ pub const GraphValidationReport = struct {
     duplicate_connection_count: usize = 0,
     orphan_connection_count: usize = 0,
     self_link_count: usize = 0,
+    input_fan_in_count: usize = 0,
     invalid_port_count: usize = 0,
     incompatible_port_type_count: usize = 0,
     cycle_count: usize = 0,
@@ -118,6 +125,7 @@ pub const GraphValidationReport = struct {
         if (policy.require_existing_nodes and self.orphan_connection_count != 0) return false;
         if (!policy.allow_self_links and self.self_link_count != 0) return false;
         if (!policy.allow_duplicate_links and self.duplicate_connection_count != 0) return false;
+        if (!policy.allow_multiple_links_to_input and self.input_fan_in_count != 0) return false;
         if (policy.enforce_port_ranges and self.invalid_port_count != 0) return false;
         if (policy.enforce_port_types and self.incompatible_port_type_count != 0) return false;
         if (!policy.allow_cycles and (self.cycle_count != 0 or self.cycle_check_truncated_count != 0)) return false;
@@ -129,6 +137,7 @@ pub const GraphValidationReport = struct {
         if (policy.require_existing_nodes) count += self.orphan_connection_count;
         if (!policy.allow_self_links) count += self.self_link_count;
         if (!policy.allow_duplicate_links) count += self.duplicate_connection_count;
+        if (!policy.allow_multiple_links_to_input) count += self.input_fan_in_count;
         if (policy.enforce_port_ranges) count += self.invalid_port_count;
         if (policy.enforce_port_types) count += self.incompatible_port_type_count;
         if (!policy.allow_cycles) count += self.cycle_count + self.cycle_check_truncated_count;
@@ -170,6 +179,18 @@ pub fn validateConnection(
         if (existing.eql(key)) {
             out.duplicate_link = true;
             break;
+        }
+    }
+    if (!policy.allow_multiple_links_to_input) {
+        for (connections) |connection| {
+            const existing = ConnectionKey.from(connection);
+            if (options.ignore_connection) |ignore| {
+                if (existing.eql(ignore)) continue;
+            }
+            if (existing.to_id == key.to_id and existing.to_port == key.to_port) {
+                out.input_already_linked = true;
+                break;
+            }
         }
     }
 
@@ -218,6 +239,13 @@ pub fn validateGraph(nodes: anytype, connections: anytype, policy: ConnectionPol
             }
         }
         if (key.from_id == key.to_id) report.self_link_count += 1;
+        if (!policy.allow_multiple_links_to_input) {
+            var later_input = index + 1;
+            while (later_input < connections.len) : (later_input += 1) {
+                const other = ConnectionKey.from(connections[later_input]);
+                if (other.to_id == key.to_id and other.to_port == key.to_port) report.input_fan_in_count += 1;
+            }
+        }
 
         var later = index + 1;
         while (later < connections.len) : (later += 1) {
@@ -343,6 +371,7 @@ test "graph validation reports duplicate orphan invalid port and cycle structure
     const report = validateGraph(&nodes, &connections, .strict_dataflow);
     try std.testing.expectEqual(@as(usize, 5), report.connection_count);
     try std.testing.expectEqual(@as(usize, 1), report.duplicate_connection_count);
+    try std.testing.expectEqual(@as(usize, 2), report.input_fan_in_count);
     try std.testing.expectEqual(@as(usize, 1), report.orphan_connection_count);
     try std.testing.expectEqual(@as(usize, 1), report.invalid_port_count);
     try std.testing.expect(report.cycle_count > 0);
@@ -380,4 +409,21 @@ test "graph validation reports port type mismatch when node schema exposes types
     const report = validateGraph(&nodes, &connections, .default);
     try std.testing.expectEqual(@as(usize, 1), report.incompatible_port_type_count);
     try std.testing.expect(!report.valid());
+}
+
+test "strict dataflow validation rejects multiple incoming links to one input port" {
+    const nodes = [_]TestNode{
+        .{ .id = 1 },
+        .{ .id = 2 },
+        .{ .id = 3 },
+    };
+    const connections = [_]TestConnection{
+        .{ .from_id = 1, .to_id = 3 },
+    };
+    const candidate = TestConnection{ .from_id = 2, .to_id = 3 };
+    const validation = validateConnection(&nodes, &connections, candidate, .strict_dataflow, .{});
+    try std.testing.expect(validation.input_already_linked);
+    try std.testing.expectEqualStrings("input already linked", validation.firstIssue(.strict_dataflow));
+    try std.testing.expect(!validation.validFor(.strict_dataflow));
+    try std.testing.expect(validation.validFor(.default));
 }
