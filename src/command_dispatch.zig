@@ -7,6 +7,7 @@
 const std = @import("std");
 const zui = @import("zui");
 const commands = @import("commands.zig");
+const graph_layout = @import("graph_layout.zig");
 const node_editor = @import("node_editor.zig");
 
 pub const NodeEditorCommand = commands.NodeEditorCommand;
@@ -33,12 +34,14 @@ pub const CommandContext = struct {
     duplicate_id_offset: u32 = 1000,
     duplicate_offset: [2]f32 = .{ 32.0, 24.0 },
     connection_policy: node_editor.ConnectionPolicy = .default,
+    layout_workspace: ?graph_layout.LayeredLayoutWorkspace = null,
+    layout_options: graph_layout.LayeredLayoutOptions = .{},
 };
 
 pub fn commandFromId(command_id: CommandId) ?NodeEditorCommand {
     if (command_id < commands.node_editor_command_id_base) return null;
     const raw = command_id - commands.node_editor_command_id_base;
-    if (raw > @intFromEnum(NodeEditorCommand.select_context_port_peers)) return null;
+    if (raw > @intFromEnum(NodeEditorCommand.auto_layout_layered)) return null;
     return @enumFromInt(raw);
 }
 
@@ -100,6 +103,7 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .select_context_port_peers => context.state.canSelectContextPortPeers(context.connections, connection_count, context.nodes, node_count),
         .reconnect_to_previous => context.connection_len != null and context.state.canReconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_count, context.nodes, node_count, context.connection_policy),
         .reconnect_to_next => context.connection_len != null and context.state.canReconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_count, context.nodes, node_count, context.connection_policy),
+        .auto_layout_layered => context.layout_workspace != null and graph_layout.canLayoutLayered(context.nodes, node_count, context.connections[0..connection_count], context.layout_workspace.?, layoutOptions(context)),
     };
 }
 
@@ -137,6 +141,7 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .select_context_port_peers => context.state.selectContextPortPeers(context.connections, activeConnectionCount(context), context.nodes, node_count),
         .reconnect_to_previous => reconnectPrevious(context),
         .reconnect_to_next => reconnectNext(context),
+        .auto_layout_layered => autoLayoutLayered(context),
     };
 }
 
@@ -198,6 +203,12 @@ fn activeGroupCount(context: *const CommandContext) usize {
 fn pushHistory(context: *CommandContext) void {
     const history = context.history orelse return;
     history.pushBeforeWithGroups(context.state.*, context.nodes, activeNodeCount(context), context.groups[0..activeGroupCount(context)], context.connections, activeConnectionCount(context));
+}
+
+fn layoutOptions(context: *const CommandContext) graph_layout.LayeredLayoutOptions {
+    var options = context.layout_options;
+    options.connection_policy = context.connection_policy;
+    return options;
 }
 
 fn dispatchSelectionStateOnly(context: *CommandContext, command: SelectionCommand) bool {
@@ -317,6 +328,13 @@ fn disconnectContextPortLinks(context: *CommandContext) bool {
     return context.state.disconnectContextPortLinks(context.connections, connection_len);
 }
 
+fn autoLayoutLayered(context: *CommandContext) bool {
+    const workspace = context.layout_workspace orelse return false;
+    pushHistory(context);
+    const result = graph_layout.layoutLayered(context.nodes, activeNodeCount(context), context.connections[0..activeConnectionCount(context)], workspace, layoutOptions(context));
+    return result.changed();
+}
+
 test "zui-nodes command dispatch handles selection mutation and insertion" {
     var selected: [8]u32 = .{0} ** 8;
     var state = node_editor.State{ .selected_node_ids = &selected };
@@ -372,6 +390,35 @@ test "zui-nodes command dispatch handles group lifecycle" {
     try std.testing.expect(groups[0].rect.w >= before.w * 0.5);
     try std.testing.expect(dispatch(&ctx, .ungroup_selected));
     try std.testing.expectEqual(@as(usize, 0), group_len);
+}
+
+test "zui-nodes command dispatch auto layouts a strict dataflow graph" {
+    var selected: [8]u32 = .{0} ** 8;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [6]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 6;
+    nodes[0] = .{ .id = 10, .title = "Source", .pos = .{ 50, 30 } };
+    nodes[1] = .{ .id = 20, .title = "Grade", .pos = .{ 25, 90 } };
+    nodes[2] = .{ .id = 30, .title = "Output", .pos = .{ -10, 120 } };
+    var node_len: usize = 3;
+    var connections = [_]node_editor.Connection{
+        .{ .from_id = 10, .to_id = 20 },
+        .{ .from_id = 20, .to_id = 30 },
+    };
+    var workspace_storage = graph_layout.StaticLayeredLayoutWorkspace(8, 8){};
+    var ctx = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .layout_workspace = workspace_storage.workspace(),
+        .layout_options = .{ .origin = .{ -40, -20 }, .layer_gap = 180, .node_gap = 30 },
+        .connection_policy = .strict_dataflow,
+    };
+    try std.testing.expect(canDispatch(&ctx, .auto_layout_layered));
+    try std.testing.expect(dispatch(&ctx, .auto_layout_layered));
+    try std.testing.expectEqual(@as(f32, -40), nodes[0].pos[0]);
+    try std.testing.expectEqual(@as(f32, 140), nodes[1].pos[0]);
+    try std.testing.expectEqual(@as(f32, 320), nodes[2].pos[0]);
 }
 
 test "zui-nodes command dispatch reconnects selected connection and supports history" {

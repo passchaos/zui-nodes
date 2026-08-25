@@ -146,6 +146,7 @@ fn nodeEditorDisabledReason(context: *const CommandContext, command: NodeEditorC
         .close_context_menu => "context menu closed",
         .disconnect_context_port_links, .select_context_port_peers => "context port unavailable",
         .reconnect_to_previous, .reconnect_to_next => "reconnect unavailable",
+        .auto_layout_layered => if (context.layout_workspace == null) "layout workspace unavailable" else "layout unavailable",
     };
 }
 

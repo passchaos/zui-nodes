@@ -67,6 +67,7 @@ pub const NodeEditorCommand = enum(u8) {
     close_context_menu,
     disconnect_context_port_links,
     select_context_port_peers,
+    auto_layout_layered,
 
     pub fn commandId(self: NodeEditorCommand) CommandId {
         return nodeEditorCommandId(self);

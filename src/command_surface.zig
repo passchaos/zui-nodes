@@ -28,7 +28,7 @@ pub const node_editor_command_category = "node editor";
 pub const node_editor_selection_category = "node editor selection";
 pub const node_editor_history_category = "node editor history";
 pub const node_editor_selection_command_count: usize = @intFromEnum(SelectionCommand.focus) + 1;
-pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.select_context_port_peers) + 1;
+pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.auto_layout_layered) + 1;
 pub const node_editor_history_command_count: usize = @intFromEnum(HistoryCommand.redo) + 1;
 pub const node_editor_all_command_count: usize = node_editor_selection_command_count + node_editor_command_count + node_editor_history_command_count;
 pub const node_editor_context_menu_capacity: usize = 40;
@@ -75,6 +75,7 @@ pub const node_editor_commands = [_]Command{
     .{ .id = NodeEditorCommand.close_context_menu.commandId(), .title = "Close Node Context Menu", .description = "Close the node-editor context menu", .category = node_editor_command_category, .panel_role = .viewport },
     .{ .id = NodeEditorCommand.disconnect_context_port_links.commandId(), .title = "Disconnect Context Port Links", .description = "Remove links attached to the port targeted by the context menu", .category = node_editor_command_category, .panel_role = .viewport, .destructive = true },
     .{ .id = NodeEditorCommand.select_context_port_peers.commandId(), .title = "Select Context Port Peers", .description = "Select nodes connected to the port targeted by the context menu", .category = node_editor_command_category, .panel_role = .viewport },
+    .{ .id = NodeEditorCommand.auto_layout_layered.commandId(), .title = "Auto Layout Node Graph", .description = "Arrange nodes into deterministic dependency layers", .category = node_editor_command_category, .panel_role = .viewport, .default_shortcut = "Shift+Home", .pinned = true },
 };
 
 pub const node_editor_history_commands = [_]Command{
@@ -148,6 +149,7 @@ pub const NodeEditorContextMenuCapabilities = struct {
     can_select_downstream_nodes: bool = false,
     can_reconnect_to_previous: bool = false,
     can_reconnect_to_next: bool = false,
+    can_auto_layout_layered: bool = false,
 };
 
 pub fn nodeEditorCommandRegistry() CommandRegistry {
@@ -242,6 +244,7 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
                 builder.appendCommand(.clear_selection);
                 builder.appendCommand(.focus_selection);
                 builder.appendCommand(.frame_all);
+                builder.appendCommand(.auto_layout_layered);
                 builder.appendSeparator();
             }
             if (options.include_insert) {
@@ -265,6 +268,7 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
                 builder.appendCommand(.clear_selection);
                 builder.appendCommand(.focus_selection);
                 builder.appendCommand(.frame_all);
+                builder.appendCommand(.auto_layout_layered);
                 builder.appendSeparator();
             }
             if (options.include_arrange) {
@@ -360,6 +364,7 @@ pub fn nodeEditorContextMenuModelForCapabilities(capabilities: NodeEditorContext
                 builder.appendCommand(.clear_selection, capabilities.has_selection);
                 builder.appendCommand(.focus_selection, capabilities.can_focus_selection);
                 builder.appendCommand(.frame_all, capabilities.can_frame_all);
+                builder.appendCommand(.auto_layout_layered, capabilities.can_auto_layout_layered);
                 builder.appendSeparator();
             }
             if (options.include_insert) {
@@ -383,6 +388,7 @@ pub fn nodeEditorContextMenuModelForCapabilities(capabilities: NodeEditorContext
                 builder.appendCommand(.clear_selection, capabilities.has_selection);
                 builder.appendCommand(.focus_selection, capabilities.can_focus_selection);
                 builder.appendCommand(.frame_all, capabilities.can_frame_all);
+                builder.appendCommand(.auto_layout_layered, capabilities.can_auto_layout_layered);
                 builder.appendSeparator();
             }
             if (options.include_arrange) {
