@@ -26,6 +26,7 @@ pub const SummaryOptions = struct {
     viewport: Rect = .zero,
     minimap_size: zui.ui_base.Size = .{ .w = 150, .h = 96 },
     connection_path_cache: ?*const node_editor.ConnectionPathCache = null,
+    connection_policy: node_editor.ConnectionPolicy = .default,
 };
 
 pub const Summary = struct {
@@ -44,12 +45,16 @@ pub const Summary = struct {
     pan: [2]f32 = .{ 0, 0 },
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
+    graph_validation: node_editor.GraphValidationReport = .{},
+    graph_valid: bool = true,
+    graph_issue_count: usize = 0,
 
     pub fn hasSelection(self: Summary) bool {
         return self.selected_node_count > 0 or self.selected_group_id != null or self.has_selected_connection;
     }
 
     pub fn statusText(self: Summary) []const u8 {
+        if (!self.graph_valid) return "invalid";
         if (self.dragging) return "dragging";
         if (self.hasSelection()) return "selected";
         if (self.node_count == 0) return "empty";
@@ -68,6 +73,7 @@ pub const PanelOptions = struct {
 pub fn summarize(options: SummaryOptions) Summary {
     const state = options.state;
     const minimap = node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size);
+    const graph_report = node_editor.validateGraph(options.nodes, options.connections, options.connection_policy);
     return .{
         .node_count = options.nodes.len,
         .connection_count = options.connections.len,
@@ -84,6 +90,9 @@ pub fn summarize(options: SummaryOptions) Summary {
         .pan = state.pan,
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
+        .graph_validation = graph_report,
+        .graph_valid = graph_report.validFor(options.connection_policy),
+        .graph_issue_count = graph_report.issueCountFor(options.connection_policy),
     };
 }
 
@@ -128,7 +137,16 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.connection_path_cache.miss_count,
         options.summary.connection_path_cache.rebuild_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, path_cache });
+    const graph = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "graph valid={} issues={d} dup={d} orphan={d} port={d} type={d} cycle={d}", .{
+        options.summary.graph_valid,
+        options.summary.graph_issue_count,
+        options.summary.graph_validation.duplicate_connection_count,
+        options.summary.graph_validation.orphan_connection_count,
+        options.summary.graph_validation.invalid_port_count,
+        options.summary.graph_validation.incompatible_port_type_count,
+        options.summary.graph_validation.cycle_count,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, graph });
     return root;
 }
 
@@ -164,4 +182,26 @@ test "zui-nodes devtools summarize node editor state" {
     try std.testing.expect(summary.minimap.visible);
     try std.testing.expectEqual(@as(u64, 1), summary.connection_path_cache.hit_count);
     try std.testing.expectEqualStrings("selected", summary.statusText());
+}
+
+test "zui-nodes devtools reports strict graph validation issues" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 1 },
+    };
+    const summary = summarize(.{
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .connection_policy = .strict_dataflow,
+    });
+    try std.testing.expectEqual(@as(usize, 2), summary.graph_validation.cycle_count);
+    try std.testing.expect(!summary.graph_validation.validFor(.strict_dataflow));
+    try std.testing.expectEqualStrings("invalid", summary.statusText());
 }

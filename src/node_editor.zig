@@ -6,6 +6,7 @@ const ui_base = zui.ui_base;
 const command_search = zui.ui_command_search;
 const commands_mod = @import("commands.zig");
 const menu_mod = zui.ui_menu;
+const graph_validation = @import("graph_validation.zig");
 
 const render = struct {
     pub const PathCommand = zui.RenderPathCommand;
@@ -47,6 +48,11 @@ pub const Connection = struct {
     to_port: u8 = 0,
     color: Color = Color.rgba8(59, 130, 246, 190),
 };
+
+pub const ConnectionPolicy = graph_validation.ConnectionPolicy;
+pub const ConnectionValidation = graph_validation.ConnectionValidation;
+pub const ConnectionValidationOptions = graph_validation.ConnectionValidationOptions;
+pub const GraphValidationReport = graph_validation.GraphValidationReport;
 
 pub const ConnectionEnd = enum {
     from,
@@ -488,6 +494,7 @@ pub fn Options(comptime StateType: type) type {
         minimap_size: Size = .{ .w = 150.0, .h = 96.0 },
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
+        connection_policy: ConnectionPolicy = .default,
     };
 }
 
@@ -733,6 +740,110 @@ pub fn connectionPortsCompatible(nodes: []const Node, connection: Connection) bo
     const to = nodeById(nodes, connection.to_id) orelse return false;
     if (connection.from_port >= outputPortCount(from) or connection.to_port >= inputPortCount(to)) return false;
     return PortType.compatible(outputPortType(from, connection.from_port), inputPortType(to, connection.to_port));
+}
+
+pub fn validateConnection(nodes: []const Node, connections: []const Connection, connection: Connection, policy: ConnectionPolicy, options: ConnectionValidationOptions) ConnectionValidation {
+    var validation_options = options;
+    if (nodes.len == 0) validation_options.nodes_are_authoritative = false;
+    return graph_validation.validateConnection(nodes, connections, connection, policy, validation_options);
+}
+
+pub fn connectionAllowed(nodes: []const Node, connections: []const Connection, connection: Connection, policy: ConnectionPolicy, options: ConnectionValidationOptions) bool {
+    return validateConnection(nodes, connections, connection, policy, options).validFor(policy);
+}
+
+pub fn validateGraph(nodes: []const Node, connections: []const Connection, policy: ConnectionPolicy) GraphValidationReport {
+    return graph_validation.validateGraph(nodes, connections, policy);
+}
+
+fn chainConnectionsAllowed(chain: ChainTemplate, policy: ConnectionPolicy) bool {
+    for (chain.connections, 0..) |connection, index| {
+        if (connection.from_id >= chain.nodes.len or connection.to_id >= chain.nodes.len) continue;
+        if (!policy.allow_self_links and connection.from_id == connection.to_id) return false;
+        const from_template = chain.nodes[@as(usize, @intCast(connection.from_id))];
+        const to_template = chain.nodes[@as(usize, @intCast(connection.to_id))];
+        if (policy.enforce_port_ranges and (connection.from_port >= outputPortCountForTemplate(from_template) or connection.to_port >= inputPortCountForTemplate(to_template))) return false;
+        if (policy.enforce_port_types and
+            connection.from_port < from_template.output_types.len and
+            connection.to_port < to_template.input_types.len and
+            !PortType.compatible(from_template.output_types[connection.from_port], to_template.input_types[connection.to_port]))
+        {
+            return false;
+        }
+        if (!policy.allow_duplicate_links) {
+            var later = index + 1;
+            while (later < chain.connections.len) : (later += 1) {
+                const other = chain.connections[later];
+                if (other.from_id >= chain.nodes.len or other.to_id >= chain.nodes.len) continue;
+                if (connectionEndpointsEqual(connection, other)) return false;
+            }
+        }
+        if (!policy.allow_cycles and chainPathExists(chain.connections, connection.to_id, connection.from_id, connection)) return false;
+    }
+    return true;
+}
+
+fn inputPortCountForTemplate(template: NodeTemplate) u8 {
+    return @max(@as(u8, 1), template.input_count);
+}
+
+fn outputPortCountForTemplate(template: NodeTemplate) u8 {
+    return @max(@as(u8, 1), template.output_count);
+}
+
+fn chainPathExists(connections: []const Connection, start_id: u32, target_id: u32, ignore: Connection) bool {
+    if (start_id == target_id) return true;
+    var visited: [64]u32 = .{0} ** 64;
+    var visited_len: usize = 0;
+    var stack: [64]u32 = .{0} ** 64;
+    var stack_len: usize = 1;
+    stack[0] = start_id;
+
+    while (stack_len > 0) {
+        stack_len -= 1;
+        const current = stack[stack_len];
+        if (current == target_id) return true;
+        if (idInSlice(visited[0..visited_len], current)) continue;
+        if (visited_len >= visited.len) return false;
+        visited[visited_len] = current;
+        visited_len += 1;
+
+        for (connections) |connection| {
+            if (connectionEndpointsEqual(connection, ignore)) continue;
+            if (connection.from_id != current) continue;
+            if (connection.to_id == target_id) return true;
+            if (idInSlice(visited[0..visited_len], connection.to_id)) continue;
+            if (stack_len >= stack.len) return false;
+            stack[stack_len] = connection.to_id;
+            stack_len += 1;
+        }
+    }
+    return false;
+}
+
+fn idInSlice(ids: []const u32, id: u32) bool {
+    for (ids) |value| {
+        if (value == id) return true;
+    }
+    return false;
+}
+
+fn editorConnectionPolicy(editor: anytype) ConnectionPolicy {
+    const Editor = @TypeOf(editor);
+    if (@hasField(Editor, "connection_policy")) return editor.connection_policy;
+    return .default;
+}
+
+fn editorActiveConnections(editor: anytype) []const Connection {
+    const Editor = @TypeOf(editor);
+    if (@hasField(Editor, "mutable_connections")) {
+        if (editor.mutable_connections) |connections| {
+            const len = if (editor.mutable_connection_len) |value| @min(value.*, connections.len) else connections.len;
+            return connections[0..len];
+        }
+    }
+    if (@hasField(Editor, "connections")) return editor.connections;
+    return &.{};
 }
 
 pub fn nodeIndexById(nodes: []const Node, id: u32) ?usize {
@@ -1052,14 +1163,11 @@ fn distributeLessThan(context: DistributeSortContext, a_index: usize, b_index: u
     return a.id < b.id;
 }
 
-fn reconnectCandidateValid(active_connections: []const Connection, selected: Connection, replacement: Connection, nodes: []const Node) bool {
-    if (replacement.from_id == replacement.to_id) return false;
+fn reconnectCandidateValid(active_connections: []const Connection, selected: Connection, replacement: Connection, nodes: []const Node, policy: ConnectionPolicy) bool {
     if (connectionEndpointsEqual(selected, replacement)) return false;
-    if (!connectionPortsCompatible(nodes, replacement)) return false;
-    for (active_connections) |connection| {
-        if (connectionEndpointsEqual(connection, replacement) and !connectionEndpointsEqual(connection, selected)) return false;
-    }
-    return true;
+    return connectionAllowed(nodes, active_connections, replacement, policy, .{
+        .ignore_connection = graph_validation.ConnectionKey.from(selected),
+    });
 }
 
 /// Mutable node-editor model used by core.zig widgets and by headless tests.
@@ -1419,10 +1527,15 @@ pub const State = struct {
         return @min(node_len, nodes.len) < nodes.len;
     }
 
-    pub fn canInsertNodeChain(_: *const State, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize, chain: ChainTemplate) bool {
+    pub fn canInsertNodeChain(self: *const State, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize, chain: ChainTemplate) bool {
+        return self.canInsertNodeChainWithPolicy(nodes, node_len, connections, connection_len, chain, .default);
+    }
+
+    pub fn canInsertNodeChainWithPolicy(_: *const State, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize, chain: ChainTemplate, policy: ConnectionPolicy) bool {
         const active_node_len = @min(node_len, nodes.len);
         const active_connection_len = @min(connection_len, connections.len);
-        return chain.nodes.len > 0 and active_node_len + chain.nodes.len <= nodes.len and active_connection_len + chain.connections.len <= connections.len;
+        if (chain.nodes.len == 0 or active_node_len + chain.nodes.len > nodes.len or active_connection_len + chain.connections.len > connections.len) return false;
+        return chainConnectionsAllowed(chain, policy);
     }
 
     pub fn insertNodeTemplate(self: *State, nodes: []Node, node_len: *usize, template: NodeTemplate, pos: [2]f32) bool {
@@ -1437,16 +1550,18 @@ pub const State = struct {
     }
 
     pub fn insertNodeChain(self: *State, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, chain: ChainTemplate) bool {
+        return self.insertNodeChainWithPolicy(nodes, node_len, connections, connection_len, chain, .default);
+    }
+
+    pub fn insertNodeChainWithPolicy(self: *State, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, chain: ChainTemplate, policy: ConnectionPolicy) bool {
         const active_node_len = @min(node_len.*, nodes.len);
         const active_connection_len = @min(connection_len.*, connections.len);
         node_len.* = active_node_len;
         connection_len.* = active_connection_len;
-        if (!self.canInsertNodeChain(nodes, active_node_len, connections, active_connection_len, chain)) return false;
-        var inserted_ids = [_]u32{0} ** 32;
+        if (!self.canInsertNodeChainWithPolicy(nodes, active_node_len, connections, active_connection_len, chain, policy)) return false;
         var insert_index = active_node_len;
         for (chain.nodes, 0..) |template, i| {
             const id = uniqueDuplicateNodeId(nodes[0..insert_index], @as(u32, @intCast(insert_index + 1)), 1000);
-            inserted_ids[i] = id;
             nodes[insert_index] = nodeFromTemplate(template, id, .{
                 chain.start_pos[0] + chain.node_gap[0] * @as(f32, @floatFromInt(i)),
                 chain.start_pos[1] + chain.node_gap[1] * @as(f32, @floatFromInt(i)),
@@ -1457,9 +1572,9 @@ pub const State = struct {
         for (chain.connections) |connection| {
             if (connection.from_id >= chain.nodes.len or connection.to_id >= chain.nodes.len) continue;
             var mapped = connection;
-            mapped.from_id = inserted_ids[connection.from_id];
-            mapped.to_id = inserted_ids[connection.to_id];
-            if (!connectionExists(connections[0..connection_index], mapped)) {
+            mapped.from_id = nodes[active_node_len + @as(usize, @intCast(connection.from_id))].id;
+            mapped.to_id = nodes[active_node_len + @as(usize, @intCast(connection.to_id))].id;
+            if (connectionAllowed(nodes[0..insert_index], connections[0..connection_index], mapped, policy, .{})) {
                 connections[connection_index] = mapped;
                 connection_index += 1;
             }
@@ -1470,12 +1585,12 @@ pub const State = struct {
         self.selected_node_id = null;
         self.selected_group_id = null;
         self.selected_connection = null;
-        for (inserted_ids[0..@min(chain.nodes.len, inserted_ids.len)]) |id| {
+        for (nodes[active_node_len..insert_index]) |node| {
             if (self.selected_node_len < self.selected_node_ids.len) {
-                self.selected_node_ids[self.selected_node_len] = id;
+                self.selected_node_ids[self.selected_node_len] = node.id;
                 self.selected_node_len += 1;
             }
-            self.selected_node_id = id;
+            self.selected_node_id = node.id;
         }
         return true;
     }
@@ -1644,19 +1759,35 @@ pub const State = struct {
     }
 
     pub fn canReconnectSelectedConnectionToPreviousNode(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize) bool {
-        return self.selectedAdjacentReconnectCandidate(connections, connection_len, nodes, node_len, .previous) != null;
+        return self.canReconnectSelectedConnectionToPreviousNodeWithPolicy(connections, connection_len, nodes, node_len, .default);
+    }
+
+    pub fn canReconnectSelectedConnectionToPreviousNodeWithPolicy(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, policy: ConnectionPolicy) bool {
+        return self.selectedAdjacentReconnectCandidate(connections, connection_len, nodes, node_len, .previous, policy) != null;
     }
 
     pub fn canReconnectSelectedConnectionToNextNode(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize) bool {
-        return self.selectedAdjacentReconnectCandidate(connections, connection_len, nodes, node_len, .next) != null;
+        return self.canReconnectSelectedConnectionToNextNodeWithPolicy(connections, connection_len, nodes, node_len, .default);
+    }
+
+    pub fn canReconnectSelectedConnectionToNextNodeWithPolicy(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, policy: ConnectionPolicy) bool {
+        return self.selectedAdjacentReconnectCandidate(connections, connection_len, nodes, node_len, .next, policy) != null;
     }
 
     pub fn reconnectSelectedConnectionToPreviousNode(self: *State, connections: []Connection, connection_len: *usize, nodes: []const Node, node_len: usize) bool {
-        return self.reconnectSelectedConnectionToAdjacentNode(connections, connection_len, nodes, node_len, .previous);
+        return self.reconnectSelectedConnectionToPreviousNodeWithPolicy(connections, connection_len, nodes, node_len, .default);
+    }
+
+    pub fn reconnectSelectedConnectionToPreviousNodeWithPolicy(self: *State, connections: []Connection, connection_len: *usize, nodes: []const Node, node_len: usize, policy: ConnectionPolicy) bool {
+        return self.reconnectSelectedConnectionToAdjacentNode(connections, connection_len, nodes, node_len, .previous, policy);
     }
 
     pub fn reconnectSelectedConnectionToNextNode(self: *State, connections: []Connection, connection_len: *usize, nodes: []const Node, node_len: usize) bool {
-        return self.reconnectSelectedConnectionToAdjacentNode(connections, connection_len, nodes, node_len, .next);
+        return self.reconnectSelectedConnectionToNextNodeWithPolicy(connections, connection_len, nodes, node_len, .default);
+    }
+
+    pub fn reconnectSelectedConnectionToNextNodeWithPolicy(self: *State, connections: []Connection, connection_len: *usize, nodes: []const Node, node_len: usize, policy: ConnectionPolicy) bool {
+        return self.reconnectSelectedConnectionToAdjacentNode(connections, connection_len, nodes, node_len, .next, policy);
     }
 
     pub fn canGroupSelectedNodes(self: *const State, nodes: []const Node, node_len: usize, groups: []const Group, group_len: usize) bool {
@@ -1895,20 +2026,27 @@ pub const State = struct {
     }
 
     pub fn canPasteClipboard(self: *const State, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize, clipboard: Clipboard) bool {
+        return self.canPasteClipboardWithPolicy(nodes, node_len, connections, connection_len, clipboard, .default);
+    }
+
+    pub fn canPasteClipboardWithPolicy(self: *const State, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize, clipboard: Clipboard, policy: ConnectionPolicy) bool {
         _ = self;
         const active_node_len = @min(node_len, nodes.len);
         const active_connection_len = @min(connection_len, connections.len);
-        return clipboard.node_len > 0 and
-            active_node_len + clipboard.node_len <= nodes.len and
-            active_connection_len + clipboard.connection_len <= connections.len;
+        if (clipboard.node_len == 0 or active_node_len + clipboard.node_len > nodes.len or active_connection_len + clipboard.connection_len > connections.len) return false;
+        return validateGraph(clipboard.nodes[0..clipboard.node_len], clipboard.connections[0..clipboard.connection_len], policy).validFor(policy);
     }
 
     pub fn pasteClipboard(self: *State, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, clipboard: *Clipboard, offset: [2]f32) bool {
+        return self.pasteClipboardWithPolicy(nodes, node_len, connections, connection_len, clipboard, offset, .default);
+    }
+
+    pub fn pasteClipboardWithPolicy(self: *State, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, clipboard: *Clipboard, offset: [2]f32, policy: ConnectionPolicy) bool {
         const active_node_len = @min(node_len.*, nodes.len);
         const active_connection_len = @min(connection_len.*, connections.len);
         node_len.* = active_node_len;
         connection_len.* = active_connection_len;
-        if (!self.canPasteClipboard(nodes, active_node_len, connections, active_connection_len, clipboard.*)) return false;
+        if (!self.canPasteClipboardWithPolicy(nodes, active_node_len, connections, active_connection_len, clipboard.*, policy)) return false;
 
         const paste_index = clipboard.paste_count +% 1;
         const step = if (paste_index == 0) @as(f32, 1.0) else @as(f32, @floatFromInt(paste_index));
@@ -1933,7 +2071,7 @@ pub const State = struct {
             var pasted = connection;
             pasted.from_id = from_id;
             pasted.to_id = to_id;
-            if (!connectionExists(connections[0..append_connection], pasted)) {
+            if (connectionAllowed(nodes[0..append_node], connections[0..append_connection], pasted, policy, .{})) {
                 connections[append_connection] = pasted;
                 append_connection += 1;
             }
@@ -2287,8 +2425,8 @@ pub const State = struct {
         return @abs(before_zoom - self.zoom) > 0.0001 or @abs(before_pan[0] - self.pan[0]) > 0.001 or @abs(before_pan[1] - self.pan[1]) > 0.001;
     }
 
-    fn reconnectSelectedConnectionToAdjacentNode(self: *State, connections: []Connection, connection_len: *usize, nodes: []const Node, node_len: usize, direction: AdjacentNodeDirection) bool {
-        const replacement = self.selectedAdjacentReconnectCandidate(connections, connection_len.*, nodes, node_len, direction) orelse return false;
+    fn reconnectSelectedConnectionToAdjacentNode(self: *State, connections: []Connection, connection_len: *usize, nodes: []const Node, node_len: usize, direction: AdjacentNodeDirection, policy: ConnectionPolicy) bool {
+        const replacement = self.selectedAdjacentReconnectCandidate(connections, connection_len.*, nodes, node_len, direction, policy) orelse return false;
         const selected = self.selected_connection orelse return false;
         const count = @min(connection_len.*, connections.len);
         connection_len.* = count;
@@ -2302,7 +2440,7 @@ pub const State = struct {
         return false;
     }
 
-    fn selectedAdjacentReconnectCandidate(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, direction: AdjacentNodeDirection) ?Connection {
+    fn selectedAdjacentReconnectCandidate(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, direction: AdjacentNodeDirection, policy: ConnectionPolicy) ?Connection {
         const selected = self.selected_connection orelse return null;
         const active_connections = connections[0..@min(connection_len, connections.len)];
         if (!connectionExists(active_connections, selected)) return null;
@@ -2311,13 +2449,13 @@ pub const State = struct {
             var replacement = selected;
             replacement.to_id = to_id;
             replacement.to_port = 0;
-            if (reconnectCandidateValid(active_connections, selected, replacement, active_nodes)) return replacement;
+            if (reconnectCandidateValid(active_connections, selected, replacement, active_nodes, policy)) return replacement;
         }
         if (adjacentNodeId(active_nodes, selected.from_id, selected.to_id, direction)) |from_id| {
             var replacement = selected;
             replacement.from_id = from_id;
             replacement.from_port = 0;
-            if (reconnectCandidateValid(active_connections, selected, replacement, active_nodes)) return replacement;
+            if (reconnectCandidateValid(active_connections, selected, replacement, active_nodes, policy)) return replacement;
         }
         return null;
     }
@@ -2509,17 +2647,15 @@ pub const State = struct {
     }
 
     pub fn appendConnectionChecked(self: *State, connections: []Connection, len: *usize, connection: Connection, nodes: []const Node) bool {
-        if (!connectionPortsCompatible(nodes, connection)) {
-            self.pending_connection = null;
-            return false;
-        }
+        return self.appendConnectionWithPolicy(connections, len, connection, nodes, .default);
+    }
+
+    pub fn appendConnectionWithPolicy(self: *State, connections: []Connection, len: *usize, connection: Connection, nodes: []const Node, policy: ConnectionPolicy) bool {
         const clamped_len = @min(len.*, connections.len);
         len.* = clamped_len;
-        for (connections[0..clamped_len]) |existing| {
-            if (State.connectionEndpointsEqual(existing, connection)) {
-                self.pending_connection = null;
-                return false;
-            }
+        if (!connectionAllowed(nodes, connections[0..clamped_len], connection, policy, .{})) {
+            self.pending_connection = null;
+            return false;
         }
         if (clamped_len >= connections.len) {
             self.pending_connection = connection;
@@ -2568,6 +2704,10 @@ pub const State = struct {
     }
 
     pub fn reconnectConnectionPortChecked(self: *State, connections: []Connection, len: *usize, target: Connection, endpoint: ConnectionEnd, node_id: u32, port: u8, nodes: []const Node) bool {
+        return self.reconnectConnectionPortWithPolicy(connections, len, target, endpoint, node_id, port, nodes, .default);
+    }
+
+    pub fn reconnectConnectionPortWithPolicy(self: *State, connections: []Connection, len: *usize, target: Connection, endpoint: ConnectionEnd, node_id: u32, port: u8, nodes: []const Node, policy: ConnectionPolicy) bool {
         const clamped_len = @min(len.*, connections.len);
         len.* = clamped_len;
         var replacement = target;
@@ -2581,15 +2721,13 @@ pub const State = struct {
                 replacement.to_port = port;
             },
         }
-        if (replacement.from_id == replacement.to_id) return false;
-        if (!connectionPortsCompatible(nodes, replacement)) return false;
         if (State.connectionEndpointsEqual(replacement, target)) {
             self.selected_connection = replacement;
             return false;
         }
-        for (connections[0..clamped_len]) |existing| {
-            if (State.connectionEndpointsEqual(existing, replacement) and !State.connectionEndpointsEqual(existing, target)) return false;
-        }
+        if (!connectionAllowed(nodes, connections[0..clamped_len], replacement, policy, .{
+            .ignore_connection = graph_validation.ConnectionKey.from(target),
+        })) return false;
         for (connections[0..clamped_len]) |*connection| {
             if (!State.connectionEndpointsEqual(connection.*, target)) continue;
             connection.* = replacement;
@@ -2970,13 +3108,13 @@ fn dragPreviewCompatible(editor: anytype, input_hover: ?PortHit) bool {
     const from_id = editor.state.dragging_connection_from_id orelse return true;
     const hit = input_hover orelse return true;
     const to_id = editor.nodes[hit.node_index].id;
-    if (from_id == to_id) return false;
-    return connectionPortsCompatible(editor.nodes, .{
+    const connection = Connection{
         .from_id = from_id,
         .from_port = editor.state.dragging_connection_from_port,
         .to_id = to_id,
         .to_port = hit.port_index,
-    });
+    };
+    return connectionAllowed(editor.nodes, editorActiveConnections(editor), connection, editorConnectionPolicy(editor), .{});
 }
 
 fn reconnectPreviewCompatible(editor: anytype, input_hover: ?PortHit, output_hover: ?PortHit) bool {
@@ -2994,8 +3132,9 @@ fn reconnectPreviewCompatible(editor: anytype, input_hover: ?PortHit, output_hov
             replacement.to_port = hit.port_index;
         },
     }
-    if (replacement.from_id == replacement.to_id) return false;
-    return connectionPortsCompatible(editor.nodes, replacement);
+    return connectionAllowed(editor.nodes, editorActiveConnections(editor), replacement, editorConnectionPolicy(editor), .{
+        .ignore_connection = graph_validation.ConnectionKey.from(connection),
+    });
 }
 
 fn inputPortAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?PortHit {
@@ -3229,15 +3368,24 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                             .to => if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| hit.port_index else 0,
                         };
                         if (target_id) |id| {
-                            if (editor.history) |history| {
-                                history.pushBefore(editor.state.*, editor.nodes, editor.nodes.len, connections, len.*);
+                            var replacement = connection;
+                            switch (endpoint) {
+                                .from => {
+                                    replacement.from_id = id;
+                                    replacement.from_port = target_port;
+                                },
+                                .to => {
+                                    replacement.to_id = id;
+                                    replacement.to_port = target_port;
+                                },
                             }
-                            changed = editor.state.reconnectConnectionPortChecked(connections, len, connection, endpoint, id, target_port, editor.nodes);
-                            if (!changed) {
+                            if (connectionAllowed(editor.nodes, connections[0..@min(len.*, connections.len)], replacement, editorConnectionPolicy(editor), .{
+                                .ignore_connection = graph_validation.ConnectionKey.from(connection),
+                            })) {
                                 if (editor.history) |history| {
-                                    _ = history.undo(editor.state, &.{}, &len.*, connections, len);
-                                    history.redo_len = 0;
+                                    history.pushBefore(editor.state.*, editor.nodes, editor.nodes.len, connections, len.*);
                                 }
+                                changed = editor.state.reconnectConnectionPortWithPolicy(connections, len, connection, endpoint, id, target_port, editor.nodes, editorConnectionPolicy(editor));
                             }
                         }
                     }
@@ -3256,12 +3404,16 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                         if (editor.mutable_connections) |connections| {
                             if (editor.mutable_connection_len) |len| {
                                 const before_len = len.*;
-                                if (editor.history) |history| {
-                                    if (!State.connectionExists(connections[0..@min(before_len, connections.len)], connection) and before_len < connections.len) {
+                                const active_connections = connections[0..@min(before_len, connections.len)];
+                                const can_append = before_len < connections.len and connectionAllowed(editor.nodes, active_connections, connection, editorConnectionPolicy(editor), .{});
+                                if (can_append) {
+                                    if (editor.history) |history| {
                                         history.pushBefore(editor.state.*, editor.nodes, editor.nodes.len, connections, before_len);
                                     }
+                                    _ = editor.state.appendConnectionWithPolicy(connections, len, connection, editor.nodes, editorConnectionPolicy(editor));
+                                } else {
+                                    editor.state.pending_connection = null;
                                 }
-                                _ = editor.state.appendConnectionChecked(connections, len, connection, editor.nodes);
                             } else {
                                 editor.state.pending_connection = connection;
                             }
@@ -3364,6 +3516,32 @@ test "NodeEditor connection hit testing and port compatibility" {
     const mid = [2]f32{ (out[0] + in[0]) * 0.5, (out[1] + in[1]) * 0.5 };
     try std.testing.expect(connectionHit(viewport, state, &nodes, connection, mid));
     try std.testing.expectEqual(connection, connectionAtPoint(viewport, state, &nodes, null, null, &.{connection}, mid).?);
+}
+
+test "NodeEditor strict dataflow policy rejects cyclic link mutation" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 160, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 320, 0 } },
+    };
+    var connections: [4]Connection = .{Connection{ .from_id = 0, .to_id = 0 }} ** 4;
+    connections[0] = .{ .from_id = 1, .to_id = 2 };
+    connections[1] = .{ .from_id = 2, .to_id = 3 };
+    var connection_len: usize = 2;
+    const cycle = Connection{ .from_id = 3, .to_id = 1 };
+    const validation = validateConnection(&nodes, connections[0..connection_len], cycle, .strict_dataflow, .{});
+    try std.testing.expect(validation.creates_cycle);
+    try std.testing.expectEqualStrings("cycle", validation.firstIssue(.strict_dataflow));
+    try std.testing.expect(!state.appendConnectionWithPolicy(&connections, &connection_len, cycle, &nodes, .strict_dataflow));
+    try std.testing.expectEqual(@as(usize, 2), connection_len);
+    try std.testing.expect(state.pending_connection == null);
+    try std.testing.expect(state.appendConnectionWithPolicy(&connections, &connection_len, cycle, &nodes, .default));
+    try std.testing.expectEqual(@as(usize, 3), connection_len);
+    const graph_report = validateGraph(&nodes, connections[0..connection_len], .strict_dataflow);
+    try std.testing.expect(graph_report.cycle_count > 0);
+    try std.testing.expect(!graph_report.validFor(.strict_dataflow));
 }
 
 test "NodeEditor connection path cache reuses cubic controls" {

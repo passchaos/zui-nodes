@@ -32,6 +32,7 @@ pub const CommandContext = struct {
     viewport: ?zui.Rect = null,
     duplicate_id_offset: u32 = 1000,
     duplicate_offset: [2]f32 = .{ 32.0, 24.0 },
+    connection_policy: node_editor.ConnectionPolicy = .default,
 };
 
 pub fn commandFromId(command_id: CommandId) ?NodeEditorCommand {
@@ -81,9 +82,9 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .select_all => node_count > 0,
         .focus_selection, .frame_all => node_count > 0,
         .copy_selection => if (context.clipboard) |_| context.state.selectedNodeStorageCount(context.nodes, node_count) > 0 else false,
-        .paste_clipboard => if (context.clipboard) |clipboard| clipboard.hasNodes() and node_count + clipboard.node_len <= context.nodes.len else false,
+        .paste_clipboard => if (context.clipboard) |clipboard| context.state.canPasteClipboardWithPolicy(context.nodes, node_count, context.connections, connection_count, clipboard.*, context.connection_policy) else false,
         .insert_image_input, .insert_processing_node, .insert_output_node => node_count < context.nodes.len,
-        .insert_processing_chain => context.insert_chain.nodes.len > 0 and context.connection_len != null and context.state.canInsertNodeChain(context.nodes, node_count, context.connections, connection_count, context.insert_chain),
+        .insert_processing_chain => context.insert_chain.nodes.len > 0 and context.connection_len != null and context.state.canInsertNodeChainWithPolicy(context.nodes, node_count, context.connections, connection_count, context.insert_chain, context.connection_policy),
         .align_left, .align_center_x, .align_right, .align_top, .align_center_y, .align_bottom => context.state.canArrangeSelectedNodes(context.nodes, node_count, command),
         .distribute_horizontal, .distribute_vertical => context.state.canArrangeSelectedNodes(context.nodes, node_count, command),
         .disconnect_selected_link => context.state.canDisconnectSelectedLink(context.connections, connection_count),
@@ -97,8 +98,8 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .close_context_menu => context.state.context_menu.open,
         .disconnect_context_port_links => context.connection_len != null and context.state.canDisconnectContextPortLinks(context.connections, connection_count),
         .select_context_port_peers => context.state.canSelectContextPortPeers(context.connections, connection_count, context.nodes, node_count),
-        .reconnect_to_previous => context.connection_len != null and context.state.canReconnectSelectedConnectionToPreviousNode(context.connections, connection_count, context.nodes, node_count),
-        .reconnect_to_next => context.connection_len != null and context.state.canReconnectSelectedConnectionToNextNode(context.connections, connection_count, context.nodes, node_count),
+        .reconnect_to_previous => context.connection_len != null and context.state.canReconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_count, context.nodes, node_count, context.connection_policy),
+        .reconnect_to_next => context.connection_len != null and context.state.canReconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_count, context.nodes, node_count, context.connection_policy),
     };
 }
 
@@ -247,7 +248,7 @@ fn copySelection(context: *CommandContext) bool {
 fn pasteSelection(context: *CommandContext) bool {
     const clipboard = context.clipboard orelse return false;
     pushHistory(context);
-    return context.state.pasteClipboard(context.nodes, context.node_len, context.connections, context.connection_len orelse return false, clipboard, .{ 24, 24 });
+    return context.state.pasteClipboardWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len orelse return false, clipboard, .{ 24, 24 }, context.connection_policy);
 }
 
 fn insertTemplate(context: *CommandContext, template: node_editor.NodeTemplate) bool {
@@ -261,7 +262,7 @@ fn insertChain(context: *CommandContext) bool {
     pushHistory(context);
     var chain = context.insert_chain;
     chain.start_pos = node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)]);
-    return context.state.insertNodeChain(context.nodes, context.node_len, context.connections, context.connection_len.?, chain);
+    return context.state.insertNodeChainWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len.?, chain, context.connection_policy);
 }
 
 fn arrange(context: *CommandContext, command: NodeEditorCommand) bool {
@@ -301,13 +302,13 @@ fn fitGroupToSelection(context: *CommandContext) bool {
 fn reconnectPrevious(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     pushHistory(context);
-    return context.state.reconnectSelectedConnectionToPreviousNode(context.connections, connection_len, context.nodes, activeNodeCount(context));
+    return context.state.reconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy);
 }
 
 fn reconnectNext(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     pushHistory(context);
-    return context.state.reconnectSelectedConnectionToNextNode(context.connections, connection_len, context.nodes, activeNodeCount(context));
+    return context.state.reconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy);
 }
 
 fn disconnectContextPortLinks(context: *CommandContext) bool {

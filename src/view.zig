@@ -75,6 +75,7 @@ pub const NodeEditorViewOptions = struct {
     show_minimap: bool = true,
     minimap_size: zui.ui_base.Size = .{ .w = 150.0, .h = 96.0 },
     clipboard: ?*node_editor.Clipboard = null,
+    connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
 };
 
@@ -106,6 +107,7 @@ const Binding = struct {
     show_minimap: bool = true,
     minimap_size: zui.ui_base.Size = .{ .w = 150.0, .h = 96.0 },
     clipboard: ?*node_editor.Clipboard = null,
+    connection_policy: node_editor.ConnectionPolicy = .default,
 
     fn editor(self: *const Binding) node_editor.Options(node_editor.State) {
         return .{
@@ -134,6 +136,7 @@ const Binding = struct {
             .minimap_size = self.minimap_size,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
+            .connection_policy = self.connection_policy,
         };
     }
 };
@@ -168,6 +171,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .show_minimap = options.show_minimap,
         .minimap_size = options.minimap_size,
         .clipboard = options.clipboard,
+        .connection_policy = options.connection_policy,
     };
     var style = options.style;
     if (style.background.a == 0 and style.background_paint == .none) style.background = options.background;
@@ -430,6 +434,48 @@ test "node editor view creates connections from output to input ports" {
     try std.testing.expectEqual(@as(usize, 1), connection_len);
     try std.testing.expectEqual(node_editor.Connection{ .from_id = 1, .to_id = 2 }, connections[0]);
     try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
+}
+
+test "node editor view rejects strict dataflow cycle gestures" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Source", .pos = .{ -160, 0 } },
+        .{ .id = 2, .title = "Middle", .pos = .{ 20, 0 } },
+        .{ .id = 3, .title = "Output", .pos = .{ 200, 0 } },
+    };
+    var connections: [4]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 4;
+    connections[0] = .{ .from_id = 1, .to_id = 2 };
+    connections[1] = .{ .from_id = 2, .to_id = 3 };
+    var connection_len: usize = 2;
+    var history = node_editor.History{};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 600, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 600, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9406,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .history = &history,
+        .connection_policy = .strict_dataflow,
+        .style = .{ .width = .{ .px = 580 }, .height = .{ .px = 220 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 580, .h = 220 };
+
+    const out = node_editor.outputPortPosition(editor_node.rect, state, nodes[2]);
+    const in = node_editor.inputPortPosition(editor_node.rect, state, nodes[0]);
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = out[0], .y = out[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var move = ElementEvent{ .mouse_move = .{ .x = in[0], .y = in[1], .dx = in[0] - out[0], .dy = in[1] - out[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+    try std.testing.expect(!state.connection_preview_valid);
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = in[0], .y = in[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 2), connection_len);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+    try std.testing.expect(state.pending_connection == null);
 }
 
 test "node editor view handles minimap panning and shift box selection" {

@@ -77,16 +77,31 @@ pub const ValidationReport = struct {
     group_count: usize = 0,
     duplicate_node_id_count: usize = 0,
     duplicate_group_id_count: usize = 0,
+    duplicate_connection_count: usize = 0,
     orphan_connection_count: usize = 0,
+    self_link_count: usize = 0,
+    invalid_port_count: usize = 0,
+    incompatible_port_type_count: usize = 0,
+    cycle_count: usize = 0,
+    cycle_check_truncated_count: usize = 0,
     selected_node_present: bool = false,
     selected_group_present: bool = false,
     selected_connection_present: bool = false,
 
     pub fn valid(self: ValidationReport) bool {
+        return self.validFor(.default);
+    }
+
+    pub fn validFor(self: ValidationReport, policy: node_editor.ConnectionPolicy) bool {
         return self.version_supported and
             self.duplicate_node_id_count == 0 and
             self.duplicate_group_id_count == 0 and
-            self.orphan_connection_count == 0 and
+            (policy.allow_duplicate_links or self.duplicate_connection_count == 0) and
+            (!policy.require_existing_nodes or self.orphan_connection_count == 0) and
+            (policy.allow_self_links or self.self_link_count == 0) and
+            (!policy.enforce_port_ranges or self.invalid_port_count == 0) and
+            (!policy.enforce_port_types or self.incompatible_port_type_count == 0) and
+            (policy.allow_cycles or (self.cycle_count == 0 and self.cycle_check_truncated_count == 0)) and
             self.selected_node_present and
             self.selected_group_present and
             self.selected_connection_present;
@@ -103,6 +118,7 @@ pub const Summary = struct {
     has_selected_connection: bool = false,
     bounds: Rect = .zero,
     valid: bool = false,
+    graph_validation: node_editor.GraphValidationReport = .{},
 
     pub fn hasSelection(self: Summary) bool {
         return self.selected_node_count > 0 or self.selected_group_id != null or self.has_selected_connection;
@@ -186,7 +202,11 @@ pub fn applyDocumentSnapshot(options: ApplyOptions) !ApplyResult {
 }
 
 pub fn summarizeDocumentSnapshot(snapshot: DocumentSnapshot) Summary {
-    const validation = validateDocumentSnapshot(snapshot);
+    return summarizeDocumentSnapshotWithPolicy(snapshot, .default);
+}
+
+pub fn summarizeDocumentSnapshotWithPolicy(snapshot: DocumentSnapshot, policy: node_editor.ConnectionPolicy) Summary {
+    const validation = validateDocumentSnapshotWithPolicy(snapshot, policy);
     return .{
         .node_count = snapshot.nodes.len,
         .connection_count = snapshot.connections.len,
@@ -196,11 +216,16 @@ pub fn summarizeDocumentSnapshot(snapshot: DocumentSnapshot) Summary {
         .selected_group_id = snapshot.selected_group_id,
         .has_selected_connection = snapshot.selected_connection != null,
         .bounds = node_editor.graphBounds(snapshot.nodes, snapshot.groups),
-        .valid = validation.valid(),
+        .valid = validation.validFor(policy),
+        .graph_validation = node_editor.validateGraph(snapshot.nodes, snapshot.connections, policy),
     };
 }
 
 pub fn validateDocumentSnapshot(snapshot: DocumentSnapshot) ValidationReport {
+    return validateDocumentSnapshotWithPolicy(snapshot, .default);
+}
+
+pub fn validateDocumentSnapshotWithPolicy(snapshot: DocumentSnapshot, policy: node_editor.ConnectionPolicy) ValidationReport {
     var report = ValidationReport{
         .version_supported = snapshot.version == DocumentSnapshotVersion,
         .node_count = snapshot.nodes.len,
@@ -226,13 +251,18 @@ pub fn validateDocumentSnapshot(snapshot: DocumentSnapshot) ValidationReport {
         if (snapshot.selected_group_id == group.id) report.selected_group_present = true;
     }
     for (snapshot.connections) |connection| {
-        const from_present = nodeIdPresent(snapshot.nodes, connection.from_id);
-        const to_present = nodeIdPresent(snapshot.nodes, connection.to_id);
-        if (!from_present or !to_present) report.orphan_connection_count += 1;
         if (snapshot.selected_connection) |selected| {
             if (std.meta.eql(selected, connection)) report.selected_connection_present = true;
         }
     }
+    const graph_report = node_editor.validateGraph(snapshot.nodes, snapshot.connections, policy);
+    report.duplicate_connection_count = graph_report.duplicate_connection_count;
+    report.orphan_connection_count = graph_report.orphan_connection_count;
+    report.self_link_count = graph_report.self_link_count;
+    report.invalid_port_count = graph_report.invalid_port_count;
+    report.incompatible_port_type_count = graph_report.incompatible_port_type_count;
+    report.cycle_count = graph_report.cycle_count;
+    report.cycle_check_truncated_count = graph_report.cycle_check_truncated_count;
     return report;
 }
 
@@ -336,4 +366,27 @@ test "zui-nodes document validation reports duplicate and orphan graph data" {
     try std.testing.expectEqual(@as(usize, 1), report.orphan_connection_count);
     try std.testing.expect(!report.selected_node_present);
     try std.testing.expect(!report.valid());
+}
+
+test "zui-nodes document validation supports strict dataflow graph policy" {
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 1 },
+    };
+    const snapshot = DocumentSnapshot{
+        .nodes = &nodes,
+        .connections = &connections,
+    };
+    const default_report = validateDocumentSnapshot(snapshot);
+    try std.testing.expect(default_report.valid());
+    const strict_report = validateDocumentSnapshotWithPolicy(snapshot, .strict_dataflow);
+    try std.testing.expect(strict_report.cycle_count > 0);
+    try std.testing.expect(!strict_report.validFor(.strict_dataflow));
+    const summary = summarizeDocumentSnapshotWithPolicy(snapshot, .strict_dataflow);
+    try std.testing.expect(!summary.valid);
+    try std.testing.expect(summary.graph_validation.cycle_count > 0);
 }
