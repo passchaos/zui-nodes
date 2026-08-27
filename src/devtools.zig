@@ -40,6 +40,7 @@ pub const SummaryOptions = struct {
     box_select_scope: node_editor.BoxSelectScope = .nodes_only,
     spatial_navigation: node_editor.SpatialNavigationOptions = .{},
     node_collapse: node_editor.NodeCollapseOptions = .{},
+    node_resize: node_editor.NodeResizeOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -82,6 +83,8 @@ pub const Summary = struct {
     navigation_spatial_fallback_count: u64 = 0,
     node_collapse_enabled: bool = false,
     node_collapse_mutation_count: u64 = 0,
+    node_resize_enabled: bool = false,
+    resizing_node_id: ?u32 = null,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -158,12 +161,12 @@ pub fn summarize(options: SummaryOptions) Summary {
         .has_selected_connection = state.boundedConnectionSelectionLen() > 0,
         .hover_node_id = state.hover_node_id,
         .hover_group_id = state.hover_group_id,
-        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.resizing_group_id != null or state.box_selecting or state.dragging_minimap,
+        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.box_selecting or state.dragging_minimap,
         .dragging_minimap = state.dragging_minimap,
         .zoom = state.zoom,
         .detail_level = node_editor.semanticDetailLevel(state.*, options.semantic_zoom),
         .drag_auto_pan_enabled = options.drag_auto_pan.enabled,
-        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.box_selecting,
+        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.box_selecting,
         .drag_snap_enabled = options.drag_snap.enabled,
         .drag_snap_active = state.dragging_node_id != null and
             ((state.snap_guide_x != null and state.snap_guide_x_span == null) or
@@ -185,6 +188,8 @@ pub fn summarize(options: SummaryOptions) Summary {
         .navigation_spatial_fallback_count = state.navigation_spatial_fallback_count,
         .node_collapse_enabled = options.node_collapse.enabled,
         .node_collapse_mutation_count = state.node_collapse_mutation_count,
+        .node_resize_enabled = options.node_resize.enabled,
+        .resizing_node_id = state.resizing_node_id,
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -224,11 +229,12 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.group_count,
         options.summary.statusText(),
     }), .{ .font_size = 10, .color = ctx.theme().text_muted, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const selection = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "selection nodes={d} collapsed={d} links={d} node={?d} group={?d} conn={}", .{
+    const selection = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "selection nodes={d} collapsed={d} links={d} node={?d} resize={?d} group={?d} conn={}", .{
         options.summary.selected_node_count,
         options.summary.selected_collapsed_node_count,
         options.summary.selected_connection_count,
         options.summary.selected_node_id,
+        options.summary.resizing_node_id,
         options.summary.selected_group_id,
         options.summary.has_selected_connection,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
@@ -239,9 +245,11 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.pan[1],
         options.summary.minimap.visible,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const auto_pan = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "auto-pan enabled={} active={}", .{
+    const auto_pan = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "auto-pan enabled={} active={} node-resize enabled={} active={?d}", .{
         options.summary.drag_auto_pan_enabled,
         options.summary.drag_auto_pan_active,
+        options.summary.node_resize_enabled,
+        options.summary.resizing_node_id,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const box_select = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "box={s} crossing={}", .{
         @tagName(options.summary.box_select_scope),

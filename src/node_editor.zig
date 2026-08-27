@@ -37,6 +37,8 @@ pub const GroupResizeEdges = packed struct {
     }
 };
 
+pub const NodeResizeEdges = GroupResizeEdges;
+
 pub const ContextTarget = enum {
     canvas,
     node,
@@ -303,6 +305,13 @@ pub const NodeCollapseOptions = struct {
     show_indicator: bool = true,
 };
 
+pub const NodeResizeOptions = struct {
+    enabled: bool = false,
+    margin: f32 = 7.0,
+    min_size: Size = .{ .w = 72.0, .h = 48.0 },
+    show_handles: bool = true,
+};
+
 pub const Node = struct {
     id: u32,
     title: []const u8,
@@ -499,6 +508,7 @@ pub fn Options(comptime StateType: type) type {
         box_select_scope: BoxSelectScope = .nodes_only,
         spatial_navigation: SpatialNavigationOptions = .{},
         node_collapse: NodeCollapseOptions = .{},
+        node_resize: NodeResizeOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -541,6 +551,11 @@ pub const PortHit = struct {
 pub const GroupResizeHit = struct {
     group_index: usize,
     edges: GroupResizeEdges,
+};
+
+pub const NodeResizeHit = struct {
+    node_index: usize,
+    edges: NodeResizeEdges,
 };
 
 /// Convert a graph-space point into screen space using the editor viewport
@@ -696,6 +711,15 @@ pub fn resizeGroupRect(origin: Rect, edges: GroupResizeEdges, delta: [2]f32, min
         out.h = @max(min_h, origin.h + delta[1]);
     }
     return out;
+}
+
+pub fn resizeNodeRect(origin: Rect, edges: NodeResizeEdges, delta: [2]f32, min_size: Size) Rect {
+    const safe_min = Size{
+        .w = if (std.math.isFinite(min_size.w)) @max(8.0, min_size.w) else 72.0,
+        .h = if (std.math.isFinite(min_size.h)) @max(8.0, min_size.h) else 48.0,
+    };
+    if (!std.math.isFinite(delta[0]) or !std.math.isFinite(delta[1])) return origin;
+    return resizeGroupRect(origin, edges, delta, safe_min);
 }
 
 pub fn nodeRectFromState(rect: Rect, state: anytype, node: Node) Rect {
@@ -1242,6 +1266,59 @@ pub fn groupResizeAtPoint(rect: Rect, state: anytype, groups: []const Group, mar
     return null;
 }
 
+pub fn nodeResizeAtPoint(rect: Rect, state: anytype, nodes: []const Node, margin_value: f32, point: [2]f32) ?NodeResizeHit {
+    const margin = if (std.math.isFinite(margin_value)) @max(0.0, margin_value) else 7.0;
+    if (margin <= 0.0) return null;
+    var i = nodes.len;
+    while (i > 0) {
+        i -= 1;
+        const node = nodes[i];
+        if (node.collapsed or !state.isNodeSelected(node.id)) continue;
+        const screen_rect = nodeRectFromState(rect, state, node);
+        if (!pointInsideResizeBand(screen_rect, margin, point)) continue;
+        const edges = NodeResizeEdges{
+            .left = @abs(point[0] - screen_rect.x) <= margin,
+            .right = @abs(point[0] - (screen_rect.x + screen_rect.w)) <= margin,
+            .top = @abs(point[1] - screen_rect.y) <= margin,
+            .bottom = @abs(point[1] - (screen_rect.y + screen_rect.h)) <= margin,
+        };
+        if (edges.any()) return .{ .node_index = i, .edges = edges };
+    }
+    return null;
+}
+
+fn pointInsideResizeBand(rect: Rect, margin: f32, point: [2]f32) bool {
+    return point[0] >= rect.x - margin and point[0] <= rect.x + rect.w + margin and
+        point[1] >= rect.y - margin and point[1] <= rect.y + rect.h + margin;
+}
+
+pub fn nodeResizeCursor(comptime CursorShape: type, edges: NodeResizeEdges) CursorShape {
+    const horizontal_ambiguous = edges.left and edges.right;
+    const vertical_ambiguous = edges.top and edges.bottom;
+    if (!horizontal_ambiguous and !vertical_ambiguous) {
+        if (edges.left and edges.top) return .resize_north_west;
+        if (edges.right and edges.top) return .resize_north_east;
+        if (edges.left and edges.bottom) return .resize_south_west;
+        if (edges.right and edges.bottom) return .resize_south_east;
+        if (edges.left) return .resize_west;
+        if (edges.right) return .resize_east;
+        if (edges.top) return .resize_north;
+        if (edges.bottom) return .resize_south;
+        return .default;
+    }
+    if (horizontal_ambiguous and !vertical_ambiguous) {
+        if (edges.top) return .resize_north;
+        if (edges.bottom) return .resize_south;
+        return .resize_col;
+    }
+    if (vertical_ambiguous and !horizontal_ambiguous) {
+        if (edges.left) return .resize_west;
+        if (edges.right) return .resize_east;
+        return .resize_row;
+    }
+    return .resize_all;
+}
+
 pub fn nodeInsideGraphRect(node: Node, rect: Rect) bool {
     return rectContainsRect(rect, nodeGraphRect(node));
 }
@@ -1481,6 +1558,8 @@ pub const State = struct {
     dragging_group_id: ?u32 = null,
     resizing_group_id: ?u32 = null,
     resizing_group_edges: GroupResizeEdges = .{},
+    resizing_node_id: ?u32 = null,
+    resizing_node_edges: NodeResizeEdges = .{},
     interaction_history_pushed: bool = false,
     node_drag_tracking: bool = false,
     node_drag_origin: [2]f32 = .{ 0, 0 },
@@ -1594,6 +1673,8 @@ pub const State = struct {
 
     pub fn beginMinimapDrag(self: *State, viewport: Rect, snapshot: MinimapSnapshot, point: [2]f32) bool {
         if (!snapshot.contains(point)) return false;
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
         self.dragging_minimap = true;
         self.minimap_drag_offset = if (snapshot.viewport_rect.contains(point))
             .{ point[0] - (snapshot.viewport_rect.x + snapshot.viewport_rect.w * 0.5), point[1] - (snapshot.viewport_rect.y + snapshot.viewport_rect.h * 0.5) }
@@ -1620,6 +1701,8 @@ pub const State = struct {
             self.selected_group_id != null or self.boundedConnectionSelectionLen() != 0 or
             (!preserve_multi_selection and (self.boundedSelectionLen() != 1 or !self.isNodeSelected(id)));
         self.dragging_node_id = id;
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
         self.dragging_group_id = null;
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
@@ -1636,12 +1719,14 @@ pub const State = struct {
     }
 
     pub fn endDrag(self: *State) bool {
-        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.dragging_connection_from_id != null or self.box_selecting or self.dragging_minimap;
+        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.resizing_node_id != null or self.resizing_node_edges.any() or self.dragging_connection_from_id != null or self.box_selecting or self.dragging_minimap;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
         self.dragging_group_id = null;
         self.resizing_group_id = null;
         self.resizing_group_edges = .{};
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
         self.dragging_connection_from_id = null;
@@ -1677,6 +1762,8 @@ pub const State = struct {
         self.dragging_group_id = id;
         self.resizing_group_id = null;
         self.resizing_group_edges = .{};
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
         self.dragging_node_id = null;
@@ -1697,12 +1784,33 @@ pub const State = struct {
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
         self.dragging_node_id = null;
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
         _ = self.finishBoxSelection(false);
         return self.setGroupSelection(id) or changed;
+    }
+
+    pub fn beginNodeResize(self: *State, id: u32, edges: NodeResizeEdges) bool {
+        if (!edges.any()) return false;
+        const changed = self.resizing_node_id == null or self.resizing_node_id.? != id or !std.meta.eql(self.resizing_node_edges, edges);
+        self.resizing_node_id = id;
+        self.resizing_node_edges = edges;
+        self.dragging_node_id = null;
+        self.dragging_group_id = null;
+        self.resizing_group_id = null;
+        self.resizing_group_edges = .{};
+        self.interaction_history_pushed = false;
+        self.resetNodeDragTracking();
+        self.dragging_connection_from_id = null;
+        self.dragging_connection_from_port = 0;
+        self.connection_preview_valid = true;
+        self.dragging_canvas = false;
+        _ = self.finishBoxSelection(false);
+        return self.setSingleSelection(id) or changed;
     }
 
     pub fn isGroupSelected(self: *const State, id: u32) bool {
@@ -3337,6 +3445,8 @@ pub const State = struct {
         self.dragging_group_id = null;
         self.resizing_group_id = null;
         self.resizing_group_edges = .{};
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
         self.interaction_history_pushed = false;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
@@ -3874,6 +3984,8 @@ pub const State = struct {
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
         _ = self.finishBoxSelection(false);
         self.connection_preview = preview;
         return changed;
@@ -4046,6 +4158,11 @@ fn editorNodeCollapseOptions(editor: anytype) NodeCollapseOptions {
     return if (@hasField(Editor, "node_collapse")) editor.node_collapse else .{};
 }
 
+fn editorNodeResizeOptions(editor: anytype) NodeResizeOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "node_resize")) editor.node_resize else .{};
+}
+
 fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: anytype, viewport_index: ?*ViewportIndex, direction: NodeNavigationDirection) bool {
     const options = editorSpatialNavigationOptions(editor);
     if (!options.enabled or input.control_down or input.super_down or input.alt_down) return false;
@@ -4112,7 +4229,7 @@ fn topologyDirectionForNavigation(flow_direction: ?graph_layout.LayeredLayoutDir
 
 fn editorDragAutoPanActive(editor: anytype) bool {
     return editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or
-        editor.state.resizing_group_id != null or editor.state.dragging_connection_from_id != null or
+        editor.state.resizing_group_id != null or editor.state.resizing_node_id != null or editor.state.dragging_connection_from_id != null or
         editor.state.reconnecting_connection != null or editor.state.box_selecting;
 }
 
@@ -4271,6 +4388,21 @@ fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     try paint_primitives.appendFillRect(allocator, out, node_rect, bg, 7.0, layer + 3);
     try paint_primitives.appendBorder(allocator, out, node_rect, if (selected) editor.selected_color else editor.grid_color.withAlpha(0.8), if (selected) 2.0 else 1.0, 7.0, layer + 4);
     if (detail_level == .overview) return;
+    const resize_options = editorNodeResizeOptions(editor);
+    if (selected and !node_item.collapsed and resize_options.enabled and resize_options.show_handles) {
+        const handle_color = editor.selected_color.withAlpha(0.92);
+        const handle_size = @max(4.0, @min(6.0, 5.0 * editor.state.zoom));
+        for ([_][2]f32{
+            .{ node_rect.x, node_rect.y },
+            .{ node_rect.x + node_rect.w * 0.5, node_rect.y },
+            .{ node_rect.x + node_rect.w, node_rect.y },
+            .{ node_rect.x, node_rect.y + node_rect.h * 0.5 },
+            .{ node_rect.x + node_rect.w, node_rect.y + node_rect.h * 0.5 },
+            .{ node_rect.x, node_rect.y + node_rect.h },
+            .{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h },
+            .{ node_rect.x + node_rect.w, node_rect.y + node_rect.h },
+        }) |position| try out.append(allocator, .{ .point = .{ .pos = position, .size = handle_size, .color = handle_color, .layer = layer + 7 } });
+    }
     try out.append(allocator, .{ .text = .{ .pos = .{ node_rect.x + 10.0, node_rect.y + 8.0 }, .size = editor.font_size, .color = editor.node_text_color, .text = node_item.title, .layer = layer + 5 } });
     const collapse_options = editorNodeCollapseOptions(editor);
     if ((node_item.collapsed or collapse_options.enabled) and collapse_options.show_indicator) {
@@ -5069,6 +5201,28 @@ fn resizeGroupBy(editor: anytype, id: u32, edges: GroupResizeEdges, delta_screen
     return changed;
 }
 
+fn resizeNodeBy(editor: anytype, id: u32, edges: NodeResizeEdges, delta_screen: [2]f32) bool {
+    if (!edges.any()) return false;
+    const nodes = editor.mutable_nodes orelse return false;
+    const active_len = if (editor.mutable_node_len) |len| @min(len.*, nodes.len) else @min(editor.nodes.len, nodes.len);
+    const zoom = @max(0.0001, editor.state.zoom);
+    const delta_graph = [2]f32{ delta_screen[0] / zoom, delta_screen[1] / zoom };
+    const node_index = if (editorViewportIndex(editor)) |viewport_index|
+        viewport_index.nodeIndexForId(id) orelse return false
+    else
+        nodeIndexById(nodes[0..active_len], id) orelse return false;
+    if (node_index >= active_len or nodes[node_index].id != id or nodes[node_index].collapsed) return false;
+    const node = &nodes[node_index];
+    const before = nodeGraphRect(node.*);
+    const resized = resizeNodeRect(before, edges, delta_graph, editorNodeResizeOptions(editor).min_size);
+    const changed = @abs(before.x - resized.x) > 0.001 or @abs(before.y - resized.y) > 0.001 or
+        @abs(before.w - resized.w) > 0.001 or @abs(before.h - resized.h) > 0.001;
+    node.pos = .{ resized.x, resized.y };
+    node.size = .{ .w = resized.w, .h = resized.h };
+    editor.state.selected_node_id = id;
+    return changed;
+}
+
 fn dragPreviewCompatible(editor: anytype, input_hover: ?PortHit) bool {
     const from_id = editor.state.dragging_connection_from_id orelse return true;
     const hit = input_hover orelse return true;
@@ -5207,6 +5361,33 @@ pub fn groupResizeAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*V
     return groupResizeAtPoint(rect, editor.state.*, editor.groups, editor.group_resize_margin, point);
 }
 
+pub fn nodeResizeAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?NodeResizeHit {
+    const options = editorNodeResizeOptions(editor);
+    if (!options.enabled or editor.mutable_nodes == null or editorDetailLevel(editor) == .overview) return null;
+    if (viewport_index) |index| {
+        const candidates = index.nodeIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, @max(0.0, options.margin));
+        var i = candidates.len;
+        while (i > 0) {
+            i -= 1;
+            const node_index = candidates[i];
+            const node = editor.nodes[node_index];
+            if (node.collapsed or !editor.state.isNodeSelected(node.id)) continue;
+            const screen_rect = nodeRectFromState(rect, editor.state.*, node);
+            const margin = @max(0.0, options.margin);
+            if (!pointInsideResizeBand(screen_rect, margin, point)) continue;
+            const edges = NodeResizeEdges{
+                .left = @abs(point[0] - screen_rect.x) <= margin,
+                .right = @abs(point[0] - (screen_rect.x + screen_rect.w)) <= margin,
+                .top = @abs(point[1] - screen_rect.y) <= margin,
+                .bottom = @abs(point[1] - (screen_rect.y + screen_rect.h)) <= margin,
+            };
+            if (edges.any()) return .{ .node_index = node_index, .edges = edges };
+        }
+        return null;
+    }
+    return nodeResizeAtPoint(rect, editor.state.*, editor.nodes, options.margin, point);
+}
+
 pub const EventInputModifiers = struct {
     shift_down: bool = false,
     control_down: bool = false,
@@ -5215,7 +5396,7 @@ pub const EventInputModifiers = struct {
 };
 
 pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype, event: anytype) bool {
-    const geometry_drag_active = editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or editor.state.resizing_group_id != null;
+    const geometry_drag_active = editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or editor.state.resizing_group_id != null or editor.state.resizing_node_id != null;
     const skip_prepare = switch (event.*) {
         .mouse_move => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap or editor.state.box_selecting,
         .mouse_up => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap,
@@ -5278,6 +5459,16 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
                 const committed = if (drag_result.geometry_changed) finishInteractionHistory(editor, history_mutation, true) else false;
                 return committed or panned or drag_result.visual_changed;
+            }
+            if (editor.state.resizing_node_id) |id| {
+                const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
+                const drag_delta = [2]f32{ m.dx - auto_pan_delta[0], m.dy - auto_pan_delta[1] };
+                if (@abs(drag_delta[0]) <= 0.001 and @abs(drag_delta[1]) <= 0.001) return false;
+                const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
+                const resized = resizeNodeBy(editor, id, editor.state.resizing_node_edges, drag_delta);
+                if (!resized) return false;
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                return finishInteractionHistory(editor, history_mutation, true) or panned;
             }
             if (editor.state.resizing_group_id) |id| {
                 const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
@@ -5383,7 +5574,10 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                     return editor.state.beginMinimapDrag(rect, snapshot, point);
                 }
             }
-            if (m.click_count == 2 and editorNodeCollapseOptions(editor).enabled) {
+            if (m.click_count == 2 and editorNodeCollapseOptions(editor).enabled and
+                inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null and
+                outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null)
+            {
                 const point = [2]f32{ m.x, m.y };
                 if (nodeAtEditorPoint(rect, editor, viewport_index, point)) |index| {
                     const node = editor.nodes[index];
@@ -5408,12 +5602,19 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 }
             }
             if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
+                editor.state.resizing_node_id = null;
+                editor.state.resizing_node_edges = .{};
                 editor.state.dragging_connection_from_id = editor.nodes[hit.node_index].id;
                 editor.state.dragging_connection_from_port = hit.port_index;
                 editor.state.connection_preview = .{ m.x, m.y };
                 editor.state.connection_preview_valid = true;
                 editor.state.pending_connection = null;
                 return true;
+            }
+            if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null) {
+                if (nodeResizeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
+                    return editor.state.beginNodeResize(editor.nodes[hit.node_index].id, hit.edges);
+                }
             }
             if (nodeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |index| {
                 const id = editor.nodes[index].id;
@@ -5615,6 +5816,28 @@ test "NodeEditor geometry transforms hit nodes ports and groups" {
     try std.testing.expectEqual(Rect{ .x = 162, .y = 134, .w = 240, .h = 140 }, group_rect);
     const resize = groupResizeAtPoint(viewport, state, &.{group}, 8.0, .{ group_rect.x + 2.0, group_rect.y + group_rect.h - 2.0 }) orelse return error.MissingResizeHit;
     try std.testing.expect(resize.edges.left and resize.edges.bottom);
+}
+
+test "NodeEditor node resize hit testing requires selected expanded nodes" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    var selected = [_]u32{ 1, 0 };
+    var state = State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1, .zoom = 2 };
+    var nodes = [_]Node{.{ .id = 1, .title = "A", .pos = .{ -40, -30 }, .size = .{ .w = 100, .h = 80 } }};
+    const node_rect = nodeRectFromState(viewport, state, nodes[0]);
+    const hit = nodeResizeAtPoint(viewport, state, &nodes, 7, .{ node_rect.x + node_rect.w - 2, node_rect.y + node_rect.h - 2 }) orelse return error.MissingNodeResizeHit;
+    try std.testing.expect(hit.edges.right and hit.edges.bottom);
+    try std.testing.expectEqual(@as(?NodeResizeHit, null), nodeResizeAtPoint(viewport, state, &nodes, 7, .{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 }));
+    nodes[0].collapsed = true;
+    try std.testing.expectEqual(@as(?NodeResizeHit, null), nodeResizeAtPoint(viewport, state, &nodes, 7, .{ node_rect.x + node_rect.w - 2, node_rect.y + 2 }));
+    _ = state.clearSelection();
+    nodes[0].collapsed = false;
+    try std.testing.expectEqual(@as(?NodeResizeHit, null), nodeResizeAtPoint(viewport, state, &nodes, 7, .{ node_rect.x + node_rect.w - 2, node_rect.y + 2 }));
+}
+
+test "NodeEditor node resize clamps each edge in graph space" {
+    const origin = Rect{ .x = 20, .y = 30, .w = 120, .h = 90 };
+    try std.testing.expectEqual(Rect{ .x = 100, .y = 95, .w = 40, .h = 25 }, resizeNodeRect(origin, .{ .left = true, .top = true }, .{ 200, 200 }, .{ .w = 40, .h = 25 }));
+    try std.testing.expectEqual(Rect{ .x = 20, .y = 30, .w = 150, .h = 105 }, resizeNodeRect(origin, .{ .right = true, .bottom = true }, .{ 30, 15 }, .{ .w = 40, .h = 25 }));
 }
 
 test "NodeEditor node drag preserves an existing multi-selection" {
