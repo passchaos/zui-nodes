@@ -307,6 +307,17 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 return self.workspace.node_hit_indices[0..count];
             }
 
+            /// Query the last prepared node geometry after `invalidateGeometry`.
+            /// Internal node drags may use this for stationary alignment targets:
+            /// moving nodes must be excluded by the caller.
+            pub fn retainedNodeIndicesInScreenRect(self: *Index, viewport: Rect, pan: [2]f32, zoom_value: f32, screen_rect: Rect) ?[]const usize {
+                if (!self.id_lookup_valid) return null;
+                const query_rect = graphScreenRect(viewport, pan, @max(0.001, zoom_value), screen_rect);
+                const count = queryIntervals(self.workspace.node_bounds[0..self.node_count], self.workspace.node_order[0..self.node_count], self.workspace.node_prefix_max_x[0..self.node_count], query_rect, self.workspace.node_hit_indices);
+                std.sort.pdq(usize, self.workspace.node_hit_indices[0..count], {}, std.sort.asc(usize));
+                return self.workspace.node_hit_indices[0..count];
+            }
+
             pub fn groupIndicesNearPoint(self: *Index, viewport: Rect, pan: [2]f32, zoom_value: f32, point: [2]f32, radius_pixels: f32) []const usize {
                 if (!self.valid) return &.{};
                 const query_rect = graphPointRect(viewport, pan, @max(0.001, zoom_value), point, radius_pixels);
@@ -762,8 +773,10 @@ test "viewport index versioned mode rebuilds only on geometry revision" {
     index.invalidateGeometry();
     try std.testing.expect(!index.summary().valid);
     try std.testing.expectEqual(@as(?usize, 1), index.nodeIndexForId(2));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, index.retainedNodeIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 100, .y = 70, .w = 240, .h = 100 }).?);
     index.invalidate();
     try std.testing.expectEqual(@as(?usize, null), index.nodeIndexForId(2));
+    try std.testing.expectEqual(@as(?[]const usize, null), index.retainedNodeIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 100, .y = 70, .w = 240, .h = 100 }));
 }
 
 test "viewport index reports invalid graph and workspace capacity" {
