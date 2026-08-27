@@ -90,6 +90,7 @@ pub const Summary = struct {
     duplicate_node_id_count: usize = 0,
     rebuild_count: u64 = 0,
     cache_hit_count: u64 = 0,
+    direct_neighbor_query_count: u64 = 0,
 };
 
 pub const Index = struct {
@@ -99,10 +100,12 @@ pub const Index = struct {
     indexed_connection_count: usize = 0,
     orphan_connection_count: usize = 0,
     duplicate_node_id_count: usize = 0,
-    topology_fingerprint: u64 = 0,
+    topology_key: u64 = 0,
+    revision_mode: bool = false,
     valid: bool = false,
     rebuild_count: u64 = 0,
     cache_hit_count: u64 = 0,
+    direct_neighbor_query_count: u64 = 0,
 
     pub fn init(workspace: Workspace) Index {
         return .{ .workspace = workspace };
@@ -110,15 +113,63 @@ pub const Index = struct {
 
     pub fn invalidate(self: *Index) void {
         self.valid = false;
+        self.revision_mode = false;
     }
 
     pub fn ensure(self: *Index, nodes: anytype, connections: anytype) BuildResult {
         const fingerprint = topologyFingerprint(nodes, connections);
-        if (self.valid and self.node_count == nodes.len and self.connection_count == connections.len and self.topology_fingerprint == fingerprint) {
+        return self.ensureWithKey(nodes, connections, fingerprint, false);
+    }
+
+    /// Skip topology fingerprinting when the caller owns a monotonically
+    /// changing revision for node ids and connection endpoints.
+    pub fn ensureVersioned(self: *Index, nodes: anytype, connections: anytype, revision: u64) BuildResult {
+        return self.ensureWithKey(nodes, connections, revision, true);
+    }
+
+    fn ensureWithKey(self: *Index, nodes: anytype, connections: anytype, key: u64, revision_mode: bool) BuildResult {
+        if (self.valid and self.node_count == nodes.len and self.connection_count == connections.len and self.topology_key == key and self.revision_mode == revision_mode) {
             self.cache_hit_count +%= 1;
             return self.buildResult(true);
         }
-        return self.rebuild(nodes, connections, fingerprint);
+        return self.rebuild(nodes, connections, key, revision_mode);
+    }
+
+    /// Returns unique direct neighbor node indices in stable node-storage order.
+    /// The result borrows traversal scratch until the next traversal or direct query.
+    pub fn directNeighborIndices(self: *Index, direction: Direction, node_id: u32) []const usize {
+        if (!self.valid) return &.{};
+        const node_index = self.nodeIndex(node_id) orelse return &.{};
+        const offsets = switch (direction) {
+            .upstream => self.workspace.reverse_offsets,
+            .downstream => self.workspace.forward_offsets,
+        };
+        const neighbors = switch (direction) {
+            .upstream => self.workspace.reverse_neighbors,
+            .downstream => self.workspace.forward_neighbors,
+        };
+        const output = self.workspace.queue[0..self.node_count];
+        var output_len: usize = 0;
+        for (neighbors[offsets[node_index]..offsets[node_index + 1]]) |neighbor| {
+            output[output_len] = neighbor;
+            output_len += 1;
+        }
+        if (output_len > 1) {
+            var write: usize = 1;
+            for (output[1..output_len]) |neighbor| {
+                if (neighbor == output[write - 1]) continue;
+                output[write] = neighbor;
+                write += 1;
+            }
+            output_len = write;
+        }
+        self.direct_neighbor_query_count +%= 1;
+        return output[0..output_len];
+    }
+
+    pub fn nodeIndexForId(self: *const Index, id: u32) ?usize {
+        if (!self.valid) return null;
+        return self.nodeIndex(id);
     }
 
     pub fn traverse(self: *Index, direction: Direction, primary_seed: ?u32, seed_ids: []const u32) TraversalResult {
@@ -198,10 +249,11 @@ pub const Index = struct {
             .duplicate_node_id_count = self.duplicate_node_id_count,
             .rebuild_count = self.rebuild_count,
             .cache_hit_count = self.cache_hit_count,
+            .direct_neighbor_query_count = self.direct_neighbor_query_count,
         };
     }
 
-    fn rebuild(self: *Index, nodes: anytype, connections: anytype, fingerprint: u64) BuildResult {
+    fn rebuild(self: *Index, nodes: anytype, connections: anytype, key: u64, revision_mode: bool) BuildResult {
         self.valid = false;
         self.rebuild_count +%= 1;
         self.node_count = nodes.len;
@@ -209,7 +261,8 @@ pub const Index = struct {
         self.indexed_connection_count = 0;
         self.orphan_connection_count = 0;
         self.duplicate_node_id_count = 0;
-        self.topology_fingerprint = fingerprint;
+        self.topology_key = key;
+        self.revision_mode = revision_mode;
 
         if (!self.workspaceFits(nodes.len, connections.len)) {
             return self.buildResultWithWorkspace(false, true);
@@ -261,6 +314,10 @@ pub const Index = struct {
             const to_index = self.nodeIndex(connection.to_id) orelse continue;
             self.workspace.reverse_neighbors[cursors[to_index]] = from_index;
             cursors[to_index] += 1;
+        }
+        for (0..nodes.len) |node_index| {
+            std.mem.sort(usize, self.workspace.forward_neighbors[forward_offsets[node_index]..forward_offsets[node_index + 1]], {}, std.sort.asc(usize));
+            std.mem.sort(usize, self.workspace.reverse_neighbors[reverse_offsets[node_index]..reverse_offsets[node_index + 1]], {}, std.sort.asc(usize));
         }
 
         self.valid = true;
@@ -392,6 +449,34 @@ test "topology index traverses large graphs in stable storage order" {
     const rebuilt = topology.ensure(&nodes, &connections);
     try std.testing.expect(!rebuilt.cache_hit);
     try std.testing.expectEqual(@as(u64, 2), topology.summary().rebuild_count);
+}
+
+test "topology index exposes direct neighbors and versioned reuse" {
+    const nodes = [_]TestNode{ .{ .id = 10 }, .{ .id = 20 }, .{ .id = 30 }, .{ .id = 40 } };
+    var connections = [_]TestConnection{
+        .{ .from_id = 10, .to_id = 30 },
+        .{ .from_id = 10, .to_id = 20 },
+        .{ .from_id = 10, .to_id = 20 },
+        .{ .from_id = 40, .to_id = 20 },
+    };
+    var storage = StaticWorkspace(nodes.len, connections.len){};
+    var topology = Index.init(storage.workspace());
+
+    try std.testing.expect(topology.ensureVersioned(&nodes, &connections, 7).complete());
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, topology.directNeighborIndices(.downstream, 10));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 3 }, topology.directNeighborIndices(.upstream, 20));
+    try std.testing.expectEqual(@as(usize, 0), topology.directNeighborIndices(.downstream, 99).len);
+    try std.testing.expect(topology.ensureVersioned(&nodes, &connections, 7).cache_hit);
+    try std.testing.expectEqual(@as(u64, 2), topology.summary().direct_neighbor_query_count);
+
+    connections[0].to_id = 40;
+    try std.testing.expect(topology.ensureVersioned(&nodes, &connections, 7).cache_hit);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, topology.directNeighborIndices(.downstream, 10));
+    const rebuilt = topology.ensureVersioned(&nodes, &connections, 8);
+    try std.testing.expect(!rebuilt.cache_hit);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, topology.directNeighborIndices(.downstream, 10));
+    try std.testing.expectEqual(@as(u64, 2), topology.summary().rebuild_count);
+    try std.testing.expectEqual(@as(u64, 4), topology.summary().direct_neighbor_query_count);
 }
 
 test "topology index reports orphans duplicates and workspace limits" {

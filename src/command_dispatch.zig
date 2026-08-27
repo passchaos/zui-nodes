@@ -179,10 +179,14 @@ pub fn dispatchHistory(context: *CommandContext, command: HistoryCommand) bool {
     if (!canDispatchHistory(context, command)) return false;
     const history = context.history orelse return false;
     const connection_len = context.connection_len orelse return false;
-    return switch (command) {
+    const changed = switch (command) {
         .undo => history.undoWithGroups(context.state, context.nodes, context.node_len, context.groups, context.group_len, context.connections, connection_len),
         .redo => history.redoWithGroups(context.state, context.nodes, context.node_len, context.groups, context.group_len, context.connections, connection_len),
     };
+    if (changed) {
+        if (context.topology_index) |topology| topology.invalidate();
+    }
+    return changed;
 }
 
 pub fn dispatchHistoryId(context: *CommandContext, command_id: CommandId) bool {
@@ -323,7 +327,7 @@ fn dispatchSelectionMutation(context: *CommandContext, command: SelectionCommand
         .duplicate => context.state.duplicateSelectedNodes(context.nodes, context.node_len, context.duplicate_id_offset, context.duplicate_offset),
         .rename, .focus => false,
     };
-    if (!finishHistoryMutation(history_mutation, changed)) return false;
+    if (!finishTopologyHistoryMutation(context, history_mutation, changed)) return false;
     if (context.selection_state) |selection| {
         selection.selected_id = context.state.selected_node_id;
         switch (command) {
@@ -346,12 +350,12 @@ fn copySelection(context: *CommandContext) bool {
 fn pasteSelection(context: *CommandContext) bool {
     const clipboard = context.clipboard orelse return false;
     const history_mutation = beginHistoryMutation(context) orelse return false;
-    return finishHistoryMutation(history_mutation, context.state.pasteClipboardWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len orelse return false, clipboard, .{ 24, 24 }, context.connection_policy));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.pasteClipboardWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len orelse return false, clipboard, .{ 24, 24 }, context.connection_policy));
 }
 
 fn insertTemplate(context: *CommandContext, template: node_editor.NodeTemplate) bool {
     const history_mutation = beginHistoryMutation(context) orelse return false;
-    return finishHistoryMutation(history_mutation, context.state.insertNodeTemplate(context.nodes, context.node_len, template, node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)])));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.insertNodeTemplate(context.nodes, context.node_len, template, node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)])));
 }
 
 fn insertChain(context: *CommandContext) bool {
@@ -360,7 +364,7 @@ fn insertChain(context: *CommandContext) bool {
     const history_mutation = beginHistoryMutation(context) orelse return false;
     var chain = context.insert_chain;
     chain.start_pos = node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)]);
-    return finishHistoryMutation(history_mutation, context.state.insertNodeChainWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len.?, chain, context.connection_policy));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.insertNodeChainWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len.?, chain, context.connection_policy));
 }
 
 fn arrange(context: *CommandContext, command: NodeEditorCommand) bool {
@@ -371,13 +375,13 @@ fn arrange(context: *CommandContext, command: NodeEditorCommand) bool {
 fn disconnectSelectedLink(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     const history_mutation = beginHistoryMutation(context) orelse return false;
-    return finishHistoryMutation(history_mutation, context.state.disconnectSelectedLink(context.connections, connection_len));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.disconnectSelectedLink(context.connections, connection_len));
 }
 
 fn disconnectSelectedNodeLinks(context: *CommandContext, command: NodeEditorCommand) bool {
     const connection_len = context.connection_len orelse return false;
     const history_mutation = beginHistoryMutation(context) orelse return false;
-    return finishHistoryMutation(history_mutation, context.state.disconnectSelectedNodeLinks(context.connections, connection_len, command));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.disconnectSelectedNodeLinks(context.connections, connection_len, command));
 }
 
 fn groupSelected(context: *CommandContext) bool {
@@ -400,19 +404,19 @@ fn fitGroupToSelection(context: *CommandContext) bool {
 fn reconnectPrevious(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     const history_mutation = beginHistoryMutation(context) orelse return false;
-    return finishHistoryMutation(history_mutation, context.state.reconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.reconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy));
 }
 
 fn reconnectNext(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     const history_mutation = beginHistoryMutation(context) orelse return false;
-    return finishHistoryMutation(history_mutation, context.state.reconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.reconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy));
 }
 
 fn disconnectContextPortLinks(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     const history_mutation = beginHistoryMutation(context) orelse return false;
-    return finishHistoryMutation(history_mutation, context.state.disconnectContextPortLinks(context.connections, connection_len));
+    return finishTopologyHistoryMutation(context, history_mutation, context.state.disconnectContextPortLinks(context.connections, connection_len));
 }
 
 fn autoLayoutLayered(context: *CommandContext) bool {
@@ -426,6 +430,12 @@ fn finishHistoryMutation(mutation: HistoryMutation, changed: bool) bool {
     if (!changed) return false;
     if (mutation.history) |history| return history.commitBefore(mutation.snapshot);
     return true;
+}
+
+fn finishTopologyHistoryMutation(context: *CommandContext, mutation: HistoryMutation, changed: bool) bool {
+    if (!changed) return false;
+    if (context.topology_index) |topology| topology.invalidate();
+    return finishHistoryMutation(mutation, true);
 }
 
 test "zui-nodes command dispatch handles selection mutation and insertion" {
@@ -801,6 +811,35 @@ test "zui-nodes command dispatch deletes multi-selected connections as one undo"
     try std.testing.expect(dispatchHistory(&context, .redo));
     try std.testing.expectEqual(@as(usize, 1), connection_len);
     try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+}
+
+test "zui-nodes graph mutations invalidate the shared topology index" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 2 }};
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var history_storage = node_editor.StaticHistoryWorkspace(nodes.len, 0, connections.len, selected_nodes.len){};
+    try std.testing.expect(history.bindWorkspace(history_storage.workspace()));
+    var topology_storage = graph_topology.StaticWorkspace(nodes.len, connections.len){};
+    var topology = graph_topology.Index.init(topology_storage.workspace());
+    try std.testing.expect(topology.ensureVersioned(&nodes, &connections, 4).complete());
+    _ = state.setConnectionSelection(connections[0]);
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len, .history = &history, .topology_index = &topology };
+
+    try std.testing.expect(dispatch(&context, .disconnect_selected_link));
+    try std.testing.expect(!topology.summary().valid);
+    try std.testing.expect(topology.ensureVersioned(&nodes, connections[0..connection_len], 4).complete());
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expect(!topology.summary().valid);
+    try std.testing.expect(topology.ensureVersioned(&nodes, connections[0..connection_len], 4).complete());
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expect(!topology.summary().valid);
 }
 
 test "zui-nodes command dispatch deletes mixed node and connection selection as one undo" {

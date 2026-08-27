@@ -57,9 +57,13 @@ pub const NodeEditorViewOptions = struct {
     connection_draw_workspace: ?*node_editor.ConnectionDrawWorkspace = null,
     /// Optional caller-owned broad-phase index shared by painting and hit tests.
     viewport_index: ?*node_editor.ViewportIndex = null,
+    /// Optional caller-owned topology index used by topology-first navigation.
+    topology_index: ?*node_editor.GraphTopologyIndex = null,
     /// Optional application-owned geometry revision. When supplied, callers
     /// must increment it after external node/group/link geometry changes.
     geometry_revision: ?u64 = null,
+    /// Optional application-owned revision for node ids and link endpoints.
+    topology_revision: ?u64 = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -104,7 +108,9 @@ const Binding = struct {
     connection_path_cache: ?*node_editor.ConnectionPathCache = null,
     connection_draw_workspace: ?*node_editor.ConnectionDrawWorkspace = null,
     viewport_index: ?*node_editor.ViewportIndex = null,
+    topology_index: ?*node_editor.GraphTopologyIndex = null,
     geometry_revision: ?u64 = null,
+    topology_revision: ?u64 = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -178,7 +184,9 @@ const Binding = struct {
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
             .viewport_index = self.viewport_index,
+            .topology_index = self.topology_index,
             .geometry_revision = self.geometry_revision,
+            .topology_revision = self.topology_revision,
             .connection_policy = self.connection_policy,
         };
     }
@@ -192,7 +200,9 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .connection_path_cache = options.connection_path_cache,
         .connection_draw_workspace = options.connection_draw_workspace,
         .viewport_index = options.viewport_index,
+        .topology_index = options.topology_index,
         .geometry_revision = options.geometry_revision,
+        .topology_revision = options.topology_revision,
         .state = options.state,
         .nodes = options.nodes,
         .connections = options.connections,
@@ -1504,6 +1514,127 @@ test "node editor view can navigate the full graph and reveal an offscreen targe
     try std.testing.expect(nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
     try std.testing.expectEqual(pan_after_reveal, state.pan);
     try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+}
+
+test "node editor view prefers topology along the configured flow axis" {
+    var selected = [_]u32{ 1, 0, 0, 0 };
+    var state = node_editor.State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "source", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "unlinked near", .pos = .{ -20, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 3, .title = "linked diagonal", .pos = .{ 100, 80 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 4, .title = "linked aligned", .pos = .{ 360, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]node_editor.Connection{
+        .{ .from_id = 1, .to_id = 3 },
+        .{ .from_id = 1, .to_id = 4 },
+    };
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var topology_storage = node_editor.StaticGraphTopologyWorkspace(nodes.len, connections.len){};
+    var topology_index = node_editor.GraphTopologyIndex.init(topology_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 600, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 600, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9430,
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .viewport_index = &viewport_index,
+        .topology_index = &topology_index,
+        .topology_revision = 1,
+        .spatial_navigation = .{ .enabled = true, .flow_direction = .left_to_right },
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 600 }, .height = .{ .px = 240 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 600, .h = 240 };
+
+    var right = ElementEvent{ .key_down = .right };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 4), state.selected_node_id);
+    try std.testing.expect(state.pan[0] < 0);
+    const revealed = node_editor.nodeRectFromState(editor_node.rect, state, nodes[3]);
+    try std.testing.expect(revealed.x + revealed.w <= editor_node.rect.w - 16);
+    try std.testing.expectEqual(@as(usize, 2), state.navigation_candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), state.navigation_topology_hit_count);
+    try std.testing.expectEqual(@as(u64, 1), topology_index.summary().rebuild_count);
+
+    var left = ElementEvent{ .key_down = .left };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &left, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    try std.testing.expectEqual(@as(u64, 2), state.navigation_topology_hit_count);
+    try std.testing.expectEqual(@as(u64, 1), topology_index.summary().rebuild_count);
+    try std.testing.expect(topology_index.summary().cache_hit_count > 0);
+    try std.testing.expectEqual(@as(u64, 2), topology_index.summary().direct_neighbor_query_count);
+
+    _ = state.setSingleSelection(2);
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 4), state.selected_node_id);
+    try std.testing.expectEqual(@as(u64, 1), state.navigation_spatial_fallback_count);
+}
+
+test "node editor topology navigation follows reversed and vertical flow directions" {
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "source", .pos = .{ 100, 100 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 2, .title = "target", .pos = .{ 0, 0 }, .size = .{ .w = 40, .h = 40 } },
+    };
+    const connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 2 }};
+    var selected = [_]u32{ 1, 0 };
+    var state = node_editor.State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+    var topology_storage = node_editor.StaticGraphTopologyWorkspace(nodes.len, connections.len){};
+    var topology = node_editor.GraphTopologyIndex.init(topology_storage.workspace());
+    try std.testing.expect(topology.ensure(&nodes, &connections).complete());
+
+    try std.testing.expect(state.navigateNodeSelectionTopology(&nodes, &topology, .left, .right_to_left, false));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    _ = state.setSingleSelection(1);
+    try std.testing.expect(state.navigateNodeSelectionTopology(&nodes, &topology, .down, .top_to_bottom, false));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    _ = state.setSingleSelection(2);
+    try std.testing.expect(state.navigateNodeSelectionTopology(&nodes, &topology, .up, .top_to_bottom, false));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    _ = state.setSingleSelection(1);
+    try std.testing.expect(state.navigateNodeSelectionTopology(&nodes, &topology, .up, .bottom_to_top, false));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    _ = state.setSingleSelection(2);
+    try std.testing.expect(state.navigateNodeSelectionTopology(&nodes, &topology, .down, .bottom_to_top, false));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+}
+
+test "node editor direct connection mutation invalidates topology navigation cache" {
+    var state = node_editor.State{};
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -100, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 } },
+    };
+    var connections = [_]node_editor.Connection{node_editor.Connection{ .from_id = 0, .to_id = 0 }};
+    var connection_len: usize = 0;
+    var topology_storage = node_editor.StaticGraphTopologyWorkspace(nodes.len, connections.len){};
+    var topology = node_editor.GraphTopologyIndex.init(topology_storage.workspace());
+    try std.testing.expect(topology.ensureVersioned(&nodes, connections[0..connection_len], 9).complete());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 400, .h = 200 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 400, .h = 200 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9431,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .topology_index = &topology,
+        .topology_revision = 9,
+        .show_minimap = false,
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 200 };
+    const output = node_editor.outputPortPosition(editor_node.rect, state, nodes[0]);
+    const input = node_editor.inputPortPosition(editor_node.rect, state, nodes[1]);
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = output[0], .y = output[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = input[0], .y = input[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expect(!topology.summary().valid);
 }
 
 test "node editor view handles groups and reconnect gestures through shared event adapter" {

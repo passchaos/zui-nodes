@@ -6,6 +6,7 @@ const ui_base = zui.ui_base;
 const command_search = zui.ui_command_search;
 const commands_mod = @import("commands.zig");
 const menu_mod = zui.ui_menu;
+const graph_layout = @import("graph_layout.zig");
 const graph_validation = @import("graph_validation.zig");
 const graph_topology = @import("graph_topology.zig");
 const node_navigation = @import("node_navigation.zig");
@@ -56,12 +57,16 @@ pub const ConnectionPolicy = graph_validation.ConnectionPolicy;
 pub const ConnectionValidation = graph_validation.ConnectionValidation;
 pub const ConnectionValidationOptions = graph_validation.ConnectionValidationOptions;
 pub const GraphValidationReport = graph_validation.GraphValidationReport;
+pub const LayeredLayoutDirection = graph_layout.LayeredLayoutDirection;
 pub const ViewportWorkspace = viewport_types.Workspace;
 pub const ViewportStorage = viewport_types.Storage;
 pub const StaticViewportWorkspace = viewport_types.StaticWorkspace;
 pub const ViewportPrepareResult = viewport_types.PrepareResult;
 pub const ViewportSummary = viewport_types.Summary;
 pub const ViewportIndex = viewport_types.Index;
+pub const GraphTopologyIndex = graph_topology.Index;
+pub const GraphTopologyWorkspace = graph_topology.Workspace;
+pub const StaticGraphTopologyWorkspace = graph_topology.StaticWorkspace;
 
 pub const ConnectedSelectionResult = struct {
     traversal: graph_topology.TraversalResult = .{},
@@ -280,7 +285,17 @@ pub const BoxSelectScope = enum {
 };
 
 pub const NodeNavigationDirection = node_navigation.Direction;
-pub const SpatialNavigationOptions = node_navigation.Options;
+
+/// Keyboard navigation is opt-in so host applications retain ownership of
+/// arrow keys. A flow direction enables direct-neighbor navigation along the
+/// graph axis before falling back to spatial navigation.
+pub const SpatialNavigationOptions = struct {
+    enabled: bool = false,
+    visible_only: bool = true,
+    flow_direction: ?graph_layout.LayeredLayoutDirection = null,
+    ensure_visible: bool = true,
+    viewport_padding: f32 = 16.0,
+};
 
 pub const Node = struct {
     id: u32,
@@ -475,7 +490,9 @@ pub fn Options(comptime StateType: type) type {
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
         viewport_index: ?*ViewportIndex = null,
+        topology_index: ?*graph_topology.Index = null,
         geometry_revision: ?u64 = null,
+        topology_revision: ?u64 = null,
         connection_policy: ConnectionPolicy = .default,
     };
 }
@@ -1469,6 +1486,8 @@ pub const State = struct {
     navigation_move_count: u64 = 0,
     navigation_candidate_count: usize = 0,
     navigation_rejected_count: u64 = 0,
+    navigation_topology_hit_count: u64 = 0,
+    navigation_spatial_fallback_count: u64 = 0,
     dragging_minimap: bool = false,
     minimap_drag_offset: [2]f32 = .{ 0.0, 0.0 },
     context_menu: ContextMenuState = .{},
@@ -3502,6 +3521,36 @@ pub const State = struct {
         return self.navigateNodeSelectionFiltered(nodes, candidate_indices, node_lookup, viewport, direction, extend);
     }
 
+    pub fn navigateNodeSelectionTopology(
+        self: *State,
+        nodes: []const Node,
+        topology: *graph_topology.Index,
+        direction: NodeNavigationDirection,
+        flow_direction: graph_layout.LayeredLayoutDirection,
+        extend: bool,
+    ) bool {
+        const topology_direction = topologyDirectionForNavigation(flow_direction, direction) orelse return false;
+        const target_id = self.topologyNavigationTarget(nodes, topology, direction, topology_direction) orelse return false;
+        return self.applyNodeNavigationTarget(target_id, extend);
+    }
+
+    fn topologyNavigationTarget(
+        self: *State,
+        nodes: []const Node,
+        topology: *graph_topology.Index,
+        direction: NodeNavigationDirection,
+        topology_direction: graph_topology.Direction,
+    ) ?u32 {
+        const current_id = self.lastSelectedNodeId() orelse return null;
+        const current_index = topology.nodeIndexForId(current_id) orelse return null;
+        if (current_index >= nodes.len) return null;
+        const current_rect = nodeGraphRect(nodes[current_index]);
+        if (!node_navigation.rectValid(current_rect)) return null;
+        const candidates = topology.directNeighborIndices(topology_direction, current_id);
+        if (candidates.len == 0) return null;
+        return self.spatialNavigationTargetFromAnchor(nodes, candidates, null, direction, current_id, current_rect) orelse self.topologyNeighborFallback(nodes, candidates, current_id);
+    }
+
     fn navigateNodeSelectionFiltered(
         self: *State,
         nodes: []const Node,
@@ -3512,6 +3561,10 @@ pub const State = struct {
         extend: bool,
     ) bool {
         const target_id = self.spatialNavigationTarget(nodes, candidate_indices, node_lookup, viewport, direction) orelse return false;
+        return self.applyNodeNavigationTarget(target_id, extend);
+    }
+
+    fn applyNodeNavigationTarget(self: *State, target_id: u32, extend: bool) bool {
         if (!extend) {
             const changed = self.setSingleSelection(target_id);
             if (changed) self.navigation_move_count +%= 1;
@@ -3533,6 +3586,18 @@ pub const State = struct {
         return changed;
     }
 
+    fn topologyNeighborFallback(self: *State, nodes: []const Node, candidate_indices: []const usize, current_id: u32) ?u32 {
+        var first_id: ?u32 = null;
+        var candidate_count: usize = 0;
+        for (candidate_indices) |node_index| {
+            if (node_index >= nodes.len or nodes[node_index].id == current_id or !node_navigation.rectValid(nodeGraphRect(nodes[node_index]))) continue;
+            candidate_count += 1;
+            if (first_id == null) first_id = nodes[node_index].id;
+        }
+        self.navigation_candidate_count = candidate_count;
+        return first_id;
+    }
+
     fn spatialNavigationTarget(
         self: *State,
         nodes: []const Node,
@@ -3547,6 +3612,18 @@ pub const State = struct {
             const node_rect = nodeGraphRect(node);
             break :blk if (node_navigation.rectValid(node_rect)) node_rect else null;
         } else null;
+        return self.spatialNavigationTargetFromAnchor(nodes, candidate_indices, viewport, direction, current_id, current_rect);
+    }
+
+    fn spatialNavigationTargetFromAnchor(
+        self: *State,
+        nodes: []const Node,
+        candidate_indices: ?[]const usize,
+        viewport: ?Rect,
+        direction: NodeNavigationDirection,
+        current_id: ?u32,
+        current_rect: ?Rect,
+    ) ?u32 {
         var first_id: ?u32 = null;
         var best_id: ?u32 = null;
         var best_score: node_navigation.Score = undefined;
@@ -3886,14 +3963,27 @@ fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: a
         editor.state.dragging_connection_from_id != null or editor.state.reconnecting_connection != null or
         editor.state.box_selecting or editor.state.context_menu.open) return false;
     var changed = false;
-    if (options.visible_only) {
+    var topology_target_found = false;
+    const topology_direction = topologyDirectionForNavigation(options.flow_direction, direction);
+    if (editor.state.lastSelectedNodeId() != null) if (topology_direction) |graph_direction| {
+        if (prepareNodeEditorTopologyIndex(editor)) |topology| {
+            if (editor.state.topologyNavigationTarget(editor.nodes, topology, direction, graph_direction)) |target_id| {
+                topology_target_found = true;
+                changed = editor.state.applyNodeNavigationTarget(target_id, input.shift_down);
+                if (changed) editor.state.navigation_topology_hit_count +%= 1;
+            }
+        }
+    };
+    if (!topology_target_found and options.visible_only) {
         if (viewport_index) |index| {
             changed = editor.state.navigateNodeSelectionIndexed(editor.nodes, index.visibleNodeIndices(), index, rect, direction, input.shift_down);
         } else {
             changed = editor.state.navigateNodeSelectionFiltered(editor.nodes, null, null, rect, direction, input.shift_down);
         }
-    } else {
+        if (changed and topology_direction != null) editor.state.navigation_spatial_fallback_count +%= 1;
+    } else if (!topology_target_found) {
         changed = editor.state.navigateNodeSelection(editor.nodes, direction, input.shift_down);
+        if (changed and topology_direction != null) editor.state.navigation_spatial_fallback_count +%= 1;
     }
     if (changed and options.ensure_visible) {
         if (editor.state.selected_node_id) |id| {
@@ -3901,6 +3991,32 @@ fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: a
         }
     }
     return true;
+}
+
+fn topologyDirectionForNavigation(flow_direction: ?graph_layout.LayeredLayoutDirection, direction: NodeNavigationDirection) ?graph_topology.Direction {
+    const flow = flow_direction orelse return null;
+    return switch (flow) {
+        .left_to_right => switch (direction) {
+            .left => .upstream,
+            .right => .downstream,
+            .up, .down => null,
+        },
+        .right_to_left => switch (direction) {
+            .left => .downstream,
+            .right => .upstream,
+            .up, .down => null,
+        },
+        .top_to_bottom => switch (direction) {
+            .up => .upstream,
+            .down => .downstream,
+            .left, .right => null,
+        },
+        .bottom_to_top => switch (direction) {
+            .up => .downstream,
+            .down => .upstream,
+            .left, .right => null,
+        },
+    };
 }
 
 fn editorDragAutoPanActive(editor: anytype) bool {
@@ -3929,6 +4045,23 @@ fn editorViewportIndex(editor: anytype) ?*ViewportIndex {
     const Editor = @TypeOf(editor);
     if (@hasField(Editor, "viewport_index")) return editor.viewport_index;
     return null;
+}
+
+fn editorTopologyIndex(editor: anytype) ?*graph_topology.Index {
+    const Editor = @TypeOf(editor);
+    if (@hasField(Editor, "topology_index")) return editor.topology_index;
+    return null;
+}
+
+fn prepareNodeEditorTopologyIndex(editor: anytype) ?*graph_topology.Index {
+    const topology = editorTopologyIndex(editor) orelse return null;
+    const connections = editorActiveConnections(editor);
+    const Editor = @TypeOf(editor);
+    const prepared = if (@hasField(Editor, "topology_revision")) blk: {
+        if (editor.topology_revision) |revision| break :blk topology.ensureVersioned(editor.nodes, connections, revision);
+        break :blk topology.ensure(editor.nodes, connections);
+    } else topology.ensure(editor.nodes, connections);
+    return if (prepared.usable()) topology else null;
 }
 
 fn editorGeometryRevision(editor: anytype) ?u64 {
@@ -4757,6 +4890,10 @@ fn invalidateEditorViewportGeometry(editor: anytype) void {
     if (editorViewportIndex(editor)) |viewport_index| viewport_index.invalidateGeometry();
 }
 
+fn invalidateEditorTopology(editor: anytype) void {
+    if (editorTopologyIndex(editor)) |topology_index| topology_index.invalidate();
+}
+
 fn finishEditorHistory(editor: anytype, mutation: EditorHistoryMutation, changed: bool) bool {
     if (!changed) return false;
     invalidateEditorViewportGeometry(editor);
@@ -5253,6 +5390,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                             })) {
                                 if (beginEditorHistory(editor)) |history_mutation| {
                                     changed = editor.state.reconnectConnectionPortWithPolicy(connections, len, connection, endpoint, id, target_port, editor.nodes, editorConnectionPolicy(editor));
+                                    if (changed) invalidateEditorTopology(editor);
                                     _ = finishEditorHistory(editor, history_mutation, changed);
                                 }
                             }
@@ -5283,6 +5421,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                                     if (history_capacity_ok) {
                                         if (beginEditorHistory(editor)) |history_mutation| {
                                             const changed = editor.state.appendConnectionWithPolicy(connections, len, connection, editor.nodes, editorConnectionPolicy(editor));
+                                            if (changed) invalidateEditorTopology(editor);
                                             _ = finishEditorHistory(editor, history_mutation, changed);
                                         }
                                     }

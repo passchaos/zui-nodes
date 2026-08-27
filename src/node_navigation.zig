@@ -9,15 +9,6 @@ pub const Direction = enum(u8) {
     down,
 };
 
-/// Navigation is opt-in so host applications retain ownership of arrow keys.
-/// Indexed editors inspect only visible nodes by default.
-pub const Options = struct {
-    enabled: bool = false,
-    visible_only: bool = true,
-    ensure_visible: bool = true,
-    viewport_padding: f32 = 16.0,
-};
-
 pub const Score = struct {
     overlap_penalty: u1,
     primary: f32,

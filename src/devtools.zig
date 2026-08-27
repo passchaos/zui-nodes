@@ -29,6 +29,7 @@ pub const SummaryOptions = struct {
     connection_path_cache: ?*const node_editor.ConnectionPathCache = null,
     connection_draw_workspace: ?*const node_editor.ConnectionDrawWorkspace = null,
     topology_index: ?*graph_topology.Index = null,
+    topology_revision: ?u64 = null,
     viewport_index: ?*node_editor.ViewportIndex = null,
     geometry_revision: ?u64 = null,
     semantic_zoom: node_editor.SemanticZoomOptions = .{},
@@ -70,9 +71,12 @@ pub const Summary = struct {
     spatial_navigation_enabled: bool = false,
     spatial_navigation_visible_only: bool = true,
     spatial_navigation_ensure_visible: bool = true,
+    spatial_navigation_flow_direction: ?node_editor.LayeredLayoutDirection = null,
     navigation_candidate_count: usize = 0,
     navigation_move_count: u64 = 0,
     navigation_rejected_count: u64 = 0,
+    navigation_topology_hit_count: u64 = 0,
+    navigation_spatial_fallback_count: u64 = 0,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -110,7 +114,12 @@ pub const PanelOptions = struct {
 pub fn summarize(options: SummaryOptions) Summary {
     const state = options.state;
     const graph_report = node_editor.validateGraph(options.nodes, options.connections, options.connection_policy);
-    if (options.topology_index) |topology| _ = topology.ensure(options.nodes, options.connections);
+    if (options.topology_index) |topology| {
+        _ = if (options.topology_revision) |revision|
+            topology.ensureVersioned(options.nodes, options.connections, revision)
+        else
+            topology.ensure(options.nodes, options.connections);
+    }
     if (options.viewport_index) |viewport_index| {
         _ = if (options.geometry_revision) |revision|
             viewport_index.prepareVersioned(options.nodes, options.groups, options.connections, options.viewport, state.pan, state.zoom, revision)
@@ -154,9 +163,12 @@ pub fn summarize(options: SummaryOptions) Summary {
         .spatial_navigation_enabled = options.spatial_navigation.enabled,
         .spatial_navigation_visible_only = options.spatial_navigation.visible_only,
         .spatial_navigation_ensure_visible = options.spatial_navigation.ensure_visible,
+        .spatial_navigation_flow_direction = options.spatial_navigation.flow_direction,
         .navigation_candidate_count = state.navigation_candidate_count,
         .navigation_move_count = state.navigation_move_count,
         .navigation_rejected_count = state.navigation_rejected_count,
+        .navigation_topology_hit_count = state.navigation_topology_hit_count,
+        .navigation_spatial_fallback_count = state.navigation_spatial_fallback_count,
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -217,13 +229,16 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         @tagName(options.summary.box_select_scope),
         options.summary.box_select_crossing,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const navigation = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "navigation enabled={} visible={} reveal={} candidates={d} moves={d} rejected={d}", .{
+    const navigation = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "navigation enabled={} visible={} flow={s} reveal={} candidates={d} moves={d} rejected={d} topology={d} fallback={d}", .{
         options.summary.spatial_navigation_enabled,
         options.summary.spatial_navigation_visible_only,
+        if (options.summary.spatial_navigation_flow_direction) |direction| @tagName(direction) else "spatial",
         options.summary.spatial_navigation_ensure_visible,
         options.summary.navigation_candidate_count,
         options.summary.navigation_move_count,
         options.summary.navigation_rejected_count,
+        options.summary.navigation_topology_hit_count,
+        options.summary.navigation_spatial_fallback_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const drag_snap = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "snap grid={} align={} distribute={} active={}/{}/{} guides={?d:.1},{?d:.1}", .{
         options.summary.drag_snap_enabled,
@@ -257,11 +272,12 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.graph_validation.incompatible_port_type_count,
         options.summary.graph_validation.cycle_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const topology = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "topology indexed={d}/{d} rebuilds={d} hits={d} valid={}", .{
+    const topology = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "topology indexed={d}/{d} rebuilds={d} hits={d} neighbors={d} valid={}", .{
         options.summary.topology.indexed_connection_count,
         options.summary.topology.connection_count,
         options.summary.topology.rebuild_count,
         options.summary.topology.cache_hit_count,
+        options.summary.topology.direct_neighbor_query_count,
         options.summary.topology.valid,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const viewport_index = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "viewport nodes={d}/{d} groups={d}/{d} links={d}/{d} rebuilds={d} queries={d} geometry_reuse={d} viewport_reuse={d} valid={}", .{
@@ -338,6 +354,8 @@ test "zui-nodes devtools exposes active drag snap guides" {
         .navigation_move_count = 7,
         .navigation_candidate_count = 3,
         .navigation_rejected_count = 2,
+        .navigation_topology_hit_count = 5,
+        .navigation_spatial_fallback_count = 1,
         .snap_guide_x = 32,
         .snap_guide_x_span = .{ 0, 80 },
         .snap_guide_y = 16,
@@ -348,7 +366,7 @@ test "zui-nodes devtools exposes active drag snap guides" {
         .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 5 },
         .alignment_snap = .{ .enabled = true },
         .distribution_snap = .{ .enabled = true },
-        .spatial_navigation = .{ .enabled = true, .visible_only = true },
+        .spatial_navigation = .{ .enabled = true, .visible_only = true, .flow_direction = .left_to_right },
     });
     try std.testing.expect(summary.drag_snap_enabled);
     try std.testing.expect(summary.drag_snap_active);
@@ -360,9 +378,12 @@ test "zui-nodes devtools exposes active drag snap guides" {
     try std.testing.expect(summary.spatial_navigation_enabled);
     try std.testing.expect(summary.spatial_navigation_visible_only);
     try std.testing.expect(summary.spatial_navigation_ensure_visible);
+    try std.testing.expectEqual(node_editor.LayeredLayoutDirection.left_to_right, summary.spatial_navigation_flow_direction.?);
     try std.testing.expectEqual(@as(u64, 7), summary.navigation_move_count);
     try std.testing.expectEqual(@as(usize, 3), summary.navigation_candidate_count);
     try std.testing.expectEqual(@as(u64, 2), summary.navigation_rejected_count);
+    try std.testing.expectEqual(@as(u64, 5), summary.navigation_topology_hit_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.navigation_spatial_fallback_count);
     try std.testing.expectEqual(@as(?f32, 32), summary.snap_guide_x);
     try std.testing.expectEqual(@as(?f32, 16), summary.snap_guide_y);
 }
@@ -402,6 +423,7 @@ test "zui-nodes devtools exposes topology index reuse" {
     var history = node_editor.History{};
     try std.testing.expect(topology.ensure(&nodes, &connections).complete());
     try std.testing.expect(topology.ensure(&nodes, &connections).cache_hit);
+    try std.testing.expectEqualSlices(usize, &.{1}, topology.directNeighborIndices(.downstream, 1));
 
     const summary = summarize(.{
         .state = &state,
@@ -414,6 +436,7 @@ test "zui-nodes devtools exposes topology index reuse" {
     try std.testing.expectEqual(@as(usize, 1), summary.topology.indexed_connection_count);
     try std.testing.expectEqual(@as(u64, 1), summary.topology.rebuild_count);
     try std.testing.expectEqual(@as(u64, 2), summary.topology.cache_hit_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.topology.direct_neighbor_query_count);
     try std.testing.expect(summary.history.available);
     try std.testing.expectEqual(@as(usize, 16), summary.history.node_capacity);
 }

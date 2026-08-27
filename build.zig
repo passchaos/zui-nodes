@@ -45,8 +45,9 @@ pub fn build(b: *std.Build) void {
         "--iterations=1000",
         "--max-build-ns=20000000",
         "--max-cached-traversal-ns=1000000",
+        "--max-direct-neighbor-ns=10000",
     });
-    const verify_topology_step = b.step("verify-topology-performance", "Verify large node-graph topology performance and zero-allocation traversal");
+    const verify_topology_step = b.step("verify-topology-performance", "Verify large node-graph topology traversal, direct-neighbor queries, and zero allocation");
     if (can_run_target) {
         verify_topology_step.dependOn(&verify_topology_bench.step);
     } else {

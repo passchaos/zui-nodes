@@ -14,6 +14,7 @@ const Options = struct {
     iterations: usize = default_iterations,
     max_build_ns: ?u64 = null,
     max_cached_traversal_ns: ?f64 = null,
+    max_direct_neighbor_ns: ?f64 = null,
 };
 
 const Report = struct {
@@ -23,6 +24,8 @@ const Report = struct {
     build_ns: u64,
     cached_traversal_ns: u64,
     cached_traversal_ns_per_iteration: f64,
+    direct_neighbor_ns_per_iteration: f64,
+    max_direct_neighbor_count: usize,
     edge_visits_per_iteration: usize,
     output_count: usize,
     rebuild_count: u64,
@@ -58,7 +61,7 @@ fn run(io: std.Io, options: Options) Report {
     var storage = topology_mod.StaticWorkspace(node_count, connection_count){};
     var topology = topology_mod.Index.init(storage.workspace());
     const build_started = std.Io.Clock.awake.now(io);
-    const build = topology.ensure(&nodes, &connections);
+    const build = topology.ensureVersioned(&nodes, &connections, 1);
     const build_ns: u64 = @intCast(build_started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
 
     var output: [node_count]u32 = undefined;
@@ -66,7 +69,7 @@ fn run(io: std.Io, options: Options) Report {
     var last = topology_mod.TraversalResult{};
     const traversal_started = std.Io.Clock.awake.now(io);
     for (0..options.iterations) |iteration| {
-        _ = topology.ensure(&nodes, &connections);
+        _ = topology.ensureVersioned(&nodes, &connections, 1);
         last = topology.traverse(if (iteration & 1 == 0) .downstream else .upstream, if (iteration & 1 == 0) nodes[0].id else nodes[node_count - 1].id, &.{});
         topology.writeReachableNodeIds(&output, &last);
         checksum = (checksum ^ output[iteration % output.len]) *% 0x0000_0100_0000_01b3;
@@ -74,11 +77,23 @@ fn run(io: std.Io, options: Options) Report {
     }
     const cached_traversal_ns: u64 = @intCast(traversal_started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
     const ns_per_iteration = @as(f64, @floatFromInt(cached_traversal_ns)) / @as(f64, @floatFromInt(options.iterations));
+    var max_direct_neighbor_count: usize = 0;
+    const direct_started = std.Io.Clock.awake.now(io);
+    for (0..options.iterations) |iteration| {
+        _ = topology.ensureVersioned(&nodes, &connections, 1);
+        const neighbors = topology.directNeighborIndices(if (iteration & 1 == 0) .downstream else .upstream, nodes[1 + iteration % (node_count - 2)].id);
+        max_direct_neighbor_count = @max(max_direct_neighbor_count, neighbors.len);
+        if (neighbors.len > 0) checksum = (checksum ^ neighbors[iteration % neighbors.len]) *% 0x0000_0100_0000_01b3;
+    }
+    const direct_elapsed_ns: u64 = @intCast(direct_started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+    const direct_neighbor_ns_per_iteration = @as(f64, @floatFromInt(direct_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
     const quality_passed = build.complete() and last.complete() and last.output_count == node_count and
         last.edge_visit_count == connection_count and topology.summary().rebuild_count == 1 and
-        topology.summary().cache_hit_count == options.iterations and checksum != 0;
+        topology.summary().cache_hit_count == options.iterations * 2 and topology.summary().direct_neighbor_query_count == options.iterations and
+        max_direct_neighbor_count == 2 and checksum != 0;
     const performance_passed = (options.max_build_ns == null or build_ns <= options.max_build_ns.?) and
-        (options.max_cached_traversal_ns == null or ns_per_iteration <= options.max_cached_traversal_ns.?);
+        (options.max_cached_traversal_ns == null or ns_per_iteration <= options.max_cached_traversal_ns.?) and
+        (options.max_direct_neighbor_ns == null or direct_neighbor_ns_per_iteration <= options.max_direct_neighbor_ns.?);
     return .{
         .node_count = node_count,
         .connection_count = connection_count,
@@ -86,6 +101,8 @@ fn run(io: std.Io, options: Options) Report {
         .build_ns = build_ns,
         .cached_traversal_ns = cached_traversal_ns,
         .cached_traversal_ns_per_iteration = ns_per_iteration,
+        .direct_neighbor_ns_per_iteration = direct_neighbor_ns_per_iteration,
+        .max_direct_neighbor_count = max_direct_neighbor_count,
         .edge_visits_per_iteration = last.edge_visit_count,
         .output_count = last.output_count,
         .rebuild_count = topology.summary().rebuild_count,
@@ -110,6 +127,8 @@ fn parseOptions(init: std.process.Init) !Options {
             options.max_build_ns = try std.fmt.parseInt(u64, arg["--max-build-ns=".len..], 10)
         else if (std.mem.startsWith(u8, arg, "--max-cached-traversal-ns="))
             options.max_cached_traversal_ns = try std.fmt.parseFloat(f64, arg["--max-cached-traversal-ns=".len..])
+        else if (std.mem.startsWith(u8, arg, "--max-direct-neighbor-ns="))
+            options.max_direct_neighbor_ns = try std.fmt.parseFloat(f64, arg["--max-direct-neighbor-ns=".len..])
         else
             return error.InvalidArgument;
     }
@@ -122,8 +141,8 @@ fn printReport(io: std.Io, report: Report) !void {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
     try stdout.print(
-        "zui-nodes topology bench: nodes={d} connections={d} iterations={d} build_ns={d} cached_traversal_ns_per_iteration={d:.3} edge_visits={d} output={d} rebuilds={d} hits={d} allocations={d} checksum={d} passed={}\n",
-        .{ report.node_count, report.connection_count, report.iterations, report.build_ns, report.cached_traversal_ns_per_iteration, report.edge_visits_per_iteration, report.output_count, report.rebuild_count, report.cache_hit_count, report.hot_path_allocations, report.checksum, report.passed },
+        "zui-nodes topology bench: nodes={d} connections={d} iterations={d} build_ns={d} cached_traversal_ns_per_iteration={d:.3} direct_neighbor_ns_per_iteration={d:.3} max_direct_neighbors={d} edge_visits={d} output={d} rebuilds={d} hits={d} allocations={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.connection_count, report.iterations, report.build_ns, report.cached_traversal_ns_per_iteration, report.direct_neighbor_ns_per_iteration, report.max_direct_neighbor_count, report.edge_visits_per_iteration, report.output_count, report.rebuild_count, report.cache_hit_count, report.hot_path_allocations, report.checksum, report.passed },
     );
     try stdout.flush();
 }
