@@ -238,6 +238,13 @@ pub fn applyDocumentSnapshot(options: ApplyOptions) !ApplyResult {
     options.state.hover_output_node_id = null;
     options.state.hover_connection = null;
     options.state.box_selecting = false;
+    options.state.box_select_mode = .replace;
+    options.state.box_select_scope = .nodes_only;
+    options.state.box_select_start = .{ 0, 0 };
+    options.state.box_select_end = .{ 0, 0 };
+    options.state.box_select_origin_x = 0;
+    options.state.box_select_crossing = false;
+    options.state.navigation_candidate_count = 0;
     options.state.dragging_minimap = false;
 
     return .{

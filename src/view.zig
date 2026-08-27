@@ -91,6 +91,8 @@ pub const NodeEditorViewOptions = struct {
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
     distribution_snap: node_editor.DistributionSnapOptions = .{},
     box_select_scope: node_editor.BoxSelectScope = .nodes_only,
+    /// Opt-in arrow-key navigation. Shift extends the current node selection.
+    spatial_navigation: node_editor.SpatialNavigationOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -134,6 +136,7 @@ const Binding = struct {
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
     distribution_snap: node_editor.DistributionSnapOptions = .{},
     box_select_scope: node_editor.BoxSelectScope = .nodes_only,
+    spatial_navigation: node_editor.SpatialNavigationOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -170,6 +173,7 @@ const Binding = struct {
             .alignment_snap = self.alignment_snap,
             .distribution_snap = self.distribution_snap,
             .box_select_scope = self.box_select_scope,
+            .spatial_navigation = self.spatial_navigation,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -220,6 +224,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .alignment_snap = options.alignment_snap,
         .distribution_snap = options.distribution_snap,
         .box_select_scope = options.box_select_scope,
+        .spatial_navigation = options.spatial_navigation,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -1366,6 +1371,139 @@ test "node editor view visible box selection clips viewport and rejects overflow
     try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
     try std.testing.expect(state.isConnectionSelected(connections[2]));
     try std.testing.expect(!state.box_selecting);
+}
+
+test "node editor view arrow keys navigate visible nodes and shift extends selection" {
+    var selected: [3]u32 = .{0} ** 3;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "left", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "right", .pos = .{ 60, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 3, .title = "offscreen", .pos = .{ 260, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var canvas_state = zui.CanvasState{};
+    var history = node_editor.History{};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 400, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 400, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9426,
+        .canvas_state = &canvas_state,
+        .state = &state,
+        .nodes = &nodes,
+        .viewport_index = &viewport_index,
+        .history = &history,
+        .spatial_navigation = .{ .enabled = true },
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 400 }, .height = .{ .px = 240 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 240 };
+
+    var initial = ElementEvent{ .key_down = .right };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &initial, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    try std.testing.expect(viewport_index.summary().valid);
+
+    var right = ElementEvent{ .key_down = .right };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(usize, 1), state.navigation_candidate_count);
+
+    editor_node.input_shift_down = true;
+    var left = ElementEvent{ .key_down = .left };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &left, editor_node.paint_user_data));
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    try std.testing.expectEqual(@as(u64, 3), state.navigation_move_count);
+    try std.testing.expect(canvas_state.dirtySummary().invalidation.contains(.paint));
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+
+    editor_node.input_shift_down = false;
+    editor_node.input_alt_down = true;
+    try std.testing.expect(!nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    editor_node.input_alt_down = false;
+    editor_node.input_control_down = true;
+    try std.testing.expect(!nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+}
+
+test "node editor view leaves arrow keys unhandled when spatial navigation is disabled" {
+    var state = node_editor.State{};
+    const nodes = [_]node_editor.Node{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 240, .h = 160 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 240, .h = 160 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9427, .state = &state, .nodes = &nodes, .show_minimap = false });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 240, .h = 160 };
+    var right = ElementEvent{ .key_down = .right };
+    try std.testing.expect(!nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, null), state.selected_node_id);
+}
+
+test "node editor view consumes enabled arrow navigation at an exhausted edge" {
+    var selected = [_]u32{1};
+    var state = node_editor.State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+    const nodes = [_]node_editor.Node{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 240, .h = 160 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 240, .h = 160 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9429, .state = &state, .nodes = &nodes, .spatial_navigation = .{ .enabled = true }, .show_minimap = false });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 240, .h = 160 };
+    var right = ElementEvent{ .key_down = .right };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    try std.testing.expectEqual(@as(u64, 0), state.navigation_move_count);
+
+    state.dragging_canvas = true;
+    var left = ElementEvent{ .key_down = .left };
+    try std.testing.expect(!nodeEditorViewEvent(editor_node, &left, editor_node.paint_user_data));
+    state.dragging_canvas = false;
+    state.context_menu.open = true;
+    try std.testing.expect(!nodeEditorViewEvent(editor_node, &left, editor_node.paint_user_data));
+}
+
+test "node editor view can navigate the full graph and reveal an offscreen target" {
+    var selected = [_]u32{ 1, 0 };
+    var state = node_editor.State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "visible", .pos = .{ 60, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "offscreen", .pos = .{ 260, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var canvas_state = zui.CanvasState{};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 400, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 400, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9428,
+        .canvas_state = &canvas_state,
+        .state = &state,
+        .nodes = &nodes,
+        .viewport_index = &viewport_index,
+        .spatial_navigation = .{ .enabled = true, .visible_only = false, .ensure_visible = true, .viewport_padding = 12 },
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 400 }, .height = .{ .px = 240 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 240 };
+
+    var right = ElementEvent{ .key_down = .right };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    try std.testing.expect(state.pan[0] < 0);
+    const revealed = node_editor.nodeRectFromState(editor_node.rect, state, nodes[1]);
+    try std.testing.expect(revealed.x >= 12);
+    try std.testing.expect(revealed.x + revealed.w <= editor_node.rect.w - 12);
+    try std.testing.expect(canvas_state.dirtySummary().invalidation.contains(.viewport_transform));
+
+    const pan_after_reveal = state.pan;
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &right, editor_node.paint_user_data));
+    try std.testing.expectEqual(pan_after_reveal, state.pan);
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
 }
 
 test "node editor view handles groups and reconnect gestures through shared event adapter" {

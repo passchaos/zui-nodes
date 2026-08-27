@@ -8,6 +8,7 @@ const commands_mod = @import("commands.zig");
 const menu_mod = zui.ui_menu;
 const graph_validation = @import("graph_validation.zig");
 const graph_topology = @import("graph_topology.zig");
+const node_navigation = @import("node_navigation.zig");
 const viewport_types = @import("node_viewport.zig").Types(Node, Group, Connection, Rect);
 
 const render = struct {
@@ -278,6 +279,9 @@ pub const BoxSelectScope = enum {
     visible_only,
 };
 
+pub const NodeNavigationDirection = node_navigation.Direction;
+pub const SpatialNavigationOptions = node_navigation.Options;
+
 pub const Node = struct {
     id: u32,
     title: []const u8,
@@ -466,6 +470,7 @@ pub fn Options(comptime StateType: type) type {
         alignment_snap: AlignmentSnapOptions = .{},
         distribution_snap: DistributionSnapOptions = .{},
         box_select_scope: BoxSelectScope = .nodes_only,
+        spatial_navigation: SpatialNavigationOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -1461,6 +1466,9 @@ pub const State = struct {
     box_select_scope: BoxSelectScope = .nodes_only,
     box_select_origin_x: f32 = 0.0,
     box_select_crossing: bool = false,
+    navigation_move_count: u64 = 0,
+    navigation_candidate_count: usize = 0,
+    navigation_rejected_count: u64 = 0,
     dragging_minimap: bool = false,
     minimap_drag_offset: [2]f32 = .{ 0.0, 0.0 },
     context_menu: ContextMenuState = .{},
@@ -1497,6 +1505,35 @@ pub const State = struct {
         const before = self.pan;
         self.pan = .{ -graph_point[0] * self.zoom, -graph_point[1] * self.zoom };
         return @abs(before[0] - self.pan[0]) > 0.001 or @abs(before[1] - self.pan[1]) > 0.001;
+    }
+
+    pub fn ensureNodeVisible(self: *State, viewport: Rect, node: Node, padding_value: f32) bool {
+        if (viewport.w <= 0 or viewport.h <= 0) return false;
+        const padding_x = @min(@max(0.0, padding_value), viewport.w * 0.5);
+        const padding_y = @min(@max(0.0, padding_value), viewport.h * 0.5);
+        const visible = Rect{
+            .x = viewport.x + padding_x,
+            .y = viewport.y + padding_y,
+            .w = @max(0.0, viewport.w - padding_x * 2),
+            .h = @max(0.0, viewport.h - padding_y * 2),
+        };
+        const node_rect = nodeRectFromState(viewport, self.*, node);
+        var delta = [2]f32{ 0, 0 };
+        if (node_rect.w > visible.w) {
+            delta[0] = visible.x + visible.w * 0.5 - (node_rect.x + node_rect.w * 0.5);
+        } else if (node_rect.x < visible.x) {
+            delta[0] = visible.x - node_rect.x;
+        } else if (node_rect.x + node_rect.w > visible.x + visible.w) {
+            delta[0] = visible.x + visible.w - node_rect.x - node_rect.w;
+        }
+        if (node_rect.h > visible.h) {
+            delta[1] = visible.y + visible.h * 0.5 - (node_rect.y + node_rect.h * 0.5);
+        } else if (node_rect.y < visible.y) {
+            delta[1] = visible.y - node_rect.y;
+        } else if (node_rect.y + node_rect.h > visible.y + visible.h) {
+            delta[1] = visible.y + visible.h - node_rect.y - node_rect.h;
+        }
+        return self.panBy(delta);
     }
 
     pub fn panToMinimapPoint(self: *State, viewport: Rect, snapshot: MinimapSnapshot, point: [2]f32) bool {
@@ -3444,6 +3481,122 @@ pub const State = struct {
         self.selected_node_id = id;
     }
 
+    pub fn navigateNodeSelection(
+        self: *State,
+        nodes: []const Node,
+        direction: NodeNavigationDirection,
+        extend: bool,
+    ) bool {
+        return self.navigateNodeSelectionFiltered(nodes, null, null, null, direction, extend);
+    }
+
+    pub fn navigateNodeSelectionIndexed(
+        self: *State,
+        nodes: []const Node,
+        candidate_indices: []const usize,
+        node_lookup: *const ViewportIndex,
+        viewport: Rect,
+        direction: NodeNavigationDirection,
+        extend: bool,
+    ) bool {
+        return self.navigateNodeSelectionFiltered(nodes, candidate_indices, node_lookup, viewport, direction, extend);
+    }
+
+    fn navigateNodeSelectionFiltered(
+        self: *State,
+        nodes: []const Node,
+        candidate_indices: ?[]const usize,
+        node_lookup: ?*const ViewportIndex,
+        viewport: ?Rect,
+        direction: NodeNavigationDirection,
+        extend: bool,
+    ) bool {
+        const target_id = self.spatialNavigationTarget(nodes, candidate_indices, node_lookup, viewport, direction) orelse return false;
+        if (!extend) {
+            const changed = self.setSingleSelection(target_id);
+            if (changed) self.navigation_move_count +%= 1;
+            return changed;
+        }
+
+        const already_selected = self.isNodeSelected(target_id);
+        const current_count = if (self.boundedSelectionLen() > 0) self.boundedSelectionLen() else @intFromBool(self.selected_node_id != null);
+        if (!already_selected and current_count + 1 > nodeSelectionCapacity(self)) {
+            self.navigation_rejected_count +%= 1;
+            return false;
+        }
+        const before_primary = self.selected_node_id;
+        if (!already_selected) self.addNodeToSelectionMixed(target_id);
+        self.selected_node_id = target_id;
+        self.selected_group_id = null;
+        const changed = !already_selected or before_primary == null or before_primary.? != target_id;
+        if (changed) self.navigation_move_count +%= 1;
+        return changed;
+    }
+
+    fn spatialNavigationTarget(
+        self: *State,
+        nodes: []const Node,
+        candidate_indices: ?[]const usize,
+        node_lookup: ?*const ViewportIndex,
+        viewport: ?Rect,
+        direction: NodeNavigationDirection,
+    ) ?u32 {
+        const current_id = self.lastSelectedNodeId();
+        const current_node = if (current_id) |id| nodeForBoxSelection(nodes, node_lookup, id) else null;
+        const current_rect = if (current_node) |node| blk: {
+            const node_rect = nodeGraphRect(node);
+            break :blk if (node_navigation.rectValid(node_rect)) node_rect else null;
+        } else null;
+        var first_id: ?u32 = null;
+        var best_id: ?u32 = null;
+        var best_score: node_navigation.Score = undefined;
+        var candidate_count: usize = 0;
+
+        if (candidate_indices) |indices| {
+            for (indices) |node_index| {
+                if (node_index >= nodes.len) continue;
+                self.considerSpatialNavigationNode(nodes[node_index], current_id, current_rect, viewport, direction, &first_id, &best_id, &best_score, &candidate_count);
+            }
+        } else {
+            for (nodes) |node| {
+                self.considerSpatialNavigationNode(node, current_id, current_rect, viewport, direction, &first_id, &best_id, &best_score, &candidate_count);
+            }
+        }
+        self.navigation_candidate_count = candidate_count;
+        return if (current_rect == null) first_id else best_id;
+    }
+
+    fn considerSpatialNavigationNode(
+        self: *const State,
+        node: Node,
+        current_id: ?u32,
+        current_rect: ?Rect,
+        viewport: ?Rect,
+        direction: NodeNavigationDirection,
+        first_id: *?u32,
+        best_id: *?u32,
+        best_score: *node_navigation.Score,
+        candidate_count: *usize,
+    ) void {
+        const node_rect = nodeGraphRect(node);
+        if (!node_navigation.rectValid(node_rect)) return;
+        if (viewport) |screen_rect| {
+            if (!rectOverlapsOrTouches(nodeRectFromState(screen_rect, self.*, node), screen_rect)) return;
+        }
+        if (first_id.* == null) first_id.* = node.id;
+        if (current_rect == null) {
+            candidate_count.* += 1;
+            return;
+        }
+        if (current_id != null and node.id == current_id.?) return;
+        const score = node_navigation.score(current_rect.?, node_rect, direction) orelse return;
+        candidate_count.* += 1;
+        if (best_id.* == null or node_navigation.lessThan(score, best_score.*)) {
+            best_id.* = node.id;
+            best_score.* = score;
+        }
+    }
+
     fn addConnectionToSelectionMixed(self: *State, connection: Connection) void {
         if (self.isConnectionSelected(connection)) return;
         if (self.selected_connections.len == 0) {
@@ -3718,6 +3871,36 @@ fn editorDistributionSnapOptions(editor: anytype) DistributionSnapOptions {
 fn editorBoxSelectScope(editor: anytype) BoxSelectScope {
     const Editor = @TypeOf(editor);
     return if (@hasField(Editor, "box_select_scope")) editor.box_select_scope else .nodes_only;
+}
+
+fn editorSpatialNavigationOptions(editor: anytype) SpatialNavigationOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "spatial_navigation")) editor.spatial_navigation else .{};
+}
+
+fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: anytype, viewport_index: ?*ViewportIndex, direction: NodeNavigationDirection) bool {
+    const options = editorSpatialNavigationOptions(editor);
+    if (!options.enabled or input.control_down or input.super_down or input.alt_down) return false;
+    if (editor.state.dragging_canvas or editor.state.dragging_minimap or editor.state.dragging_node_id != null or
+        editor.state.dragging_group_id != null or editor.state.resizing_group_id != null or
+        editor.state.dragging_connection_from_id != null or editor.state.reconnecting_connection != null or
+        editor.state.box_selecting or editor.state.context_menu.open) return false;
+    var changed = false;
+    if (options.visible_only) {
+        if (viewport_index) |index| {
+            changed = editor.state.navigateNodeSelectionIndexed(editor.nodes, index.visibleNodeIndices(), index, rect, direction, input.shift_down);
+        } else {
+            changed = editor.state.navigateNodeSelectionFiltered(editor.nodes, null, null, rect, direction, input.shift_down);
+        }
+    } else {
+        changed = editor.state.navigateNodeSelection(editor.nodes, direction, input.shift_down);
+    }
+    if (changed and options.ensure_visible) {
+        if (editor.state.selected_node_id) |id| {
+            if (nodeForBoxSelection(editor.nodes, viewport_index, id)) |node| _ = editor.state.ensureNodeVisible(rect, node, options.viewport_padding);
+        }
+    }
+    return true;
 }
 
 fn editorDragAutoPanActive(editor: anytype) bool {
@@ -5130,6 +5313,10 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             return editor.state.zoomAt(rect, .{ p.x, p.y }, @floatCast(p.scale_delta));
         },
         .key_down => |key| switch (key) {
+            .left => return navigateEditorNodeSelection(rect, input, editor, viewport_index, .left),
+            .right => return navigateEditorNodeSelection(rect, input, editor, viewport_index, .right),
+            .up => return navigateEditorNodeSelection(rect, input, editor, viewport_index, .up),
+            .down => return navigateEditorNodeSelection(rect, input, editor, viewport_index, .down),
             .home => {
                 const before_pan = editor.state.pan;
                 const before_zoom = editor.state.zoom;
@@ -6041,6 +6228,96 @@ test "NodeEditor visible box add promotes legacy primary selection atomically" {
     try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
 }
 
+test "NodeEditor spatial navigation follows geometry with deterministic tie breaking" {
+    const nodes = [_]Node{
+        .{ .id = 10, .title = "center", .pos = .{ 0, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 20, .title = "left", .pos = .{ -100, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 30, .title = "right aligned", .pos = .{ 100, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 31, .title = "right tie", .pos = .{ 100, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 40, .title = "up", .pos = .{ 0, -100 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 50, .title = "down", .pos = .{ 0, 100 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 60, .title = "near diagonal", .pos = .{ 50, 100 }, .size = .{ .w = 40, .h = 40 } },
+    };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .left, false));
+    try std.testing.expectEqual(@as(?u32, 10), state.selected_node_id);
+    try std.testing.expectEqual(nodes.len, state.navigation_candidate_count);
+
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .right, false));
+    try std.testing.expectEqual(@as(?u32, 30), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 3), state.navigation_candidate_count);
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .left, false));
+    try std.testing.expectEqual(@as(?u32, 10), state.selected_node_id);
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .up, false));
+    try std.testing.expectEqual(@as(?u32, 40), state.selected_node_id);
+    _ = state.setSingleSelection(10);
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .down, false));
+    try std.testing.expectEqual(@as(?u32, 50), state.selected_node_id);
+}
+
+test "NodeEditor spatial navigation extends selection and rejects capacity overflow" {
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 3, .title = "C", .pos = .{ 200, 0 }, .size = .{ .w = 40, .h = 40 } },
+    };
+    var selected: [2]u32 = .{ 1, 0 };
+    var state = State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .right, true));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .left, true));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .right, true));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    try std.testing.expect(!state.navigateNodeSelection(&nodes, .right, true));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    try std.testing.expectEqual(@as(u64, 1), state.navigation_rejected_count);
+}
+
+test "NodeEditor spatial navigation replaces connection selection without history" {
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 }, .size = .{ .w = 40, .h = 40 } },
+    };
+    const connection = Connection{ .from_id = 1, .to_id = 2 };
+    var selected_nodes: [2]u32 = undefined;
+    var selected_connections: [2]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    _ = state.setConnectionSelection(connection);
+
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .right, false));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+    try std.testing.expectEqual(@as(u64, 1), state.navigation_move_count);
+}
+
+test "NodeEditor indexed spatial navigation remains viewport local" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "anchor", .pos = .{ 100, 0 }, .size = .{ .w = 40, .h = 40 } },
+        .{ .id = 2, .title = "visible diagonal", .pos = .{ 185, 80 }, .size = .{ .w = 10, .h = 10 } },
+        .{ .id = 3, .title = "offscreen aligned", .pos = .{ 210, 0 }, .size = .{ .w = 40, .h = 40 } },
+    };
+    var selected: [3]u32 = .{ 1, 0, 0 };
+    var state = State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+    var storage = StaticViewportWorkspace(nodes.len, 0, 0){};
+    var index = ViewportIndex.init(storage.workspace());
+    try std.testing.expect(index.prepare(&nodes, &.{}, &.{}, viewport, .{ 0, 0 }, 1).ready);
+
+    try std.testing.expect(state.navigateNodeSelectionIndexed(&nodes, index.visibleNodeIndices(), &index, viewport, .right, false));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+    _ = state.setSingleSelection(1);
+    try std.testing.expect(state.navigateNodeSelection(&nodes, .right, false));
+    try std.testing.expectEqual(@as(?u32, 3), state.selected_node_id);
+}
+
 test "NodeEditor semantic zoom keeps paint and port hit detail aligned" {
     const viewport = Rect{ .x = 0, .y = 0, .w = 420, .h = 240 };
     var selected: [4]u32 = .{0} ** 4;
@@ -6218,6 +6495,27 @@ test "NodeEditor disconnect selected link removes every selected connection in s
     try std.testing.expectEqual(Connection{ .from_id = 2, .to_id = 3 }, connections[0]);
     try std.testing.expectEqual(Connection{ .from_id = 4, .to_id = 5 }, connections[1]);
     try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+}
+
+test "NodeEditor partial disconnect retains selected connections that still exist" {
+    var selected_nodes = [_]u32{ 2, 0 };
+    var selected_connections: [3]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 3, .to_id = 4 },
+        .{ .from_id = 2, .to_id = 5 },
+    };
+    var connection_len: usize = connections.len;
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[1]));
+    state.selected_node_len = 1;
+    state.selected_node_id = 2;
+    try std.testing.expect(state.disconnectSelectedNodeLinks(&connections, &connection_len, .disconnect_selected_links));
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(Connection{ .from_id = 3, .to_id = 4 }, connections[0]);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(connections[0]));
 }
 
 test "NodeEditor connected selection follows full upstream and downstream chains" {

@@ -494,6 +494,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.box_select_end = .{ 0, 0 };
             state.box_select_origin_x = 0;
             state.box_select_crossing = false;
+            state.navigation_candidate_count = 0;
         }
 
         fn writeSelectedConnections(state: anytype, destination: []Connection) void {
