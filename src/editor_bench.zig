@@ -239,6 +239,7 @@ fn run(init: std.process.Init, options: Options) !Report {
             .connections = connections,
             .viewport_index = &viewport_index,
             .geometry_revision = drag_revision,
+            .drag_auto_pan = .{ .enabled = false },
             .show_minimap = false,
         }, &move)) return error.EditorMultiDragDidNotMove;
     }

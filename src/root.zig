@@ -173,6 +173,7 @@ pub const DetailLevel = node_editor.DetailLevel;
 pub const SemanticZoomMode = node_editor.SemanticZoomMode;
 pub const SemanticZoomOptions = node_editor.SemanticZoomOptions;
 pub const semanticDetailLevel = node_editor.semanticDetailLevel;
+pub const DragAutoPanOptions = node_editor.DragAutoPanOptions;
 pub const ConnectionEnd = node_editor.ConnectionEnd;
 pub const ConnectionPath = node_editor.ConnectionPath;
 pub const ConnectionPathCache = node_editor.ConnectionPathCache;

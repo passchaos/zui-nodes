@@ -98,6 +98,36 @@ pub const SemanticZoomOptions = struct {
     }
 };
 
+pub const DragAutoPanOptions = struct {
+    enabled: bool = true,
+    edge_margin: f32 = 36.0,
+    max_step: f32 = 18.0,
+
+    pub fn delta(self: DragAutoPanOptions, viewport: Rect, point: [2]f32) [2]f32 {
+        if (!self.enabled or viewport.w <= 0 or viewport.h <= 0) return .{ 0, 0 };
+        const margin_x = @min(@max(0.0, self.edge_margin), viewport.w * 0.5);
+        const margin_y = @min(@max(0.0, self.edge_margin), viewport.h * 0.5);
+        return .{
+            autoPanAxis(point[0], viewport.x, viewport.x + viewport.w, margin_x, self.max_step),
+            autoPanAxis(point[1], viewport.y, viewport.y + viewport.h, margin_y, self.max_step),
+        };
+    }
+};
+
+fn autoPanAxis(position: f32, min_value: f32, max_value: f32, margin: f32, max_step_value: f32) f32 {
+    if (margin <= 0 or max_step_value <= 0) return 0;
+    const max_step = @max(0.0, max_step_value);
+    if (position < min_value + margin) {
+        const strength = std.math.clamp((min_value + margin - position) / margin, 0.0, 1.0);
+        return max_step * strength * strength;
+    }
+    if (position > max_value - margin) {
+        const strength = std.math.clamp((position - (max_value - margin)) / margin, 0.0, 1.0);
+        return -max_step * strength * strength;
+    }
+    return 0;
+}
+
 pub fn semanticDetailLevel(state: anytype, options: SemanticZoomOptions) DetailLevel {
     const detail = options.detailLevel(state.zoom);
     if (detail == .overview and (state.dragging_connection_from_id != null or state.reconnecting_connection != null)) return .compact;
@@ -391,6 +421,7 @@ pub fn Options(comptime StateType: type) type {
         minimap_max_node_marks: usize = 512,
         minimap_max_group_marks: usize = 128,
         semantic_zoom: SemanticZoomOptions = .{},
+        drag_auto_pan: DragAutoPanOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -2979,6 +3010,32 @@ fn editorDetailLevel(editor: anytype) DetailLevel {
     return semanticDetailLevel(editor.state.*, options);
 }
 
+fn editorDragAutoPanOptions(editor: anytype) DragAutoPanOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "drag_auto_pan")) editor.drag_auto_pan else .{};
+}
+
+fn editorDragAutoPanActive(editor: anytype) bool {
+    return editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or
+        editor.state.resizing_group_id != null or editor.state.dragging_connection_from_id != null or
+        editor.state.reconnecting_connection != null or editor.state.box_selecting;
+}
+
+fn editorDragAutoPanDelta(rect: Rect, editor: anytype, point: [2]f32) [2]f32 {
+    if (!editorDragAutoPanActive(editor)) return .{ 0, 0 };
+    return editorDragAutoPanOptions(editor).delta(rect, point);
+}
+
+fn applyEditorDragAutoPan(editor: anytype, delta: [2]f32) bool {
+    if (@abs(delta[0]) <= 0.001 and @abs(delta[1]) <= 0.001) return false;
+    _ = editor.state.panBy(delta);
+    if (editor.state.box_selecting) {
+        editor.state.box_select_start[0] += delta[0];
+        editor.state.box_select_start[1] += delta[1];
+    }
+    return true;
+}
+
 fn editorViewportIndex(editor: anytype) ?*ViewportIndex {
     const Editor = @TypeOf(editor);
     if (@hasField(Editor, "viewport_index")) return editor.viewport_index;
@@ -3579,42 +3636,74 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 const snapshot = minimapSnapshotPrepared(rect, editor, viewport_index);
                 return editor.state.updateMinimapDrag(rect, snapshot, .{ m.x, m.y });
             }
-            if (editor.state.box_selecting) return editor.state.updateBoxSelect(.{ m.x, m.y });
+            if (editor.state.box_selecting) {
+                const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                return editor.state.updateBoxSelect(.{ m.x, m.y }) or panned;
+            }
             if (editor.state.reconnecting_connection != null) {
+                const input_before_pan = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const output_before_pan = outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const auto_pan_delta = if (input_before_pan == null and output_before_pan == null)
+                    editorDragAutoPanDelta(rect, editor, .{ m.x, m.y })
+                else
+                    [2]f32{ 0, 0 };
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
                 const changed = editor.state.updateReconnectPreview(.{ m.x, m.y });
-                const input_hover = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
-                const output_hover = outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const input_hover = input_before_pan orelse inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const output_hover = output_before_pan orelse outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
                 editor.state.hover_input_node_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
                 editor.state.hover_output_node_id = if (output_hover) |hit| editor.nodes[hit.node_index].id else null;
                 const valid = reconnectPreviewCompatible(editor, input_hover, output_hover);
                 const valid_changed = editor.state.connection_preview_valid != valid;
                 editor.state.connection_preview_valid = valid;
-                return changed or valid_changed or input_hover != null or output_hover != null;
+                return changed or valid_changed or input_hover != null or output_hover != null or panned;
             }
             if (editor.state.dragging_connection_from_id != null) {
+                const input_before_pan = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const auto_pan_delta = if (input_before_pan == null)
+                    editorDragAutoPanDelta(rect, editor, .{ m.x, m.y })
+                else
+                    [2]f32{ 0, 0 };
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
                 editor.state.connection_preview = .{ m.x, m.y };
-                const input_hover = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const input_hover = input_before_pan orelse inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
                 const input_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
                 editor.state.hover_input_node_id = input_id;
                 const valid = dragPreviewCompatible(editor, input_hover);
                 const valid_changed = editor.state.connection_preview_valid != valid;
                 editor.state.connection_preview_valid = valid;
-                return valid_changed or true;
+                return valid_changed or panned or true;
             }
             if (editor.state.dragging_node_id) |id| {
-                if (@abs(m.dx) <= 0.001 and @abs(m.dy) <= 0.001) return false;
+                const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
+                const drag_delta = [2]f32{ m.dx - auto_pan_delta[0], m.dy - auto_pan_delta[1] };
+                if (@abs(drag_delta[0]) <= 0.001 and @abs(drag_delta[1]) <= 0.001) return false;
                 const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
-                return finishInteractionHistory(editor, history_mutation, dragNodeBy(editor, id, .{ m.dx, m.dy }));
+                const dragged = dragNodeBy(editor, id, drag_delta);
+                if (!dragged) return false;
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                return finishInteractionHistory(editor, history_mutation, true) or panned;
             }
             if (editor.state.resizing_group_id) |id| {
-                if (@abs(m.dx) <= 0.001 and @abs(m.dy) <= 0.001) return false;
+                const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
+                const drag_delta = [2]f32{ m.dx - auto_pan_delta[0], m.dy - auto_pan_delta[1] };
+                if (@abs(drag_delta[0]) <= 0.001 and @abs(drag_delta[1]) <= 0.001) return false;
                 const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
-                return finishInteractionHistory(editor, history_mutation, resizeGroupBy(editor, id, editor.state.resizing_group_edges, .{ m.dx, m.dy }));
+                const resized = resizeGroupBy(editor, id, editor.state.resizing_group_edges, drag_delta);
+                if (!resized) return false;
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                return finishInteractionHistory(editor, history_mutation, true) or panned;
             }
             if (editor.state.dragging_group_id) |id| {
-                if (@abs(m.dx) <= 0.001 and @abs(m.dy) <= 0.001) return false;
+                const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
+                const drag_delta = [2]f32{ m.dx - auto_pan_delta[0], m.dy - auto_pan_delta[1] };
+                if (@abs(drag_delta[0]) <= 0.001 and @abs(drag_delta[1]) <= 0.001) return false;
                 const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
-                return finishInteractionHistory(editor, history_mutation, dragGroupBy(editor, id, .{ m.dx, m.dy }));
+                const dragged = dragGroupBy(editor, id, drag_delta);
+                if (!dragged) return false;
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                return finishInteractionHistory(editor, history_mutation, true) or panned;
             }
             if (editor.state.dragging_canvas) return editor.state.panBy(.{ m.dx, m.dy });
             const input_hover = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
@@ -3918,6 +4007,16 @@ test "NodeEditor node drag preserves an existing multi-selection" {
     try std.testing.expectEqual(@as(?u32, 3), state.selected_node_id);
     try std.testing.expectEqual(@as(usize, 1), state.boundedSelectionLen());
     try std.testing.expectEqualSlices(u32, &.{3}, state.selected_node_ids[0..state.boundedSelectionLen()]);
+}
+
+test "NodeEditor drag auto pan accelerates at each viewport edge" {
+    const viewport = Rect{ .x = 10, .y = 20, .w = 400, .h = 240 };
+    const options = DragAutoPanOptions{ .edge_margin = 40, .max_step = 20 };
+    try std.testing.expectEqual([2]f32{ 20, 20 }, options.delta(viewport, .{ 10, 20 }));
+    try std.testing.expectEqual([2]f32{ -20, -20 }, options.delta(viewport, .{ 410, 260 }));
+    try std.testing.expectEqual([2]f32{ 5, 5 }, options.delta(viewport, .{ 30, 40 }));
+    try std.testing.expectEqual([2]f32{ 0, 0 }, options.delta(viewport, .{ 210, 140 }));
+    try std.testing.expectEqual([2]f32{ 0, 0 }, (DragAutoPanOptions{ .enabled = false }).delta(viewport, .{ 10, 20 }));
 }
 
 test "NodeEditor bounds minimap and group resize helpers" {

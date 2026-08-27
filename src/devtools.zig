@@ -32,6 +32,7 @@ pub const SummaryOptions = struct {
     viewport_index: ?*node_editor.ViewportIndex = null,
     geometry_revision: ?u64 = null,
     semantic_zoom: node_editor.SemanticZoomOptions = .{},
+    drag_auto_pan: node_editor.DragAutoPanOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -50,6 +51,8 @@ pub const Summary = struct {
     dragging_minimap: bool = false,
     zoom: f32 = 1.0,
     detail_level: node_editor.DetailLevel = .full,
+    drag_auto_pan_enabled: bool = false,
+    drag_auto_pan_active: bool = false,
     pan: [2]f32 = .{ 0, 0 },
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
@@ -113,6 +116,8 @@ pub fn summarize(options: SummaryOptions) Summary {
         .dragging_minimap = state.dragging_minimap,
         .zoom = state.zoom,
         .detail_level = node_editor.semanticDetailLevel(state.*, options.semantic_zoom),
+        .drag_auto_pan_enabled = options.drag_auto_pan.enabled,
+        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.box_selecting,
         .pan = state.pan,
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
@@ -161,6 +166,10 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.pan[0],
         options.summary.pan[1],
         options.summary.minimap.visible,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const auto_pan = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "auto-pan enabled={} active={}", .{
+        options.summary.drag_auto_pan_enabled,
+        options.summary.drag_auto_pan_active,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const path_cache = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "paths={d} hits={d} misses={d} rebuilds={d}", .{
         options.summary.connection_path_cache.entry_count,
@@ -213,7 +222,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, connection_draw, topology, viewport_index, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, path_cache, connection_draw, topology, viewport_index, history, graph });
     return root;
 }
 

@@ -86,6 +86,7 @@ pub const NodeEditorViewOptions = struct {
     minimap_max_node_marks: usize = 512,
     minimap_max_group_marks: usize = 128,
     semantic_zoom: node_editor.SemanticZoomOptions = .{},
+    drag_auto_pan: node_editor.DragAutoPanOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -124,6 +125,7 @@ const Binding = struct {
     minimap_max_node_marks: usize = 512,
     minimap_max_group_marks: usize = 128,
     semantic_zoom: node_editor.SemanticZoomOptions = .{},
+    drag_auto_pan: node_editor.DragAutoPanOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -155,6 +157,7 @@ const Binding = struct {
             .minimap_max_node_marks = self.minimap_max_node_marks,
             .minimap_max_group_marks = self.minimap_max_group_marks,
             .semantic_zoom = self.semantic_zoom,
+            .drag_auto_pan = self.drag_auto_pan,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -200,6 +203,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .minimap_max_node_marks = options.minimap_max_node_marks,
         .minimap_max_group_marks = options.minimap_max_group_marks,
         .semantic_zoom = options.semantic_zoom,
+        .drag_auto_pan = options.drag_auto_pan,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -496,11 +500,137 @@ test "node editor multi-drag is atomic when history capacity is insufficient" {
     const start = [2]f32{ node_rect.x + 20, node_rect.y + 20 };
     var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
     try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
-    var move = ElementEvent{ .mouse_move = .{ .x = start[0] + 20, .y = start[1] + 10, .dx = 20, .dy = 10 } };
+    var move = ElementEvent{ .mouse_move = .{ .x = 399, .y = start[1] + 10, .dx = 20, .dy = 10 } };
     try std.testing.expect(!nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
     try std.testing.expectEqual(before, nodes);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, state.pan);
     try std.testing.expectEqual(@as(usize, 0), history.undo_len);
     try std.testing.expect(!state.interaction_history_pushed);
+}
+
+test "node editor drag auto pan keeps selected nodes under the pointer" {
+    var selected = [_]u32{ 1, 2, 0, 0 };
+    var state = node_editor.State{
+        .selected_node_ids = &selected,
+        .selected_node_len = 2,
+        .selected_node_id = 1,
+    };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ -80, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 400, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 400, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9419,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .history = &history,
+        .viewport_index = &viewport_index,
+        .show_minimap = false,
+        .drag_auto_pan = .{ .edge_margin = 40, .max_step = 20 },
+        .style = .{ .width = .{ .px = 400 }, .height = .{ .px = 240 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const before = nodes;
+    const anchor_before = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    const start = [2]f32{ anchor_before.x + anchor_before.w * 0.5, anchor_before.y + anchor_before.h * 0.5 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var move = ElementEvent{ .mouse_move = .{ .x = 399, .y = start[1], .dx = 12, .dy = 0 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+    try std.testing.expect(state.pan[0] < 0);
+    const anchor_after = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), anchor_after.x - anchor_before.x, 0.001);
+    try std.testing.expectApproxEqAbs(nodes[0].pos[0] - before[0].pos[0], nodes[1].pos[0] - before[1].pos[0], 0.001);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+}
+
+test "node editor box auto pan preserves graph-space selection anchor" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    const nodes = [_]node_editor.Node{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }};
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const editor = node_editor.Options(node_editor.State){
+        .state = &state,
+        .nodes = &nodes,
+        .show_minimap = false,
+        .drag_auto_pan = .{ .edge_margin = 40, .max_step = 20 },
+    };
+    try std.testing.expect(state.beginBoxSelectMode(.{ 200, 120 }, .replace));
+    const anchor_graph_before = node_editor.screenToGraph(viewport, state, state.box_select_start);
+    var move = ElementEvent{ .mouse_move = .{ .x = 399, .y = 120, .dx = 0, .dy = 0 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &move));
+    const anchor_graph_after = node_editor.screenToGraph(viewport, state, state.box_select_start);
+    try std.testing.expectApproxEqAbs(anchor_graph_before[0], anchor_graph_after[0], 0.001);
+    try std.testing.expectApproxEqAbs(anchor_graph_before[1], anchor_graph_after[1], 0.001);
+    try std.testing.expect(state.pan[0] < 0);
+    try std.testing.expectEqual([2]f32{ 399, 120 }, state.box_select_end);
+}
+
+test "node editor group drag and resize remain pointer aligned during auto pan" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var groups = [_]node_editor.Group{.{ .id = 1, .title = "Group", .rect = .{ .x = 60, .y = -40, .w = 120, .h = 100 } }};
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const editor = node_editor.Options(node_editor.State){
+        .state = &state,
+        .nodes = &.{},
+        .groups = &groups,
+        .mutable_groups = &groups,
+        .show_minimap = false,
+        .drag_auto_pan = .{ .edge_margin = 40, .max_step = 20 },
+    };
+    const before_drag = node_editor.groupRect(viewport, state, groups[0]);
+    try std.testing.expect(state.beginGroupDrag(1));
+    var drag = ElementEvent{ .mouse_move = .{ .x = 399, .y = 120, .dx = 12, .dy = 0 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &drag));
+    const after_drag = node_editor.groupRect(viewport, state, groups[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), after_drag.x - before_drag.x, 0.001);
+    _ = state.endDrag();
+
+    state.pan = .{ 0, 0 };
+    const before_resize = node_editor.groupRect(viewport, state, groups[0]);
+    try std.testing.expect(state.beginGroupResize(1, .{ .right = true }));
+    var resize = ElementEvent{ .mouse_move = .{ .x = 399, .y = 120, .dx = 10, .dy = 0 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &resize));
+    const after_resize = node_editor.groupRect(viewport, state, groups[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), (after_resize.x + after_resize.w) - (before_resize.x + before_resize.w), 0.001);
+}
+
+test "node editor connection auto pan pauses on valid targets" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Source", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "Target", .pos = .{ 110, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    const editor = node_editor.Options(node_editor.State){
+        .state = &state,
+        .nodes = &nodes,
+        .viewport_index = &viewport_index,
+        .show_minimap = false,
+        .drag_auto_pan = .{ .edge_margin = 80, .max_step = 20 },
+    };
+    state.dragging_connection_from_id = 1;
+    const target = node_editor.inputPortPosition(viewport, state, nodes[1]);
+    const pan_before = state.pan;
+    var target_move = ElementEvent{ .mouse_move = .{ .x = target[0], .y = target[1], .dx = 0, .dy = 0 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &target_move));
+    try std.testing.expectEqual(pan_before, state.pan);
+    try std.testing.expectEqual(@as(?u32, 2), state.hover_input_node_id);
+
+    var edge_move = ElementEvent{ .mouse_move = .{ .x = 399, .y = 20, .dx = 0, .dy = 0 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &edge_move));
+    try std.testing.expect(state.pan[0] < pan_before[0]);
 }
 
 test "node editor view reports dirty canvas invalidation" {
@@ -516,7 +646,7 @@ test "node editor view reports dirty canvas invalidation" {
     var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
     defer view.deinit();
     var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
-    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9412, .canvas_state = &canvas_state, .viewport_index = &viewport_index, .geometry_revision = 1, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9412, .canvas_state = &canvas_state, .viewport_index = &viewport_index, .geometry_revision = 1, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .drag_auto_pan = .{ .enabled = false }, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
     editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
 
     const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[1]);
