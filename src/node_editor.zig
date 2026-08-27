@@ -132,6 +132,20 @@ pub const AlignmentSnapOptions = struct {
     show_guides: bool = true,
 };
 
+pub const DistributionSnapOptions = struct {
+    enabled: bool = false,
+    /// Equal-spacing capture distance stays constant in screen pixels.
+    threshold_pixels: f32 = 6.0,
+    candidate_margin_pixels: f32 = 96.0,
+    show_guides: bool = true,
+};
+
+pub const SpacingGuide = struct {
+    first: [2]f32,
+    second: [2]f32,
+    cross: f32,
+};
+
 fn autoPanAxis(position: f32, min_value: f32, max_value: f32, margin: f32, max_step_value: f32) f32 {
     if (margin <= 0 or max_step_value <= 0) return 0;
     const max_step = @max(0.0, max_step_value);
@@ -442,6 +456,7 @@ pub fn Options(comptime StateType: type) type {
         drag_auto_pan: DragAutoPanOptions = .{},
         drag_snap: DragSnapOptions = .{},
         alignment_snap: AlignmentSnapOptions = .{},
+        distribution_snap: DistributionSnapOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -1235,6 +1250,8 @@ pub const State = struct {
     snap_guide_y: ?f32 = null,
     snap_guide_x_span: ?[2]f32 = null,
     snap_guide_y_span: ?[2]f32 = null,
+    spacing_guide_x: ?SpacingGuide = null,
+    spacing_guide_y: ?SpacingGuide = null,
     selected_node_id: ?u32 = null,
     selected_node_ids: []u32 = &.{},
     selected_node_len: usize = 0,
@@ -2812,6 +2829,8 @@ pub const State = struct {
         self.snap_guide_y = null;
         self.snap_guide_x_span = null;
         self.snap_guide_y_span = null;
+        self.spacing_guide_x = null;
+        self.spacing_guide_y = null;
     }
 
     pub fn updateBoxSelect(self: *State, point: [2]f32) bool {
@@ -3069,6 +3088,11 @@ fn editorAlignmentSnapOptions(editor: anytype) AlignmentSnapOptions {
     return if (@hasField(Editor, "alignment_snap")) editor.alignment_snap else .{};
 }
 
+fn editorDistributionSnapOptions(editor: anytype) DistributionSnapOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "distribution_snap")) editor.distribution_snap else .{};
+}
+
 fn editorDragAutoPanActive(editor: anytype) bool {
     return editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or
         editor.state.resizing_group_id != null or editor.state.dragging_connection_from_id != null or
@@ -3293,6 +3317,26 @@ fn appendNodeEditorSnapGuides(allocator: std.mem.Allocator, out: *std.ArrayList(
             try out.append(allocator, .{ .line = .{ .a = .{ screen_a, screen_y }, .b = .{ screen_b, screen_y }, .thickness = 1.0, .color = color, .layer = layer } });
         }
     }
+    const distribution_options = editorDistributionSnapOptions(editor);
+    if (distribution_options.enabled and distribution_options.show_guides) {
+        if (editor.state.spacing_guide_x) |guide| try appendSpacingGuide(allocator, out, rect, editor.state.*, guide, true, editor.selected_color.withAlpha(0.82), layer);
+        if (editor.state.spacing_guide_y) |guide| try appendSpacingGuide(allocator, out, rect, editor.state.*, guide, false, editor.selected_color.withAlpha(0.82), layer);
+    }
+}
+
+fn appendSpacingGuide(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, state: State, guide: SpacingGuide, horizontal: bool, color: Color, layer: i32) !void {
+    const first_a = graphToScreen(rect, state, if (horizontal) .{ guide.first[0], guide.cross } else .{ guide.cross, guide.first[0] });
+    const first_b = graphToScreen(rect, state, if (horizontal) .{ guide.first[1], guide.cross } else .{ guide.cross, guide.first[1] });
+    const second_a = graphToScreen(rect, state, if (horizontal) .{ guide.second[0], guide.cross } else .{ guide.cross, guide.second[0] });
+    const second_b = graphToScreen(rect, state, if (horizontal) .{ guide.second[1], guide.cross } else .{ guide.cross, guide.second[1] });
+    try out.append(allocator, .{ .line = .{ .a = first_a, .b = first_b, .thickness = 1.0, .color = color, .layer = layer } });
+    try out.append(allocator, .{ .line = .{ .a = second_a, .b = second_b, .thickness = 1.0, .color = color, .layer = layer } });
+    const tick = 4.0;
+    for ([_][2]f32{ first_a, first_b, second_a, second_b }) |point| {
+        const a = if (horizontal) [2]f32{ point[0], point[1] - tick } else [2]f32{ point[0] - tick, point[1] };
+        const b = if (horizontal) [2]f32{ point[0], point[1] + tick } else [2]f32{ point[0] + tick, point[1] };
+        try out.append(allocator, .{ .line = .{ .a = a, .b = b, .thickness = 1.0, .color = color, .layer = layer } });
+    }
 }
 
 fn appendNodeEditorPortOverlay(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, node_item: Node, layer: i32) !void {
@@ -3439,15 +3483,26 @@ const NodeDragProjection = struct {
     guide_y: ?f32,
     guide_x_span: ?[2]f32 = null,
     guide_y_span: ?[2]f32 = null,
+    spacing_guide_x: ?SpacingGuide = null,
+    spacing_guide_y: ?SpacingGuide = null,
 };
 
 const AxisSnapCandidate = struct {
     target_delta: f32,
     guide: ?f32 = null,
     span: ?[2]f32 = null,
+    spacing_guide: ?SpacingGuide = null,
     target_span: [2]f32 = .{ 0, 0 },
     moving_span: [2]f32 = .{ 0, 0 },
     distance_pixels: f32 = std.math.inf(f32),
+    priority: u2 = 0,
+};
+
+const AxisNeighbors = struct {
+    before_near: ?Rect = null,
+    before_far: ?Rect = null,
+    after_near: ?Rect = null,
+    after_far: ?Rect = null,
 };
 
 fn snapDragAxis(origin: f32, accumulated: f32, spacing_value: f32, threshold_pixels: f32, zoom: f32, bypass: bool) struct { delta: f32, guide: ?f32 } {
@@ -3513,8 +3568,9 @@ fn considerAlignmentAxis(best: *AxisSnapCandidate, moving_features: [3]f32, targ
         const target_feature = target_features[pair[1]];
         const correction = target_feature - moving_feature;
         const distance_pixels = @abs(correction) * zoom;
+        const priority: u2 = 2;
         if (distance_pixels > threshold_pixels or distance_pixels > best.distance_pixels or
-            (distance_pixels == best.distance_pixels and best.span != null)) continue;
+            (distance_pixels == best.distance_pixels and priority <= best.priority)) continue;
         best.* = .{
             .target_delta = accumulated + correction,
             .guide = target_feature,
@@ -3522,8 +3578,94 @@ fn considerAlignmentAxis(best: *AxisSnapCandidate, moving_features: [3]f32, targ
             .target_span = target_span,
             .moving_span = moving_span,
             .distance_pixels = distance_pixels,
+            .priority = priority,
         };
     }
+}
+
+fn rectAxisStart(rect: Rect, horizontal: bool) f32 {
+    return if (horizontal) rect.x else rect.y;
+}
+
+fn rectAxisExtent(rect: Rect, horizontal: bool) f32 {
+    return if (horizontal) rect.w else rect.h;
+}
+
+fn rectCrossStart(rect: Rect, horizontal: bool) f32 {
+    return if (horizontal) rect.y else rect.x;
+}
+
+fn rectCrossExtent(rect: Rect, horizontal: bool) f32 {
+    return if (horizontal) rect.h else rect.w;
+}
+
+fn rangesOverlap(a_start: f32, a_extent: f32, b_start: f32, b_extent: f32) bool {
+    return a_start <= b_start + b_extent and a_start + a_extent >= b_start;
+}
+
+fn considerDistributionNeighbor(neighbors: *AxisNeighbors, moving: Rect, candidate: Rect, horizontal: bool) void {
+    if (!rangesOverlap(rectCrossStart(moving, horizontal), rectCrossExtent(moving, horizontal), rectCrossStart(candidate, horizontal), rectCrossExtent(candidate, horizontal))) return;
+    const moving_start = rectAxisStart(moving, horizontal);
+    const moving_end = moving_start + rectAxisExtent(moving, horizontal);
+    const candidate_start = rectAxisStart(candidate, horizontal);
+    const candidate_end = candidate_start + rectAxisExtent(candidate, horizontal);
+    if (candidate_end <= moving_start) {
+        if (neighbors.before_near == null or candidate_end > rectAxisStart(neighbors.before_near.?, horizontal) + rectAxisExtent(neighbors.before_near.?, horizontal)) {
+            neighbors.before_far = neighbors.before_near;
+            neighbors.before_near = candidate;
+        } else if (neighbors.before_far == null or candidate_end > rectAxisStart(neighbors.before_far.?, horizontal) + rectAxisExtent(neighbors.before_far.?, horizontal)) {
+            neighbors.before_far = candidate;
+        }
+    } else if (candidate_start >= moving_end) {
+        if (neighbors.after_near == null or candidate_start < rectAxisStart(neighbors.after_near.?, horizontal)) {
+            neighbors.after_far = neighbors.after_near;
+            neighbors.after_near = candidate;
+        } else if (neighbors.after_far == null or candidate_start < rectAxisStart(neighbors.after_far.?, horizontal)) {
+            neighbors.after_far = candidate;
+        }
+    }
+}
+
+fn considerDistributionAxis(best: *AxisSnapCandidate, moving: Rect, before_near: ?Rect, before_far: ?Rect, after_near: ?Rect, after_far: ?Rect, accumulated: f32, threshold_pixels: f32, zoom: f32, horizontal: bool) void {
+    const moving_start = rectAxisStart(moving, horizontal);
+    const moving_extent = rectAxisExtent(moving, horizontal);
+    const cross = rectCrossStart(moving, horizontal) + rectCrossExtent(moving, horizontal) * 0.5;
+
+    if (before_near != null and after_near != null) {
+        const before_end = rectAxisStart(before_near.?, horizontal) + rectAxisExtent(before_near.?, horizontal);
+        const after_start = rectAxisStart(after_near.?, horizontal);
+        const target_start = (before_end + after_start - moving_extent) * 0.5;
+        considerDistributionTarget(best, accumulated, target_start - moving_start, .{ .first = .{ before_end, target_start }, .second = .{ target_start + moving_extent, after_start }, .cross = cross }, threshold_pixels, zoom);
+    }
+    if (before_near != null and before_far != null) {
+        const far_end = rectAxisStart(before_far.?, horizontal) + rectAxisExtent(before_far.?, horizontal);
+        const near_start = rectAxisStart(before_near.?, horizontal);
+        const near_end = near_start + rectAxisExtent(before_near.?, horizontal);
+        const gap = near_start - far_end;
+        const target_start = near_end + gap;
+        considerDistributionTarget(best, accumulated, target_start - moving_start, .{ .first = .{ far_end, near_start }, .second = .{ near_end, target_start }, .cross = cross }, threshold_pixels, zoom);
+    }
+    if (after_near != null and after_far != null) {
+        const near_start = rectAxisStart(after_near.?, horizontal);
+        const near_end = near_start + rectAxisExtent(after_near.?, horizontal);
+        const far_start = rectAxisStart(after_far.?, horizontal);
+        const gap = far_start - near_end;
+        const target_start = near_start - gap - moving_extent;
+        considerDistributionTarget(best, accumulated, target_start - moving_start, .{ .first = .{ target_start + moving_extent, near_start }, .second = .{ near_end, far_start }, .cross = cross }, threshold_pixels, zoom);
+    }
+}
+
+fn considerDistributionTarget(best: *AxisSnapCandidate, accumulated: f32, correction: f32, guide: SpacingGuide, threshold_pixels: f32, zoom: f32) void {
+    const distance_pixels = @abs(correction) * zoom;
+    const priority: u2 = 1;
+    if (distance_pixels > threshold_pixels or distance_pixels > best.distance_pixels or
+        (distance_pixels == best.distance_pixels and priority <= best.priority)) return;
+    best.* = .{
+        .target_delta = accumulated + correction,
+        .spacing_guide = guide,
+        .distance_pixels = distance_pixels,
+        .priority = priority,
+    };
 }
 
 fn considerAlignmentNode(editor: anytype, node: Node, moving_bounds: Rect, accumulated: [2]f32, threshold_pixels: f32, zoom: f32, best_x: *AxisSnapCandidate, best_y: *AxisSnapCandidate) void {
@@ -3579,6 +3721,47 @@ fn applyAlignmentSnap(editor: anytype, viewport: Rect, id: u32, accumulated: [2]
     for (nodes[0..active_len]) |node| considerAlignmentNode(editor, node, moving_bounds, accumulated, options.threshold_pixels, zoom, best_x, best_y);
 }
 
+fn considerDistributionNode(editor: anytype, node: Node, moving_bounds: Rect, x_neighbors: *AxisNeighbors, y_neighbors: *AxisNeighbors) void {
+    if (editor.state.isNodeSelected(node.id)) return;
+    const node_bounds = nodeGraphRect(node);
+    considerDistributionNeighbor(x_neighbors, moving_bounds, node_bounds, true);
+    considerDistributionNeighbor(y_neighbors, moving_bounds, node_bounds, false);
+}
+
+fn applyDistributionSnap(editor: anytype, viewport: Rect, id: u32, accumulated: [2]f32, bypass_snap: bool, best_x: *AxisSnapCandidate, best_y: *AxisSnapCandidate) void {
+    const options = editorDistributionSnapOptions(editor);
+    if (bypass_snap or !options.enabled or !std.math.isFinite(options.threshold_pixels) or
+        options.threshold_pixels < 0 or viewport.w <= 0 or viewport.h <= 0) return;
+    const nodes = editor.mutable_nodes orelse return;
+    const active_len = if (editor.mutable_node_len) |len| @min(len.*, nodes.len) else @min(editor.nodes.len, nodes.len);
+    const original_bounds = originalDraggedBounds(editor, id) orelse return;
+    const moving_bounds = Rect{
+        .x = original_bounds.x + accumulated[0],
+        .y = original_bounds.y + accumulated[1],
+        .w = original_bounds.w,
+        .h = original_bounds.h,
+    };
+    var x_neighbors = AxisNeighbors{};
+    var y_neighbors = AxisNeighbors{};
+    const zoom = @max(0.0001, editor.state.zoom);
+    if (editorViewportIndex(editor)) |viewport_index| {
+        const margin = if (std.math.isFinite(options.candidate_margin_pixels)) @max(0.0, options.candidate_margin_pixels) else 0.0;
+        const query_rect = Rect{ .x = viewport.x - margin, .y = viewport.y - margin, .w = viewport.w + margin * 2.0, .h = viewport.h + margin * 2.0 };
+        if (viewport_index.retainedNodeIndicesInScreenRect(viewport, editor.state.pan, zoom, query_rect)) |candidates| {
+            for (candidates) |node_index| {
+                if (node_index >= active_len) continue;
+                considerDistributionNode(editor, nodes[node_index], moving_bounds, &x_neighbors, &y_neighbors);
+            }
+            considerDistributionAxis(best_x, moving_bounds, x_neighbors.before_near, x_neighbors.before_far, x_neighbors.after_near, x_neighbors.after_far, accumulated[0], options.threshold_pixels, zoom, true);
+            considerDistributionAxis(best_y, moving_bounds, y_neighbors.before_near, y_neighbors.before_far, y_neighbors.after_near, y_neighbors.after_far, accumulated[1], options.threshold_pixels, zoom, false);
+            return;
+        }
+    }
+    for (nodes[0..active_len]) |node| considerDistributionNode(editor, node, moving_bounds, &x_neighbors, &y_neighbors);
+    considerDistributionAxis(best_x, moving_bounds, x_neighbors.before_near, x_neighbors.before_far, x_neighbors.after_near, x_neighbors.after_far, accumulated[0], options.threshold_pixels, zoom, true);
+    considerDistributionAxis(best_y, moving_bounds, y_neighbors.before_near, y_neighbors.before_far, y_neighbors.after_near, y_neighbors.after_far, accumulated[1], options.threshold_pixels, zoom, false);
+}
+
 fn projectNodeDrag(editor: anytype, viewport: Rect, id: u32, delta_screen: [2]f32, bypass_snap: bool) ?NodeDragProjection {
     const nodes = editor.mutable_nodes orelse return null;
     const active_len = if (editor.mutable_node_len) |len| @min(len.*, nodes.len) else @min(editor.nodes.len, nodes.len);
@@ -3611,6 +3794,7 @@ fn projectNodeDrag(editor: anytype, viewport: Rect, id: u32, delta_screen: [2]f3
     // screen-space correction wins; ties prefer the more informative node
     // alignment guide and then preserve stable storage/pair order.
     applyAlignmentSnap(editor, viewport, id, accumulated_delta, bypass_snap, &best_x, &best_y);
+    applyDistributionSnap(editor, viewport, id, accumulated_delta, bypass_snap, &best_x, &best_y);
     const alignment = editorAlignmentSnapOptions(editor);
     if (!alignment.show_guides) {
         if (best_x.span != null) best_x.guide = null;
@@ -3630,6 +3814,8 @@ fn projectNodeDrag(editor: anytype, viewport: Rect, id: u32, delta_screen: [2]f3
             @max(best_y.target_span[1], best_y.moving_span[1] + x_correction),
         };
     }
+    if (best_x.spacing_guide) |*guide| guide.cross += best_y.target_delta - accumulated_delta[1];
+    if (best_y.spacing_guide) |*guide| guide.cross += best_x.target_delta - accumulated_delta[0];
     return .{
         .origin = origin,
         .accumulated_delta = accumulated_delta,
@@ -3638,6 +3824,8 @@ fn projectNodeDrag(editor: anytype, viewport: Rect, id: u32, delta_screen: [2]f3
         .guide_y = best_y.guide,
         .guide_x_span = best_x.span,
         .guide_y_span = best_y.span,
+        .spacing_guide_x = best_x.spacing_guide,
+        .spacing_guide_y = best_y.spacing_guide,
     };
 }
 
@@ -3650,6 +3838,12 @@ fn nodeDragProjectionChangesGeometry(state: *const State, projection: NodeDragPr
 fn optionalPointEqual(a: ?[2]f32, b: ?[2]f32) bool {
     if (a == null or b == null) return a == null and b == null;
     return a.?[0] == b.?[0] and a.?[1] == b.?[1];
+}
+
+fn optionalSpacingGuideEqual(a: ?SpacingGuide, b: ?SpacingGuide) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.first[0] == b.?.first[0] and a.?.first[1] == b.?.first[1] and
+        a.?.second[0] == b.?.second[0] and a.?.second[1] == b.?.second[1] and a.?.cross == b.?.cross;
 }
 
 fn dragNodeBy(editor: anytype, id: u32, delta_screen: [2]f32, bypass_snap: bool) NodeDragResult {
@@ -3670,13 +3864,19 @@ fn applyNodeDragProjection(editor: anytype, id: u32, projection: NodeDragProject
     const previous_guide_y = editor.state.snap_guide_y;
     const previous_guide_x_span = editor.state.snap_guide_x_span;
     const previous_guide_y_span = editor.state.snap_guide_y_span;
+    const previous_spacing_guide_x = editor.state.spacing_guide_x;
+    const previous_spacing_guide_y = editor.state.spacing_guide_y;
     editor.state.snap_guide_x = projection.guide_x;
     editor.state.snap_guide_y = projection.guide_y;
     editor.state.snap_guide_x_span = projection.guide_x_span;
     editor.state.snap_guide_y_span = projection.guide_y_span;
+    editor.state.spacing_guide_x = projection.spacing_guide_x;
+    editor.state.spacing_guide_y = projection.spacing_guide_y;
     const visual_changed = previous_guide_x != editor.state.snap_guide_x or previous_guide_y != editor.state.snap_guide_y or
         !optionalPointEqual(previous_guide_x_span, editor.state.snap_guide_x_span) or
-        !optionalPointEqual(previous_guide_y_span, editor.state.snap_guide_y_span);
+        !optionalPointEqual(previous_guide_y_span, editor.state.snap_guide_y_span) or
+        !optionalSpacingGuideEqual(previous_spacing_guide_x, editor.state.spacing_guide_x) or
+        !optionalSpacingGuideEqual(previous_spacing_guide_y, editor.state.spacing_guide_y);
     const applied_delta = [2]f32{
         projection.target_delta[0] - editor.state.node_drag_applied_delta[0],
         projection.target_delta[1] - editor.state.node_drag_applied_delta[1],
@@ -4485,6 +4685,63 @@ test "NodeEditor indexed alignment snap reuses retained stationary geometry" {
     try std.testing.expectEqual(rebuilds, viewport_index.summary().rebuild_count);
 }
 
+test "NodeEditor distribution snap equalizes inner and outer spacing" {
+    var selected = [_]u32{ 1, 5, 0, 0 };
+    var state = State{ .selected_node_ids = &selected, .selected_node_len = 2, .selected_node_id = 1 };
+    var nodes = [_]Node{
+        .{ .id = 1, .title = "Moving", .pos = .{ 38, 0 }, .size = .{ .w = 20, .h = 20 } },
+        .{ .id = 5, .title = "Moving child", .pos = .{ 38, 30 }, .size = .{ .w = 20, .h = 20 } },
+        .{ .id = 2, .title = "Left", .pos = .{ 0, 0 }, .size = .{ .w = 20, .h = 50 } },
+        .{ .id = 3, .title = "Right", .pos = .{ 80, 0 }, .size = .{ .w = 20, .h = 50 } },
+        .{ .id = 4, .title = "Far right", .pos = .{ 118, 0 }, .size = .{ .w = 20, .h = 50 } },
+    };
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 200 };
+    const editor = Options(State){
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .distribution_snap = .{ .enabled = true, .threshold_pixels = 6 },
+    };
+    try std.testing.expect(state.beginNodeDrag(1));
+    const inner = projectNodeDrag(editor, viewport, 1, .{ 2, 0 }, false) orelse return error.DragProjectionUnavailable;
+    _ = applyNodeDragProjection(editor, 1, inner);
+    try std.testing.expectEqual(@as(f32, 40), nodes[0].pos[0]);
+    try std.testing.expectEqual(@as(f32, 40), nodes[1].pos[0]);
+    try std.testing.expectEqual(@as(f32, 30), nodes[1].pos[1]);
+    try std.testing.expectEqual(@as(?SpacingGuide, .{ .first = .{ 20, 40 }, .second = .{ 60, 80 }, .cross = 25 }), state.spacing_guide_x);
+
+    _ = state.endDrag();
+    try std.testing.expect(state.setSingleSelection(4));
+    try std.testing.expect(state.beginNodeDrag(4));
+    const outer = projectNodeDrag(editor, viewport, 4, .{ 2, 0 }, false) orelse return error.DragProjectionUnavailable;
+    _ = applyNodeDragProjection(editor, 4, outer);
+    try std.testing.expectEqual(@as(f32, 120), nodes[4].pos[0]);
+    try std.testing.expectEqual(@as(?SpacingGuide, .{ .first = .{ 60, 80 }, .second = .{ 100, 120 }, .cross = 25 }), state.spacing_guide_x);
+}
+
+test "NodeEditor distribution snap supports vertical spacing and Alt bypass" {
+    var selected = [_]u32{ 1, 0, 0, 0 };
+    var state = State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1, .zoom = 2 };
+    var nodes = [_]Node{
+        .{ .id = 1, .title = "Moving", .pos = .{ 0, 38 }, .size = .{ .w = 20, .h = 20 } },
+        .{ .id = 2, .title = "Top", .pos = .{ 0, 0 }, .size = .{ .w = 20, .h = 20 } },
+        .{ .id = 3, .title = "Bottom", .pos = .{ 0, 80 }, .size = .{ .w = 20, .h = 20 } },
+    };
+    const viewport = Rect{ .x = 0, .y = 0, .w = 300, .h = 300 };
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .distribution_snap = .{ .enabled = true, .threshold_pixels = 6 } };
+    try std.testing.expect(state.beginNodeDrag(1));
+    const snapped = projectNodeDrag(editor, viewport, 1, .{ 4, 4 }, false) orelse return error.DragProjectionUnavailable;
+    _ = applyNodeDragProjection(editor, 1, snapped);
+    try std.testing.expectEqual([2]f32{ 2, 40 }, nodes[0].pos);
+    try std.testing.expect(state.spacing_guide_y != null);
+
+    const bypassed = projectNodeDrag(editor, viewport, 1, .{ 0, 0 }, true) orelse return error.DragProjectionUnavailable;
+    _ = applyNodeDragProjection(editor, 1, bypassed);
+    try std.testing.expectEqual([2]f32{ 2, 40 }, nodes[0].pos);
+    try std.testing.expectEqual(@as(?SpacingGuide, null), state.spacing_guide_x);
+    try std.testing.expectEqual(@as(?SpacingGuide, null), state.spacing_guide_y);
+}
+
 test "NodeEditor paints active snap guides in the dynamic overlay range" {
     var selected = [_]u32{ 1, 0, 0, 0 };
     var state = State{
@@ -4556,6 +4813,34 @@ test "NodeEditor paints alignment guides only across related nodes" {
         else => {},
     };
     try std.testing.expect(found);
+}
+
+test "NodeEditor paints equal spacing guides with endpoint ticks" {
+    var selected = [_]u32{ 1, 0, 0, 0 };
+    var state = State{
+        .selected_node_ids = &selected,
+        .selected_node_len = 1,
+        .selected_node_id = 1,
+        .dragging_node_id = 1,
+        .spacing_guide_x = .{ .first = .{ 20, 40 }, .second = .{ 60, 80 }, .cross = 10 },
+    };
+    const nodes = [_]Node{.{ .id = 1, .title = "A", .pos = .{ 40, 0 } }};
+    const viewport = Rect{ .x = 0, .y = 0, .w = 200, .h = 100 };
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .distribution_snap = .{ .enabled = true }, .grid_color = Color.transparent, .show_minimap = false };
+    var out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (out.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        out.deinit(std.testing.allocator);
+    }
+    const dynamic = try appendNodeEditor(std.testing.allocator, &out, viewport, editor, 0);
+    var guide_lines: usize = 0;
+    for (out.items[dynamic.start..dynamic.end]) |command| switch (command) {
+        .line => |line| if (line.color.a > 0) {
+            guide_lines += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 6), guide_lines);
 }
 
 test "NodeEditor bounds minimap and group resize helpers" {

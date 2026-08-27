@@ -29,6 +29,8 @@ const Report = struct {
     multi_drag_ns_per_iteration: f64,
     multi_drag_selection_count: usize,
     alignment_snap_count: usize,
+    distribution_snap_count: usize,
+    distribution_snap_ns_per_iteration: f64,
     max_visible_nodes: usize,
     max_visible_connections: usize,
     max_draw_commands: usize,
@@ -245,6 +247,7 @@ fn run(init: std.process.Init, options: Options) !Report {
             .drag_auto_pan = .{ .enabled = false },
             .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 6, .show_guides = false },
             .alignment_snap = .{ .enabled = true, .threshold_pixels = 6, .show_guides = false },
+            .distribution_snap = .{ .enabled = true, .threshold_pixels = 6, .show_guides = false },
             .show_minimap = false,
         }, &move)) drag_changed_count += 1;
         if (state.snap_guide_x_span != null or state.snap_guide_y_span != null) alignment_snap_count += 1;
@@ -270,6 +273,38 @@ fn run(init: std.process.Init, options: Options) !Report {
     }
     const unselected_before_x = (@as(f32, @floatFromInt(columns - 1)) - @as(f32, @floatFromInt(columns)) * 0.5) * 184.0;
     drag_correct = drag_correct and nodes[node_count - 1].pos[0] == unselected_before_x;
+
+    const distribution_node_index = node_count / 2 + columns / 2;
+    const distribution_before = nodes[distribution_node_index].pos;
+    try std.testing.expect(state.setSingleSelection(nodes[distribution_node_index].id));
+    state.pan = .{ -distribution_before[0], -distribution_before[1] };
+    const distribution_revision: u64 = 3;
+    if (!viewport_index.prepareVersioned(nodes, &.{}, connections, viewport, state.pan, state.zoom, distribution_revision).ready) return error.EditorDistributionViewportUnavailable;
+    const distribution_rebuilds = viewport_index.summary().rebuild_count;
+    _ = state.beginNodeDrag(nodes[distribution_node_index].id);
+    var distribution_snap_count: usize = 0;
+    const distribution_started = std.Io.Clock.awake.now(init.io);
+    for (0..options.iterations) |_| {
+        var move = zui.ElementEvent{ .mouse_move = .{ .x = viewport.w * 0.5, .y = viewport.h * 0.5, .dx = 0, .dy = 0 } };
+        _ = node_editor.handleEditorEvent(viewport, .{}, node_editor.Options(node_editor.State){
+            .state = &state,
+            .nodes = nodes,
+            .mutable_nodes = nodes,
+            .connections = connections,
+            .viewport_index = &viewport_index,
+            .geometry_revision = distribution_revision,
+            .drag_auto_pan = .{ .enabled = false },
+            .distribution_snap = .{ .enabled = true, .threshold_pixels = 6, .show_guides = false },
+            .show_minimap = false,
+        }, &move);
+        if (state.spacing_guide_x != null or state.spacing_guide_y != null) distribution_snap_count += 1;
+    }
+    const distribution_elapsed_ns: u64 = @intCast(distribution_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+    const distribution_snap_ns_per_iteration = @as(f64, @floatFromInt(distribution_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+    _ = state.endDrag();
+    const distribution_correct = nodes[distribution_node_index].pos[0] == distribution_before[0] and
+        nodes[distribution_node_index].pos[1] == distribution_before[1] and
+        viewport_index.summary().rebuild_count == distribution_rebuilds and distribution_snap_count == options.iterations;
     const draw_summary = draw_workspace.summary();
     const quality_passed = connection_index == connection_count and paint_summary.valid and paint_summary.rebuild_count == 1 and
         max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
@@ -277,9 +312,10 @@ fn run(init: std.process.Init, options: Options) !Report {
         max_draw_commands < draw_command_capacity and owned_payload_count == 0 and fixed.end_index == 0 and
         draw_summary.frame_count == options.iterations + 2 and draw_summary.borrowed_connection_count == paint_summary.visible_connection_count and
         draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and
-        overview_adaptive_commands * 3 < overview_full_commands and drag_correct and alignment_snap_count > 0 and checksum != 0;
+        overview_adaptive_commands * 3 < overview_full_commands and drag_correct and alignment_snap_count > 0 and distribution_correct and checksum != 0;
     const performance_passed = options.max_paint_ns == null or paint_ns_per_frame <= options.max_paint_ns.?;
-    const drag_performance_passed = options.max_multi_drag_ns == null or multi_drag_ns_per_iteration <= options.max_multi_drag_ns.?;
+    const drag_performance_passed = options.max_multi_drag_ns == null or
+        (multi_drag_ns_per_iteration <= options.max_multi_drag_ns.? and distribution_snap_ns_per_iteration <= options.max_multi_drag_ns.?);
     return .{
         .node_count = node_count,
         .connection_count = connection_count,
@@ -290,6 +326,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         .multi_drag_ns_per_iteration = multi_drag_ns_per_iteration,
         .multi_drag_selection_count = drag_selection_count,
         .alignment_snap_count = alignment_snap_count,
+        .distribution_snap_count = distribution_snap_count,
+        .distribution_snap_ns_per_iteration = distribution_snap_ns_per_iteration,
         .max_visible_nodes = max_visible_nodes,
         .max_visible_connections = max_visible_connections,
         .max_draw_commands = max_draw_commands,
@@ -329,8 +367,8 @@ fn printReport(io: std.Io, report: Report) !void {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
     try stdout.print(
-        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x multi_drag={d}@{d:.3}ns alignment_snaps={d} max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
-        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.alignment_snap_count, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x multi_drag={d}@{d:.3}ns alignment_snaps={d} distribution_snap={d}@{d:.3}ns max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
     );
     try stdout.flush();
 }

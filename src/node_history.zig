@@ -435,6 +435,8 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.snap_guide_y = null;
             state.snap_guide_x_span = null;
             state.snap_guide_y_span = null;
+            state.spacing_guide_x = null;
+            state.spacing_guide_y = null;
             state.dragging_connection_from_id = null;
             state.dragging_connection_from_port = 0;
             state.reconnecting_connection = null;

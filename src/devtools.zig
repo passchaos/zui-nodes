@@ -35,6 +35,7 @@ pub const SummaryOptions = struct {
     drag_auto_pan: node_editor.DragAutoPanOptions = .{},
     drag_snap: node_editor.DragSnapOptions = .{},
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
+    distribution_snap: node_editor.DistributionSnapOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -59,6 +60,8 @@ pub const Summary = struct {
     drag_snap_active: bool = false,
     alignment_snap_enabled: bool = false,
     alignment_snap_active: bool = false,
+    distribution_snap_enabled: bool = false,
+    distribution_snap_active: bool = false,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -132,6 +135,8 @@ pub fn summarize(options: SummaryOptions) Summary {
                 (state.snap_guide_y != null and state.snap_guide_y_span == null)),
         .alignment_snap_enabled = options.alignment_snap.enabled,
         .alignment_snap_active = state.dragging_node_id != null and (state.snap_guide_x_span != null or state.snap_guide_y_span != null),
+        .distribution_snap_enabled = options.distribution_snap.enabled,
+        .distribution_snap_active = state.dragging_node_id != null and (state.spacing_guide_x != null or state.spacing_guide_y != null),
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -187,11 +192,13 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.drag_auto_pan_enabled,
         options.summary.drag_auto_pan_active,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const drag_snap = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "snap grid={} align={} active={}/{} guides={?d:.1},{?d:.1}", .{
+    const drag_snap = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "snap grid={} align={} distribute={} active={}/{}/{} guides={?d:.1},{?d:.1}", .{
         options.summary.drag_snap_enabled,
         options.summary.alignment_snap_enabled,
+        options.summary.distribution_snap_enabled,
         options.summary.drag_snap_active,
         options.summary.alignment_snap_active,
+        options.summary.distribution_snap_active,
         options.summary.snap_guide_x,
         options.summary.snap_guide_y,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
@@ -301,11 +308,13 @@ test "zui-nodes devtools exposes active drag snap guides" {
         .nodes = &.{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }},
         .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 5 },
         .alignment_snap = .{ .enabled = true },
+        .distribution_snap = .{ .enabled = true },
     });
     try std.testing.expect(summary.drag_snap_enabled);
     try std.testing.expect(summary.drag_snap_active);
     try std.testing.expect(summary.alignment_snap_enabled);
     try std.testing.expect(summary.alignment_snap_active);
+    try std.testing.expect(summary.distribution_snap_enabled);
     try std.testing.expectEqual(@as(?f32, 32), summary.snap_guide_x);
     try std.testing.expectEqual(@as(?f32, 16), summary.snap_guide_y);
 }

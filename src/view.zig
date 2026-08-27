@@ -89,6 +89,7 @@ pub const NodeEditorViewOptions = struct {
     drag_auto_pan: node_editor.DragAutoPanOptions = .{},
     drag_snap: node_editor.DragSnapOptions = .{},
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
+    distribution_snap: node_editor.DistributionSnapOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -130,6 +131,7 @@ const Binding = struct {
     drag_auto_pan: node_editor.DragAutoPanOptions = .{},
     drag_snap: node_editor.DragSnapOptions = .{},
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
+    distribution_snap: node_editor.DistributionSnapOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -164,6 +166,7 @@ const Binding = struct {
             .drag_auto_pan = self.drag_auto_pan,
             .drag_snap = self.drag_snap,
             .alignment_snap = self.alignment_snap,
+            .distribution_snap = self.distribution_snap,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -212,6 +215,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .drag_auto_pan = options.drag_auto_pan,
         .drag_snap = options.drag_snap,
         .alignment_snap = options.alignment_snap,
+        .distribution_snap = options.distribution_snap,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
