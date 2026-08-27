@@ -9,7 +9,9 @@ const horizontal_connection_count: usize = rows * (columns - 1);
 const vertical_connection_count: usize = columns * (rows - 1);
 const connection_count: usize = horizontal_connection_count + vertical_connection_count;
 const default_iterations: usize = 1000;
-const draw_command_capacity: usize = 8192;
+const draw_command_capacity: usize = 16384;
+const input_labels = [_][]const u8{ "input", "mask" };
+const output_labels = [_][]const u8{ "value", "image" };
 
 const Options = struct {
     iterations: usize = default_iterations,
@@ -26,6 +28,8 @@ const Report = struct {
     max_visible_nodes: usize,
     max_visible_connections: usize,
     max_draw_commands: usize,
+    overview_adaptive_commands: usize,
+    overview_full_commands: usize,
     hot_path_allocations: usize,
     owned_payload_count: usize,
     owning_payload_count: usize,
@@ -62,6 +66,8 @@ fn run(init: std.process.Init, options: Options) !Report {
             .size = .{ .w = 144, .h = 72 },
             .input_count = 2,
             .output_count = 2,
+            .input_labels = &input_labels,
+            .output_labels = &output_labels,
         };
     }
     var connection_index: usize = 0;
@@ -168,14 +174,44 @@ fn run(init: std.process.Init, options: Options) !Report {
     const owning_elapsed_ns: u64 = @intCast(owning_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
     const owning_paint_ns_per_frame = @as(f64, @floatFromInt(owning_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
     const paint_speedup = owning_paint_ns_per_frame / paint_ns_per_frame;
+
+    const overview_target = nodes[node_count / 2];
+    state.zoom = 0.25;
+    state.pan = .{ -overview_target.pos[0] * state.zoom, -overview_target.pos[1] * state.zoom };
+    out.clearRetainingCapacity();
+    _ = try node_editor.appendNodeEditor(no_alloc, &out, viewport, node_editor.Options(node_editor.State){
+        .state = &state,
+        .nodes = nodes,
+        .connections = connections,
+        .connection_draw_workspace = &draw_workspace,
+        .viewport_index = &viewport_index,
+        .geometry_revision = 1,
+        .show_minimap = false,
+        .grid_color = zui.Color.transparent,
+    }, 0);
+    const overview_adaptive_commands = out.items.len;
+    out.clearRetainingCapacity();
+    _ = try node_editor.appendNodeEditor(no_alloc, &out, viewport, node_editor.Options(node_editor.State){
+        .state = &state,
+        .nodes = nodes,
+        .connections = connections,
+        .connection_draw_workspace = &draw_workspace,
+        .viewport_index = &viewport_index,
+        .geometry_revision = 1,
+        .semantic_zoom = .{ .mode = .full },
+        .show_minimap = false,
+        .grid_color = zui.Color.transparent,
+    }, 0);
+    const overview_full_commands = out.items.len;
     const summary = viewport_index.summary();
     const draw_summary = draw_workspace.summary();
     const quality_passed = connection_index == connection_count and summary.valid and summary.rebuild_count == 1 and
         max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
         max_visible_connections > 0 and max_visible_connections < connection_count / 10 and
         max_draw_commands < draw_command_capacity and owned_payload_count == 0 and fixed.end_index == 0 and
-        draw_summary.frame_count == options.iterations and draw_summary.borrowed_connection_count == summary.visible_connection_count and
-        draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and checksum != 0;
+        draw_summary.frame_count == options.iterations + 2 and draw_summary.borrowed_connection_count == summary.visible_connection_count and
+        draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and
+        overview_adaptive_commands * 3 < overview_full_commands and checksum != 0;
     const performance_passed = options.max_paint_ns == null or paint_ns_per_frame <= options.max_paint_ns.?;
     return .{
         .node_count = node_count,
@@ -187,6 +223,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         .max_visible_nodes = max_visible_nodes,
         .max_visible_connections = max_visible_connections,
         .max_draw_commands = max_draw_commands,
+        .overview_adaptive_commands = overview_adaptive_commands,
+        .overview_full_commands = overview_full_commands,
         .hot_path_allocations = 0,
         .owned_payload_count = owned_payload_count,
         .owning_payload_count = owning_payload_count,
@@ -219,8 +257,8 @@ fn printReport(io: std.Io, report: Report) !void {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
     try stdout.print(
-        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
-        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
     );
     try stdout.flush();
 }

@@ -31,6 +31,7 @@ pub const SummaryOptions = struct {
     topology_index: ?*graph_topology.Index = null,
     viewport_index: ?*node_editor.ViewportIndex = null,
     geometry_revision: ?u64 = null,
+    semantic_zoom: node_editor.SemanticZoomOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -48,6 +49,7 @@ pub const Summary = struct {
     dragging: bool = false,
     dragging_minimap: bool = false,
     zoom: f32 = 1.0,
+    detail_level: node_editor.DetailLevel = .full,
     pan: [2]f32 = .{ 0, 0 },
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
@@ -110,6 +112,7 @@ pub fn summarize(options: SummaryOptions) Summary {
         .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.resizing_group_id != null or state.box_selecting or state.dragging_minimap,
         .dragging_minimap = state.dragging_minimap,
         .zoom = state.zoom,
+        .detail_level = node_editor.semanticDetailLevel(state.*, options.semantic_zoom),
         .pan = state.pan,
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
@@ -152,8 +155,9 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.selected_group_id,
         options.summary.has_selected_connection,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const viewport = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "zoom={d:.2} pan={d:.1},{d:.1} minimap={}", .{
+    const viewport = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "zoom={d:.2} detail={s} pan={d:.1},{d:.1} minimap={}", .{
         options.summary.zoom,
+        @tagName(options.summary.detail_level),
         options.summary.pan[0],
         options.summary.pan[1],
         options.summary.minimap.visible,
@@ -244,6 +248,7 @@ test "zui-nodes devtools summarize node editor state" {
     try std.testing.expect(summary.hasSelection());
     try std.testing.expect(summary.minimap.visible);
     try std.testing.expectEqual(@as(u64, 1), summary.connection_path_cache.hit_count);
+    try std.testing.expectEqual(node_editor.DetailLevel.full, summary.detail_level);
     try std.testing.expectEqualStrings("selected", summary.statusText());
 }
 

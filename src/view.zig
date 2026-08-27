@@ -85,6 +85,7 @@ pub const NodeEditorViewOptions = struct {
     minimap_size: zui.ui_base.Size = .{ .w = 150.0, .h = 96.0 },
     minimap_max_node_marks: usize = 512,
     minimap_max_group_marks: usize = 128,
+    semantic_zoom: node_editor.SemanticZoomOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -122,6 +123,7 @@ const Binding = struct {
     minimap_size: zui.ui_base.Size = .{ .w = 150.0, .h = 96.0 },
     minimap_max_node_marks: usize = 512,
     minimap_max_group_marks: usize = 128,
+    semantic_zoom: node_editor.SemanticZoomOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -152,6 +154,7 @@ const Binding = struct {
             .minimap_size = self.minimap_size,
             .minimap_max_node_marks = self.minimap_max_node_marks,
             .minimap_max_group_marks = self.minimap_max_group_marks,
+            .semantic_zoom = self.semantic_zoom,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -196,6 +199,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .minimap_size = options.minimap_size,
         .minimap_max_node_marks = options.minimap_max_node_marks,
         .minimap_max_group_marks = options.minimap_max_group_marks,
+        .semantic_zoom = options.semantic_zoom,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };

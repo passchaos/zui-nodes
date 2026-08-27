@@ -71,6 +71,39 @@ pub const ConnectedSelectionResult = struct {
     }
 };
 
+pub const DetailLevel = enum(u8) {
+    overview,
+    compact,
+    full,
+};
+
+pub const SemanticZoomMode = enum(u8) {
+    adaptive,
+    full,
+};
+
+pub const SemanticZoomOptions = struct {
+    mode: SemanticZoomMode = .adaptive,
+    compact_min_zoom: f32 = 0.4,
+    full_min_zoom: f32 = 0.75,
+
+    pub fn detailLevel(self: SemanticZoomOptions, zoom_value: f32) DetailLevel {
+        if (self.mode == .full) return .full;
+        const compact_min = @max(0.0, self.compact_min_zoom);
+        const full_min = @max(compact_min, self.full_min_zoom);
+        const zoom = @max(0.0, zoom_value);
+        if (zoom < compact_min) return .overview;
+        if (zoom < full_min) return .compact;
+        return .full;
+    }
+};
+
+pub fn semanticDetailLevel(state: anytype, options: SemanticZoomOptions) DetailLevel {
+    const detail = options.detailLevel(state.zoom);
+    if (detail == .overview and (state.dragging_connection_from_id != null or state.reconnecting_connection != null)) return .compact;
+    return detail;
+}
+
 pub const ConnectionEnd = enum {
     from,
     to,
@@ -357,6 +390,7 @@ pub fn Options(comptime StateType: type) type {
         minimap_size: Size = .{ .w = 150.0, .h = 96.0 },
         minimap_max_node_marks: usize = 512,
         minimap_max_group_marks: usize = 128,
+        semantic_zoom: SemanticZoomOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -2918,6 +2952,12 @@ fn editorConnectionDrawWorkspace(editor: anytype) ?*ConnectionDrawWorkspace {
     return null;
 }
 
+fn editorDetailLevel(editor: anytype) DetailLevel {
+    const Editor = @TypeOf(editor);
+    const options: SemanticZoomOptions = if (@hasField(Editor, "semantic_zoom")) editor.semantic_zoom else .{};
+    return semanticDetailLevel(editor.state.*, options);
+}
+
 fn editorViewportIndex(editor: anytype) ?*ViewportIndex {
     const Editor = @TypeOf(editor);
     if (@hasField(Editor, "viewport_index")) return editor.viewport_index;
@@ -2949,14 +2989,15 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     const connection_draw_workspace = editorConnectionDrawWorkspace(editor);
     if (connection_draw_workspace) |workspace| workspace.beginPaint();
     const viewport_index = prepareNodeEditorViewportIndex(rect, editor);
+    const detail_level = editorDetailLevel(editor);
     try appendNodeEditorGrid(allocator, out, rect, editor, layer + 1);
     if (viewport_index) |index| {
         for (index.visibleGroupIndices()) |group_index| {
-            try appendNodeEditorGroup(allocator, out, rect, editor, editor.groups[group_index], layer + 2);
+            try appendNodeEditorGroup(allocator, out, rect, editor, editor.groups[group_index], detail_level, layer + 2);
         }
     } else {
         for (editor.groups) |group| {
-            try appendNodeEditorGroup(allocator, out, rect, editor, group, layer + 2);
+            try appendNodeEditorGroup(allocator, out, rect, editor, group, detail_level, layer + 2);
         }
     }
     const connections = editorActiveConnections(editor);
@@ -2971,11 +3012,11 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     }
     if (viewport_index) |index| {
         for (index.visibleNodeIndices()) |node_index| {
-            try appendNodeEditorNode(allocator, out, rect, editor, editor.nodes[node_index], layer);
+            try appendNodeEditorNode(allocator, out, rect, editor, editor.nodes[node_index], detail_level, layer);
         }
     } else {
         for (editor.nodes) |node_item| {
-            try appendNodeEditorNode(allocator, out, rect, editor, node_item, layer);
+            try appendNodeEditorNode(allocator, out, rect, editor, node_item, detail_level, layer);
         }
     }
     const dynamic_start = out.items.len;
@@ -3025,7 +3066,7 @@ fn appendNodeEditorConnectionBorrowed(allocator: std.mem.Allocator, out: *std.Ar
     } });
 }
 
-fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, node_item: Node, layer: i32) !void {
+fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, node_item: Node, detail_level: DetailLevel, layer: i32) !void {
     const node_rect = nodeRectFromElement(rect, editor, node_item);
     if (!rectOverlapsOrTouches(node_rect, rect)) return;
     const selected = editor.state.isNodeSelected(node_item.id);
@@ -3033,13 +3074,16 @@ fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     const bg = if (selected) node_item.color.lighten(0.08) else if (hovered) node_item.color.lighten(0.04) else node_item.color;
     try paint_primitives.appendFillRect(allocator, out, node_rect, bg, 7.0, layer + 3);
     try paint_primitives.appendBorder(allocator, out, node_rect, if (selected) editor.selected_color else editor.grid_color.withAlpha(0.8), if (selected) 2.0 else 1.0, 7.0, layer + 4);
+    if (detail_level == .overview) return;
     try out.append(allocator, .{ .text = .{ .pos = .{ node_rect.x + 10.0, node_rect.y + 8.0 }, .size = editor.font_size, .color = editor.node_text_color, .text = node_item.title, .layer = layer + 5 } });
     var input_port_index: u8 = 0;
     while (input_port_index < inputPortCount(node_item)) : (input_port_index += 1) {
         const in_port = inputPortPositionAt(rect, editor.state.*, node_item, input_port_index);
         const input_hovered = editor.state.hover_input_node_id != null and editor.state.hover_input_node_id.? == node_item.id;
         try out.append(allocator, .{ .point = .{ .pos = in_port, .size = if (input_hovered) 7.0 else 5.0, .color = if (input_hovered) editor.selected_color else editor.port_color, .layer = layer + 6 } });
-        if (inputPortLabel(node_item, input_port_index)) |port_label| try out.append(allocator, .{ .text = .{ .pos = .{ in_port[0] + 8.0, in_port[1] - editor.font_size * 0.5 }, .size = @max(8.0, editor.font_size - 2.0), .color = editor.node_text_color.withAlpha(0.78), .text = port_label, .layer = layer + 6 } });
+        if (detail_level == .full) {
+            if (inputPortLabel(node_item, input_port_index)) |port_label| try out.append(allocator, .{ .text = .{ .pos = .{ in_port[0] + 8.0, in_port[1] - editor.font_size * 0.5 }, .size = @max(8.0, editor.font_size - 2.0), .color = editor.node_text_color.withAlpha(0.78), .text = port_label, .layer = layer + 6 } });
+        }
     }
     var output_port_index: u8 = 0;
     while (output_port_index < outputPortCount(node_item)) : (output_port_index += 1) {
@@ -3047,9 +3091,11 @@ fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
         const output_hovered = editor.state.hover_output_node_id != null and editor.state.hover_output_node_id.? == node_item.id;
         const output_dragging = editor.state.dragging_connection_from_id != null and editor.state.dragging_connection_from_id.? == node_item.id;
         try out.append(allocator, .{ .point = .{ .pos = out_port, .size = if (output_hovered) 7.0 else 5.0, .color = if (output_hovered or output_dragging) editor.selected_color else editor.port_color, .layer = layer + 6 } });
-        if (outputPortLabel(node_item, output_port_index)) |port_label| {
-            const label_w = @as(f32, @floatFromInt(port_label.len)) * @max(8.0, editor.font_size - 2.0) * 0.54;
-            try out.append(allocator, .{ .text = .{ .pos = .{ out_port[0] - label_w - 8.0, out_port[1] - editor.font_size * 0.5 }, .size = @max(8.0, editor.font_size - 2.0), .color = editor.node_text_color.withAlpha(0.78), .text = port_label, .layer = layer + 6 } });
+        if (detail_level == .full) {
+            if (outputPortLabel(node_item, output_port_index)) |port_label| {
+                const label_w = @as(f32, @floatFromInt(port_label.len)) * @max(8.0, editor.font_size - 2.0) * 0.54;
+                try out.append(allocator, .{ .text = .{ .pos = .{ out_port[0] - label_w - 8.0, out_port[1] - editor.font_size * 0.5 }, .size = @max(8.0, editor.font_size - 2.0), .color = editor.node_text_color.withAlpha(0.78), .text = port_label, .layer = layer + 6 } });
+            }
         }
     }
 }
@@ -3080,6 +3126,7 @@ pub fn appendNodeEditorConnectionOverlay(allocator: std.mem.Allocator, out: *std
 
 fn appendNodeEditorConnectionOverlayPrepared(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, layer: i32) !void {
     try appendNodeEditorConnectionPreviewOverlay(allocator, out, rect, editor, layer + 3);
+    if (editorDetailLevel(editor) == .overview) return;
     if (viewport_index) |index| {
         for (index.visibleNodeIndices()) |node_index| try appendNodeEditorPortOverlay(allocator, out, rect, editor, editor.nodes[node_index], layer);
     } else {
@@ -3136,7 +3183,7 @@ fn appendNodeEditorConnectionPreviewOverlay(allocator: std.mem.Allocator, out: *
     } });
 }
 
-fn appendNodeEditorGroup(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, group: Group, layer: i32) !void {
+fn appendNodeEditorGroup(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, group: Group, detail_level: DetailLevel, layer: i32) !void {
     const group_rect = groupRectFromElement(rect, editor, group);
     if (group_rect.x + group_rect.w < rect.x or group_rect.x > rect.x + rect.w or group_rect.y + group_rect.h < rect.y or group_rect.y > rect.y + rect.h) return;
     const radius = @max(0.0, group.radius * editor.state.zoom);
@@ -3156,7 +3203,7 @@ fn appendNodeEditorGroup(allocator: std.mem.Allocator, out: *std.ArrayList(DrawC
         try paint_primitives.appendFillRect(allocator, out, title_rect, border_color.withAlpha(@max(border_color.a * 0.24, 0.10)), radius, layer + 1);
     }
     if (border_color.a > 0.0) try paint_primitives.appendBorder(allocator, out, group_rect, border_color, if (selected) 1.8 else 1.0, radius, layer + 2);
-    if (group.title.len > 0 and group.text_color.a > 0.0) {
+    if (detail_level != .overview and group.title.len > 0 and group.text_color.a > 0.0) {
         try out.append(allocator, .{ .text = .{
             .pos = .{ group_rect.x + 10.0 * editor.state.zoom, group_rect.y + @max(5.0, 7.0 * editor.state.zoom) },
             .size = @max(8.0, editor.font_size * 0.92),
@@ -3358,6 +3405,7 @@ fn reconnectPreviewCompatible(editor: anytype, input_hover: ?PortHit, output_hov
 }
 
 pub fn inputPortAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?PortHit {
+    if (editorDetailLevel(editor) == .overview) return null;
     if (viewport_index) |index| {
         // Port rows keep up to 17 px of screen-space inset even when a node is
         // tiny, so widen the broad phase while retaining exact portHit checks.
@@ -3374,6 +3422,7 @@ pub fn inputPortAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*Vie
 }
 
 pub fn outputPortAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?PortHit {
+    if (editorDetailLevel(editor) == .overview) return null;
     if (viewport_index) |index| {
         for (index.nodeIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, 25.0)) |node_index| {
             const node = editor.nodes[node_index];
@@ -3903,7 +3952,7 @@ test "NodeEditor viewport index preserves tiny multi-port geometry at minimum zo
     const connections = [_]Connection{.{ .from_id = 1, .from_port = 7, .to_id = 2, .to_port = 7 }};
     var storage = StaticViewportWorkspace(nodes.len, 0, connections.len){};
     var viewport_index = ViewportIndex.init(storage.workspace());
-    const editor = Options(State){ .state = &state, .nodes = &nodes, .connections = &connections, .viewport_index = &viewport_index, .show_minimap = false };
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .connections = &connections, .viewport_index = &viewport_index, .semantic_zoom = .{ .mode = .full }, .show_minimap = false };
     const prepared = prepareNodeEditorViewportIndex(viewport, editor) orelse return error.ViewportIndexUnavailable;
 
     const output_point = outputPortPositionAt(viewport, state, nodes[0], 7);
@@ -4233,6 +4282,97 @@ test "NodeEditor indexed box selection matches full scan in every mode" {
         try std.testing.expectEqual(full.selected_node_id, indexed.selected_node_id);
         try std.testing.expectEqual(full.boundedSelectionLen(), indexed.boundedSelectionLen());
         try std.testing.expectEqualSlices(u32, full.selected_node_ids[0..full.boundedSelectionLen()], indexed.selected_node_ids[0..indexed.boundedSelectionLen()]);
+    }
+}
+
+test "NodeEditor semantic zoom keeps paint and port hit detail aligned" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 420, .h = 240 };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    const labels = [_][]const u8{ "in", "mask" };
+    const nodes = [_]Node{.{
+        .id = 1,
+        .title = "Node",
+        .pos = .{ -80, -40 },
+        .size = .{ .w = 160, .h = 84 },
+        .input_count = 2,
+        .output_count = 2,
+        .input_labels = &labels,
+        .output_labels = &labels,
+    }};
+    const groups = [_]Group{.{ .id = 9, .title = "Group", .rect = .{ .x = -110, .y = -65, .w = 220, .h = 140 } }};
+    var viewport_storage = StaticViewportWorkspace(nodes.len, groups.len, 0){};
+    var viewport_index = ViewportIndex.init(viewport_storage.workspace());
+
+    const cases = [_]struct { zoom: f32, expected: DetailLevel, text_count: usize, point_count: usize, ports_hit: bool }{
+        .{ .zoom = 0.25, .expected = .overview, .text_count = 0, .point_count = 0, .ports_hit = false },
+        .{ .zoom = 0.5, .expected = .compact, .text_count = 2, .point_count = 8, .ports_hit = true },
+        .{ .zoom = 1.0, .expected = .full, .text_count = 6, .point_count = 8, .ports_hit = true },
+    };
+    for (cases) |case| {
+        state.zoom = case.zoom;
+        var out = std.ArrayList(DrawCmd).empty;
+        defer {
+            for (out.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+            out.deinit(std.testing.allocator);
+        }
+        const editor = Options(State){ .state = &state, .nodes = &nodes, .groups = &groups, .viewport_index = &viewport_index, .show_minimap = false, .grid_color = Color.transparent };
+        try std.testing.expectEqual(case.expected, editor.semantic_zoom.detailLevel(state.zoom));
+        _ = try appendNodeEditor(std.testing.allocator, &out, viewport, editor, 0);
+        var text_count: usize = 0;
+        var point_count: usize = 0;
+        for (out.items) |command| switch (command) {
+            .text => text_count += 1,
+            .point => point_count += 1,
+            else => {},
+        };
+        try std.testing.expectEqual(case.text_count, text_count);
+        try std.testing.expectEqual(case.point_count, point_count);
+        const prepared = prepareNodeEditorViewportIndex(viewport, editor) orelse return error.ViewportIndexUnavailable;
+        const input_point = inputPortPositionAt(viewport, state, nodes[0], 0);
+        try std.testing.expectEqual(case.ports_hit, inputPortAtEditorPoint(viewport, editor, prepared, input_point) != null);
+    }
+
+    state.zoom = 0.25;
+    var full_out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (full_out.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        full_out.deinit(std.testing.allocator);
+    }
+    const full_editor = Options(State){ .state = &state, .nodes = &nodes, .groups = &groups, .viewport_index = &viewport_index, .semantic_zoom = .{ .mode = .full }, .show_minimap = false, .grid_color = Color.transparent };
+    _ = try appendNodeEditor(std.testing.allocator, &full_out, viewport, full_editor, 0);
+    var full_text_count: usize = 0;
+    for (full_out.items) |command| if (command == .text) {
+        full_text_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 6), full_text_count);
+    const prepared = prepareNodeEditorViewportIndex(viewport, full_editor) orelse return error.ViewportIndexUnavailable;
+    try std.testing.expect(inputPortAtEditorPoint(viewport, full_editor, prepared, inputPortPositionAt(viewport, state, nodes[0], 0)) != null);
+
+    state.dragging_connection_from_id = nodes[0].id;
+    const active_editor = Options(State){ .state = &state, .nodes = &nodes, .groups = &groups, .viewport_index = &viewport_index, .show_minimap = false, .grid_color = Color.transparent };
+    try std.testing.expectEqual(DetailLevel.compact, editorDetailLevel(active_editor));
+    try std.testing.expect(inputPortAtEditorPoint(viewport, active_editor, prepared, inputPortPositionAt(viewport, state, nodes[0], 0)) != null);
+
+    state.dragging_connection_from_id = null;
+    state.zoom = 1.0;
+    var adaptive_near = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (adaptive_near.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        adaptive_near.deinit(std.testing.allocator);
+    }
+    var full_near = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (full_near.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        full_near.deinit(std.testing.allocator);
+    }
+    const adaptive_near_editor = Options(State){ .state = &state, .nodes = &nodes, .groups = &groups, .viewport_index = &viewport_index, .show_minimap = false, .grid_color = Color.transparent };
+    const full_near_editor = Options(State){ .state = &state, .nodes = &nodes, .groups = &groups, .viewport_index = &viewport_index, .semantic_zoom = .{ .mode = .full }, .show_minimap = false, .grid_color = Color.transparent };
+    _ = try appendNodeEditor(std.testing.allocator, &adaptive_near, viewport, adaptive_near_editor, 0);
+    _ = try appendNodeEditor(std.testing.allocator, &full_near, viewport, full_near_editor, 0);
+    try std.testing.expectEqual(adaptive_near.items.len, full_near.items.len);
+    for (adaptive_near.items, full_near.items) |adaptive_command, full_command| {
+        try std.testing.expect(std.meta.eql(adaptive_command, full_command));
     }
 }
 
