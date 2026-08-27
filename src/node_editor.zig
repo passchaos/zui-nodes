@@ -1256,14 +1256,23 @@ pub const State = struct {
     }
 
     pub fn beginNodeDrag(self: *State, id: u32) bool {
-        const changed = self.dragging_node_id == null or self.dragging_node_id.? != id;
+        const preserve_multi_selection = self.boundedSelectionLen() > 1 and self.isNodeSelected(id);
+        const changed = self.dragging_node_id == null or self.dragging_node_id.? != id or
+            self.selected_node_id == null or self.selected_node_id.? != id or
+            self.selected_group_id != null or self.selected_connection != null or
+            (!preserve_multi_selection and (self.boundedSelectionLen() != 1 or !self.isNodeSelected(id)));
         self.dragging_node_id = id;
         self.dragging_group_id = null;
         self.interaction_history_pushed = false;
         self.dragging_canvas = false;
         self.box_selecting = false;
-        self.selected_node_id = id;
-        _ = self.setSingleSelection(id);
+        if (preserve_multi_selection) {
+            self.selected_node_id = id;
+            self.selected_group_id = null;
+            self.selected_connection = null;
+        } else {
+            _ = self.setSingleSelection(id);
+        }
         return changed;
     }
 
@@ -3269,12 +3278,40 @@ fn dragNodeBy(editor: anytype, id: u32, delta_screen: [2]f32) bool {
     const nodes = editor.mutable_nodes orelse return false;
     const zoom = @max(0.0001, editor.state.zoom);
     const delta_graph = [2]f32{ delta_screen[0] / zoom, delta_screen[1] / zoom };
-    for (nodes) |*node| {
+    if (@abs(delta_graph[0]) <= 0.001 and @abs(delta_graph[1]) <= 0.001) return false;
+    const active_len = if (editor.mutable_node_len) |len| @min(len.*, nodes.len) else @min(editor.nodes.len, nodes.len);
+    const move_selection = editor.state.boundedSelectionLen() > 1 and editor.state.isNodeSelected(id);
+    if (move_selection) {
+        if (editorViewportIndex(editor)) |viewport_index| {
+            if (viewport_index.nodeIndexForId(id) != null) {
+                var moved = false;
+                for (editor.state.selected_node_ids[0..editor.state.boundedSelectionLen()]) |selected_id| {
+                    const node_index = viewport_index.nodeIndexForId(selected_id) orelse continue;
+                    if (node_index >= active_len or nodes[node_index].id != selected_id) continue;
+                    nodes[node_index].pos[0] += delta_graph[0];
+                    nodes[node_index].pos[1] += delta_graph[1];
+                    moved = true;
+                }
+                if (moved) editor.state.selected_node_id = id;
+                return moved;
+            }
+        }
+        var moved = false;
+        for (nodes[0..active_len]) |*node| {
+            if (!editor.state.isNodeSelected(node.id)) continue;
+            node.pos[0] += delta_graph[0];
+            node.pos[1] += delta_graph[1];
+            moved = true;
+        }
+        if (moved) editor.state.selected_node_id = id;
+        return moved;
+    }
+    for (nodes[0..active_len]) |*node| {
         if (node.id != id) continue;
         node.pos[0] += delta_graph[0];
         node.pos[1] += delta_graph[1];
         editor.state.selected_node_id = id;
-        return @abs(delta_graph[0]) > 0.001 or @abs(delta_graph[1]) > 0.001;
+        return true;
     }
     return false;
 }
@@ -3298,7 +3335,7 @@ fn beginEditorHistory(editor: anytype) ?EditorHistoryMutation {
 }
 
 fn invalidateEditorViewportGeometry(editor: anytype) void {
-    if (editorViewportIndex(editor)) |viewport_index| viewport_index.invalidate();
+    if (editorViewportIndex(editor)) |viewport_index| viewport_index.invalidateGeometry();
 }
 
 fn finishEditorHistory(editor: anytype, mutation: EditorHistoryMutation, changed: bool) bool {
@@ -3517,7 +3554,13 @@ pub const EventInputModifiers = struct {
 };
 
 pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype, event: anytype) bool {
-    const viewport_index = prepareNodeEditorViewportIndex(rect, editor);
+    const geometry_drag_active = editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or editor.state.resizing_group_id != null;
+    const skip_prepare = switch (event.*) {
+        .mouse_move => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap or editor.state.box_selecting,
+        .mouse_up => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap,
+        else => false,
+    };
+    const viewport_index = if (skip_prepare) editorViewportIndex(editor) else prepareNodeEditorViewportIndex(rect, editor);
     switch (event.*) {
         .mouse_move => |m| {
             if (editor.state.dragging_minimap) {
@@ -3841,6 +3884,26 @@ test "NodeEditor geometry transforms hit nodes ports and groups" {
     try std.testing.expectEqual(Rect{ .x = 162, .y = 134, .w = 240, .h = 140 }, group_rect);
     const resize = groupResizeAtPoint(viewport, state, &.{group}, 8.0, .{ group_rect.x + 2.0, group_rect.y + group_rect.h - 2.0 }) orelse return error.MissingResizeHit;
     try std.testing.expect(resize.edges.left and resize.edges.bottom);
+}
+
+test "NodeEditor node drag preserves an existing multi-selection" {
+    var selected = [_]u32{ 1, 2, 0, 0 };
+    var state = State{
+        .selected_node_ids = &selected,
+        .selected_node_len = 2,
+        .selected_node_id = 2,
+    };
+    try std.testing.expect(state.beginNodeDrag(1));
+    try std.testing.expectEqual(@as(?u32, 1), state.dragging_node_id);
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    _ = state.endDrag();
+
+    try std.testing.expect(state.beginNodeDrag(3));
+    try std.testing.expectEqual(@as(?u32, 3), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedSelectionLen());
+    try std.testing.expectEqualSlices(u32, &.{3}, state.selected_node_ids[0..state.boundedSelectionLen()]);
 }
 
 test "NodeEditor bounds minimap and group resize helpers" {

@@ -217,6 +217,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             pan: [2]f32 = .{ 0, 0 },
             zoom: f32 = 1.0,
             valid: bool = false,
+            id_lookup_valid: bool = false,
             viewport_valid: bool = false,
             rebuild_count: u64 = 0,
             query_count: u64 = 0,
@@ -228,6 +229,16 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             }
 
             pub fn invalidate(self: *Index) void {
+                self.valid = false;
+                self.id_lookup_valid = false;
+                self.viewport_valid = false;
+            }
+
+            /// Invalidate geometry-dependent intervals while preserving the
+            /// node ID lookup table. Internal drags use this so subsequent
+            /// pointer events can move a small selection without rebuilding
+            /// the full spatial index before every delta.
+            pub fn invalidateGeometry(self: *Index) void {
                 self.valid = false;
                 self.viewport_valid = false;
             }
@@ -314,7 +325,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             }
 
             pub fn nodeIndexForId(self: *const Index, id: u32) ?usize {
-                if (!self.valid) return null;
+                if (!self.id_lookup_valid) return null;
                 return self.nodeIndex(id);
             }
 
@@ -343,6 +354,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
 
             fn rebuild(self: *Index, nodes: []const Node, groups: []const Group, connections: []const Connection, geometry_key: u64, revision_mode: bool) PrepareResult {
                 self.valid = false;
+                self.id_lookup_valid = false;
                 self.viewport_valid = false;
                 self.node_count = nodes.len;
                 self.group_count = groups.len;
@@ -380,6 +392,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                     }
                 }
                 if (self.duplicate_node_id_count != 0) return self.prepareResult(false, false, false);
+                self.id_lookup_valid = true;
 
                 const group_bounds = self.workspace.group_bounds[0..groups.len];
                 const group_order = self.workspace.group_order[0..groups.len];
@@ -745,6 +758,12 @@ test "viewport index versioned mode rebuilds only on geometry revision" {
     try std.testing.expect(zoomed.geometry_reused);
     try std.testing.expect(!zoomed.viewport_reused);
     try std.testing.expectEqual(@as(u64, 2), index.summary().rebuild_count);
+
+    index.invalidateGeometry();
+    try std.testing.expect(!index.summary().valid);
+    try std.testing.expectEqual(@as(?usize, 1), index.nodeIndexForId(2));
+    index.invalidate();
+    try std.testing.expectEqual(@as(?usize, null), index.nodeIndexForId(2));
 }
 
 test "viewport index reports invalid graph and workspace capacity" {

@@ -16,6 +16,7 @@ const output_labels = [_][]const u8{ "value", "image" };
 const Options = struct {
     iterations: usize = default_iterations,
     max_paint_ns: ?f64 = null,
+    max_multi_drag_ns: ?f64 = null,
 };
 
 const Report = struct {
@@ -25,6 +26,8 @@ const Report = struct {
     paint_ns_per_frame: f64,
     owning_paint_ns_per_frame: f64,
     paint_speedup: f64,
+    multi_drag_ns_per_iteration: f64,
+    multi_drag_selection_count: usize,
     max_visible_nodes: usize,
     max_visible_connections: usize,
     max_draw_commands: usize,
@@ -203,16 +206,67 @@ fn run(init: std.process.Init, options: Options) !Report {
         .grid_color = zui.Color.transparent,
     }, 0);
     const overview_full_commands = out.items.len;
-    const summary = viewport_index.summary();
+    const paint_summary = viewport_index.summary();
+
+    const drag_selection_count = selected_ids.len;
+    var drag_before: [selected_ids.len][2]f32 = undefined;
+    for (&selected_ids, &drag_before, 0..) |*selected_id, *before, selection_index| {
+        const node_index = selection_index * (node_count / drag_selection_count);
+        selected_id.* = nodes[node_index].id;
+        before.* = nodes[node_index].pos;
+    }
+    state.selected_node_len = drag_selection_count;
+    state.selected_node_id = selected_ids[0];
+    state.zoom = 1;
+    state.pan = .{ 0, 0 };
+    viewport_index.invalidate();
+    const drag_revision: u64 = 2;
+    if (!viewport_index.prepareVersioned(nodes, &.{}, connections, viewport, state.pan, state.zoom, drag_revision).ready) return error.EditorDragViewportUnavailable;
+    const rebuilds_before_drag = viewport_index.summary().rebuild_count;
+    _ = state.beginNodeDrag(selected_ids[0]);
+    const drag_started = std.Io.Clock.awake.now(init.io);
+    for (0..options.iterations) |iteration| {
+        var move = zui.ElementEvent{ .mouse_move = .{
+            .x = @floatFromInt(iteration),
+            .y = @floatFromInt(iteration),
+            .dx = 1,
+            .dy = 0.5,
+        } };
+        if (!node_editor.handleEditorEvent(viewport, .{}, node_editor.Options(node_editor.State){
+            .state = &state,
+            .nodes = nodes,
+            .mutable_nodes = nodes,
+            .connections = connections,
+            .viewport_index = &viewport_index,
+            .geometry_revision = drag_revision,
+            .show_minimap = false,
+        }, &move)) return error.EditorMultiDragDidNotMove;
+    }
+    const drag_elapsed_ns: u64 = @intCast(drag_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+    const multi_drag_ns_per_iteration = @as(f64, @floatFromInt(drag_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+    _ = state.endDrag();
+    const drag_summary = viewport_index.summary();
+    var drag_correct = !drag_summary.valid and drag_summary.rebuild_count == rebuilds_before_drag;
+    for (selected_ids, drag_before) |selected_id, before| {
+        const node_index = viewport_index.nodeIndexForId(selected_id) orelse {
+            drag_correct = false;
+            continue;
+        };
+        drag_correct = drag_correct and nodes[node_index].pos[0] == before[0] + @as(f32, @floatFromInt(options.iterations)) and
+            nodes[node_index].pos[1] == before[1] + @as(f32, @floatFromInt(options.iterations)) * 0.5;
+    }
+    const unselected_before_x = (@as(f32, @floatFromInt(columns - 1)) - @as(f32, @floatFromInt(columns)) * 0.5) * 184.0;
+    drag_correct = drag_correct and nodes[node_count - 1].pos[0] == unselected_before_x;
     const draw_summary = draw_workspace.summary();
-    const quality_passed = connection_index == connection_count and summary.valid and summary.rebuild_count == 1 and
+    const quality_passed = connection_index == connection_count and paint_summary.valid and paint_summary.rebuild_count == 1 and
         max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
         max_visible_connections > 0 and max_visible_connections < connection_count / 10 and
         max_draw_commands < draw_command_capacity and owned_payload_count == 0 and fixed.end_index == 0 and
-        draw_summary.frame_count == options.iterations + 2 and draw_summary.borrowed_connection_count == summary.visible_connection_count and
+        draw_summary.frame_count == options.iterations + 2 and draw_summary.borrowed_connection_count == paint_summary.visible_connection_count and
         draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and
-        overview_adaptive_commands * 3 < overview_full_commands and checksum != 0;
+        overview_adaptive_commands * 3 < overview_full_commands and drag_correct and checksum != 0;
     const performance_passed = options.max_paint_ns == null or paint_ns_per_frame <= options.max_paint_ns.?;
+    const drag_performance_passed = options.max_multi_drag_ns == null or multi_drag_ns_per_iteration <= options.max_multi_drag_ns.?;
     return .{
         .node_count = node_count,
         .connection_count = connection_count,
@@ -220,6 +274,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         .paint_ns_per_frame = paint_ns_per_frame,
         .owning_paint_ns_per_frame = owning_paint_ns_per_frame,
         .paint_speedup = paint_speedup,
+        .multi_drag_ns_per_iteration = multi_drag_ns_per_iteration,
+        .multi_drag_selection_count = drag_selection_count,
         .max_visible_nodes = max_visible_nodes,
         .max_visible_connections = max_visible_connections,
         .max_draw_commands = max_draw_commands,
@@ -230,8 +286,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         .owning_payload_count = owning_payload_count,
         .checksum = checksum,
         .quality_passed = quality_passed,
-        .performance_passed = performance_passed,
-        .passed = quality_passed and performance_passed,
+        .performance_passed = performance_passed and drag_performance_passed,
+        .passed = quality_passed and performance_passed and drag_performance_passed,
     };
 }
 
@@ -245,6 +301,8 @@ fn parseOptions(init: std.process.Init) !Options {
             options.iterations = try std.fmt.parseInt(usize, arg["--iterations=".len..], 10)
         else if (std.mem.startsWith(u8, arg, "--max-paint-ns="))
             options.max_paint_ns = try std.fmt.parseFloat(f64, arg["--max-paint-ns=".len..])
+        else if (std.mem.startsWith(u8, arg, "--max-multi-drag-ns="))
+            options.max_multi_drag_ns = try std.fmt.parseFloat(f64, arg["--max-multi-drag-ns=".len..])
         else
             return error.InvalidArgument;
     }
@@ -257,8 +315,8 @@ fn printReport(io: std.Io, report: Report) !void {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
     try stdout.print(
-        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
-        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x multi_drag={d}@{d:.3}ns max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
     );
     try stdout.flush();
 }

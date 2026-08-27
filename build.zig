@@ -108,6 +108,7 @@ pub fn build(b: *std.Build) void {
     verify_editor_bench.addArgs(&.{
         "--iterations=1000",
         "--max-paint-ns=1000000",
+        "--max-multi-drag-ns=100000",
     });
     const verify_editor_step = b.step("verify-editor-performance", "Verify 10k-node indexed paint throughput and zero payload allocation");
     if (can_run_target) {

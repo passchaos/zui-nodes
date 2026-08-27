@@ -288,7 +288,7 @@ fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, be
     if (!changed) return;
     const geometry_changed = before.structural_drag or binding.state.dragging_node_id != null or binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.reconnecting_connection != null;
     if (geometry_changed) {
-        if (binding.viewport_index) |viewport_index| viewport_index.invalidate();
+        if (binding.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
     }
     const canvas_state = binding.canvas_state orelse return;
     if (before.transformChanged(binding.state)) {
@@ -369,6 +369,123 @@ test "node editor view drags mutable nodes" {
     try std.testing.expectEqual(@as(usize, 1), history.undo_len);
     try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
     try std.testing.expectEqual(before, nodes[1].pos);
+}
+
+test "node editor view drags multi-selection as one undo transaction" {
+    var selected = [_]u32{ 1, 2, 0, 0 };
+    var state = node_editor.State{
+        .selected_node_ids = &selected,
+        .selected_node_len = 2,
+        .selected_node_id = 2,
+        .zoom = 2,
+    };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -120, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 20, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 3, .title = "C", .pos = .{ 180, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const before = nodes;
+    var node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = .{.{ .from_id = 1, .to_id = 2 }};
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 640, .h = 280 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 640, .h = 280 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9417,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .history = &history,
+        .viewport_index = &viewport_index,
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 620 }, .height = .{ .px = 260 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 620, .h = 260 };
+    const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    const start = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+    var move1 = ElementEvent{ .mouse_move = .{ .x = start[0] + 20, .y = start[1] + 10, .dx = 20, .dy = 10 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move1, editor_node.paint_user_data));
+    var move2 = ElementEvent{ .mouse_move = .{ .x = start[0] + 28, .y = start[1] + 14, .dx = 8, .dy = 4 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move2, editor_node.paint_user_data));
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = start[0] + 28, .y = start[1] + 14 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expectEqual([2]f32{ before[0].pos[0] + 14, before[0].pos[1] + 7 }, nodes[0].pos);
+    try std.testing.expectEqual([2]f32{ before[1].pos[0] + 14, before[1].pos[1] + 7 }, nodes[1].pos);
+    try std.testing.expectEqual(before[2].pos, nodes[2].pos);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(!viewport_index.summary().valid);
+    try std.testing.expectEqual(@as(u64, 1), viewport_index.summary().rebuild_count);
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expectEqual(before[0].pos, nodes[0].pos);
+    try std.testing.expectEqual(before[1].pos, nodes[1].pos);
+    try std.testing.expectEqual(before[2].pos, nodes[2].pos);
+
+    const third_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[2]);
+    const third_point = [2]f32{ third_rect.x + third_rect.w * 0.5, third_rect.y + third_rect.h * 0.5 };
+    var third_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = third_point[0], .y = third_point[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &third_down, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?u32, 3), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedSelectionLen());
+}
+
+test "node editor multi-drag is atomic when history capacity is insufficient" {
+    const node_count = 17;
+    var selected = [_]u32{ 1, 2, 0, 0 };
+    var state = node_editor.State{
+        .selected_node_ids = &selected,
+        .selected_node_len = 2,
+        .selected_node_id = 2,
+    };
+    var nodes: [node_count]node_editor.Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{
+        .id = @intCast(index + 1),
+        .title = "node",
+        .pos = .{ @floatFromInt(index * 100), 0 },
+        .size = .{ .w = 80, .h = 60 },
+    };
+    const before = nodes;
+    var node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = undefined;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 420, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 420, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9418,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .history = &history,
+        .viewport_index = &viewport_index,
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 400 }, .height = .{ .px = 220 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 220 };
+    const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    const start = [2]f32{ node_rect.x + 20, node_rect.y + 20 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var move = ElementEvent{ .mouse_move = .{ .x = start[0] + 20, .y = start[1] + 10, .dx = 20, .dy = 10 } };
+    try std.testing.expect(!nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+    try std.testing.expectEqual(before, nodes);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+    try std.testing.expect(!state.interaction_history_pushed);
 }
 
 test "node editor view reports dirty canvas invalidation" {
