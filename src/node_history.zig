@@ -18,6 +18,8 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             connection_len: usize = 0,
             selected_node_ids: [64]u32 = .{0} ** 64,
             selected_node_len: usize = 0,
+            selected_connections: [64]Connection = undefined,
+            selected_connection_len: usize = 0,
             selected_node_id: ?u32 = null,
             selected_group_id: ?u32 = null,
             selected_connection: ?Connection = null,
@@ -30,6 +32,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             groups: []Group,
             connections: []Connection,
             selected_node_ids: []u32,
+            selected_connections: []Connection,
             slot_count: usize,
             node_capacity: usize,
             group_capacity: usize,
@@ -43,7 +46,8 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 const connection_len = std.math.mul(usize, self.slot_count, self.connection_capacity) catch return false;
                 const selection_len = std.math.mul(usize, self.slot_count, self.selection_capacity) catch return false;
                 return self.nodes.len >= node_len and self.groups.len >= group_len and
-                    self.connections.len >= connection_len and self.selected_node_ids.len >= selection_len;
+                    self.connections.len >= connection_len and self.selected_node_ids.len >= selection_len and
+                    self.selected_connections.len >= selection_len;
             }
         };
 
@@ -53,6 +57,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             groups: []Group,
             connections: []Connection,
             selected_node_ids: []u32,
+            selected_connections: []Connection,
             node_capacity: usize,
             group_capacity: usize,
             connection_capacity: usize,
@@ -70,12 +75,15 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 const connections = try allocator.alloc(Connection, try std.math.mul(usize, slot_count, connection_capacity));
                 errdefer allocator.free(connections);
                 const selected_node_ids = try allocator.alloc(u32, try std.math.mul(usize, slot_count, selection_capacity));
+                errdefer allocator.free(selected_node_ids);
+                const selected_connections = try allocator.alloc(Connection, try std.math.mul(usize, slot_count, selection_capacity));
                 return .{
                     .allocator = allocator,
                     .nodes = nodes,
                     .groups = groups,
                     .connections = connections,
                     .selected_node_ids = selected_node_ids,
+                    .selected_connections = selected_connections,
                     .node_capacity = node_capacity,
                     .group_capacity = group_capacity,
                     .connection_capacity = connection_capacity,
@@ -88,6 +96,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 self.allocator.free(self.groups);
                 self.allocator.free(self.connections);
                 self.allocator.free(self.selected_node_ids);
+                self.allocator.free(self.selected_connections);
                 self.* = undefined;
             }
 
@@ -97,6 +106,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                     .groups = self.groups,
                     .connections = self.connections,
                     .selected_node_ids = self.selected_node_ids,
+                    .selected_connections = self.selected_connections,
                     .slot_count = History.stack_capacity + 1,
                     .node_capacity = self.node_capacity,
                     .group_capacity = self.group_capacity,
@@ -118,6 +128,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 groups: [slot_count * group_capacity]Group = undefined,
                 connections: [slot_count * connection_capacity]Connection = undefined,
                 selected_node_ids: [slot_count * selection_capacity]u32 = .{0} ** (slot_count * selection_capacity),
+                selected_connections: [slot_count * selection_capacity]Connection = undefined,
 
                 pub fn workspace(self: *@This()) HistoryWorkspace {
                     return .{
@@ -125,6 +136,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                         .groups = &self.groups,
                         .connections = &self.connections,
                         .selected_node_ids = &self.selected_node_ids,
+                        .selected_connections = &self.selected_connections,
                         .slot_count = slot_count,
                         .node_capacity = node_capacity,
                         .group_capacity = group_capacity,
@@ -191,7 +203,8 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 const active_node_len = @min(node_len, nodes.len);
                 const active_connection_len = @min(connection_len, connections.len);
                 const selection_len = state.boundedSelectionLen();
-                if (!self.canCaptureCounts(active_node_len, groups.len, active_connection_len, selection_len)) {
+                const connection_selection_len = state.boundedConnectionSelectionLen();
+                if (!self.canCaptureCounts(active_node_len, groups.len, active_connection_len, selection_len, connection_selection_len)) {
                     snapshot.complete = false;
                     self.rejected_snapshot_count +%= 1;
                     return snapshot;
@@ -200,6 +213,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 snapshot.group_len = groups.len;
                 snapshot.connection_len = active_connection_len;
                 snapshot.selected_node_len = selection_len;
+                snapshot.selected_connection_len = connection_selection_len;
                 if (self.workspace) |workspace| {
                     const slot = self.availableStorageSlot() orelse {
                         snapshot.complete = false;
@@ -211,11 +225,16 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                     if (snapshot.group_len > 0) @memcpy(slotSlice(Group, workspace.groups, workspace.group_capacity, slot)[0..snapshot.group_len], groups);
                     if (snapshot.connection_len > 0) @memcpy(slotSlice(Connection, workspace.connections, workspace.connection_capacity, slot)[0..snapshot.connection_len], connections[0..snapshot.connection_len]);
                     if (snapshot.selected_node_len > 0) @memcpy(slotSlice(u32, workspace.selected_node_ids, workspace.selection_capacity, slot)[0..snapshot.selected_node_len], state.selected_node_ids[0..snapshot.selected_node_len]);
+                    if (snapshot.selected_connection_len > 0) {
+                        const destination = slotSlice(Connection, workspace.selected_connections, workspace.selection_capacity, slot)[0..snapshot.selected_connection_len];
+                        writeSelectedConnections(state, destination);
+                    }
                 } else {
                     if (snapshot.node_len > 0) @memcpy(snapshot.nodes[0..snapshot.node_len], nodes[0..snapshot.node_len]);
                     if (snapshot.group_len > 0) @memcpy(snapshot.groups[0..snapshot.group_len], groups);
                     if (snapshot.connection_len > 0) @memcpy(snapshot.connections[0..snapshot.connection_len], connections[0..snapshot.connection_len]);
                     if (snapshot.selected_node_len > 0) @memcpy(snapshot.selected_node_ids[0..snapshot.selected_node_len], state.selected_node_ids[0..snapshot.selected_node_len]);
+                    if (snapshot.selected_connection_len > 0) writeSelectedConnections(state, snapshot.selected_connections[0..snapshot.selected_connection_len]);
                 }
                 snapshot.selected_node_id = state.selected_node_id;
                 snapshot.selected_group_id = state.selected_group_id;
@@ -228,11 +247,15 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             }
 
             pub fn canCaptureWithGroups(self: *const History, state: anytype, nodes: []const Node, node_len: usize, groups: []const Group, connections: []const Connection, connection_len: usize) bool {
-                return self.canCaptureCounts(@min(node_len, nodes.len), groups.len, @min(connection_len, connections.len), state.boundedSelectionLen());
+                return self.canCaptureCounts(@min(node_len, nodes.len), groups.len, @min(connection_len, connections.len), state.boundedSelectionLen(), state.boundedConnectionSelectionLen());
             }
 
             pub fn supportsGraphCapacity(self: *const History, node_capacity: usize, group_capacity: usize, connection_capacity: usize, selection_capacity: usize) bool {
-                return self.canCaptureCounts(node_capacity, group_capacity, connection_capacity, selection_capacity);
+                return self.canCaptureCounts(node_capacity, group_capacity, connection_capacity, selection_capacity, selection_capacity);
+            }
+
+            pub fn supportsGraphCapacityWithSelections(self: *const History, node_capacity: usize, group_capacity: usize, connection_capacity: usize, node_selection_capacity: usize, connection_selection_capacity: usize) bool {
+                return self.canCaptureCounts(node_capacity, group_capacity, connection_capacity, node_selection_capacity, connection_selection_capacity);
             }
 
             pub fn pushBefore(self: *History, state: anytype, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize) bool {
@@ -259,7 +282,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             pub fn undo(self: *History, state: anytype, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize) bool {
                 if (self.undo_len == 0) return false;
                 const current = self.capture(state.*, nodes, node_len.*, connections, connection_len.*);
-                if (!current.complete or !self.canApplySnapshot(self.undo_stack[self.undo_len - 1], nodes.len, 0, connections.len, state.selected_node_ids.len)) return false;
+                if (!current.complete or !self.canApplySnapshot(self.undo_stack[self.undo_len - 1], nodes.len, 0, connections.len, state.selected_node_ids.len, connectionSelectionCapacity(state))) return false;
                 self.pushRedo(current);
                 self.undo_len -= 1;
                 return self.applyHistorySnapshot(state, nodes, node_len, connections, connection_len, self.undo_stack[self.undo_len]);
@@ -269,7 +292,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 if (self.undo_len == 0) return false;
                 const current_group_len = if (group_len) |len| @min(len.*, groups.len) else groups.len;
                 const current = self.captureWithGroups(state.*, nodes, node_len.*, groups[0..current_group_len], connections, connection_len.*);
-                if (!current.complete or !self.canApplySnapshot(self.undo_stack[self.undo_len - 1], nodes.len, groups.len, connections.len, state.selected_node_ids.len)) return false;
+                if (!current.complete or !self.canApplySnapshot(self.undo_stack[self.undo_len - 1], nodes.len, groups.len, connections.len, state.selected_node_ids.len, connectionSelectionCapacity(state))) return false;
                 self.pushRedo(current);
                 self.undo_len -= 1;
                 return self.applyHistorySnapshotWithGroups(state, nodes, node_len, groups, group_len, connections, connection_len, self.undo_stack[self.undo_len]);
@@ -278,7 +301,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             pub fn redo(self: *History, state: anytype, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize) bool {
                 if (self.redo_len == 0) return false;
                 const current = self.capture(state.*, nodes, node_len.*, connections, connection_len.*);
-                if (!current.complete or !self.canApplySnapshot(self.redo_stack[self.redo_len - 1], nodes.len, 0, connections.len, state.selected_node_ids.len)) return false;
+                if (!current.complete or !self.canApplySnapshot(self.redo_stack[self.redo_len - 1], nodes.len, 0, connections.len, state.selected_node_ids.len, connectionSelectionCapacity(state))) return false;
                 self.pushUndo(current);
                 self.redo_len -= 1;
                 return self.applyHistorySnapshot(state, nodes, node_len, connections, connection_len, self.redo_stack[self.redo_len]);
@@ -288,7 +311,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 if (self.redo_len == 0) return false;
                 const current_group_len = if (group_len) |len| @min(len.*, groups.len) else groups.len;
                 const current = self.captureWithGroups(state.*, nodes, node_len.*, groups[0..current_group_len], connections, connection_len.*);
-                if (!current.complete or !self.canApplySnapshot(self.redo_stack[self.redo_len - 1], nodes.len, groups.len, connections.len, state.selected_node_ids.len)) return false;
+                if (!current.complete or !self.canApplySnapshot(self.redo_stack[self.redo_len - 1], nodes.len, groups.len, connections.len, state.selected_node_ids.len, connectionSelectionCapacity(state))) return false;
                 self.pushUndo(current);
                 self.redo_len -= 1;
                 return self.applyHistorySnapshotWithGroups(state, nodes, node_len, groups, group_len, connections, connection_len, self.redo_stack[self.redo_len]);
@@ -303,11 +326,19 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             }
 
             pub fn canUndoFor(self: *const History, node_capacity: usize, group_capacity: usize, connection_capacity: usize, selection_capacity: usize) bool {
-                return self.undo_len > 0 and self.canApplySnapshot(self.undo_stack[self.undo_len - 1], node_capacity, group_capacity, connection_capacity, selection_capacity);
+                return self.canUndoForSelections(node_capacity, group_capacity, connection_capacity, selection_capacity, selection_capacity);
             }
 
             pub fn canRedoFor(self: *const History, node_capacity: usize, group_capacity: usize, connection_capacity: usize, selection_capacity: usize) bool {
-                return self.redo_len > 0 and self.canApplySnapshot(self.redo_stack[self.redo_len - 1], node_capacity, group_capacity, connection_capacity, selection_capacity);
+                return self.canRedoForSelections(node_capacity, group_capacity, connection_capacity, selection_capacity, selection_capacity);
+            }
+
+            pub fn canUndoForSelections(self: *const History, node_capacity: usize, group_capacity: usize, connection_capacity: usize, node_selection_capacity: usize, connection_selection_capacity: usize) bool {
+                return self.undo_len > 0 and self.canApplySnapshot(self.undo_stack[self.undo_len - 1], node_capacity, group_capacity, connection_capacity, node_selection_capacity, connection_selection_capacity);
+            }
+
+            pub fn canRedoForSelections(self: *const History, node_capacity: usize, group_capacity: usize, connection_capacity: usize, node_selection_capacity: usize, connection_selection_capacity: usize) bool {
+                return self.redo_len > 0 and self.canApplySnapshot(self.redo_stack[self.redo_len - 1], node_capacity, group_capacity, connection_capacity, node_selection_capacity, connection_selection_capacity);
             }
 
             pub fn summary(self: *const History) HistorySummary {
@@ -349,9 +380,9 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 self.redo_len = 0;
             }
 
-            fn canCaptureCounts(self: *const History, node_len: usize, group_len: usize, connection_len: usize, selection_len: usize) bool {
-                if (self.workspace) |workspace| return workspace.valid() and node_len <= workspace.node_capacity and group_len <= workspace.group_capacity and connection_len <= workspace.connection_capacity and selection_len <= workspace.selection_capacity;
-                return node_len <= 16 and group_len <= 16 and connection_len <= 32 and selection_len <= 64;
+            fn canCaptureCounts(self: *const History, node_len: usize, group_len: usize, connection_len: usize, selection_len: usize, connection_selection_len: usize) bool {
+                if (self.workspace) |workspace| return workspace.valid() and node_len <= workspace.node_capacity and group_len <= workspace.group_capacity and connection_len <= workspace.connection_capacity and selection_len <= workspace.selection_capacity and connection_selection_len <= workspace.selection_capacity;
+                return node_len <= 16 and group_len <= 16 and connection_len <= 32 and selection_len <= 64 and connection_selection_len <= 64;
             }
 
             fn availableStorageSlot(self: *const History) ?usize {
@@ -372,8 +403,8 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 return null;
             }
 
-            fn canApplySnapshot(_: *const History, snapshot: HistorySnapshot, node_capacity: usize, group_capacity: usize, connection_capacity: usize, selection_capacity: usize) bool {
-                return snapshot.complete and snapshot.node_len <= node_capacity and snapshot.group_len <= group_capacity and snapshot.connection_len <= connection_capacity and snapshot.selected_node_len <= selection_capacity;
+            fn canApplySnapshot(_: *const History, snapshot: HistorySnapshot, node_capacity: usize, group_capacity: usize, connection_capacity: usize, node_selection_capacity: usize, connection_selection_capacity: usize) bool {
+                return snapshot.complete and snapshot.node_len <= node_capacity and snapshot.group_len <= group_capacity and snapshot.connection_len <= connection_capacity and snapshot.selected_node_len <= node_selection_capacity and snapshot.selected_connection_len <= connection_selection_capacity;
             }
 
             fn applyHistorySnapshot(self: *History, state: anytype, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, snapshot: HistorySnapshot) bool {
@@ -400,7 +431,6 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 _ = state.clearSelection();
                 state.selected_node_id = snapshot.selected_node_id;
                 state.selected_group_id = snapshot.selected_group_id;
-                state.selected_connection = snapshot.selected_connection;
                 state.selected_node_len = @min(snapshot.selected_node_len, state.selected_node_ids.len);
                 if (state.selected_node_len > 0) {
                     if (snapshot.storage_slot) |slot| {
@@ -415,6 +445,17 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                         state.selected_node_len = 1;
                     }
                 }
+                state.selected_connection_len = 0;
+                if (snapshot.selected_connection_len > 0 and state.selected_connections.len > 0) {
+                    state.selected_connection_len = snapshot.selected_connection_len;
+                    if (snapshot.storage_slot) |slot| {
+                        const workspace = self.workspace orelse return false;
+                        @memcpy(state.selected_connections[0..state.selected_connection_len], slotSlice(Connection, workspace.selected_connections, workspace.selection_capacity, slot)[0..state.selected_connection_len]);
+                    } else {
+                        @memcpy(state.selected_connections[0..state.selected_connection_len], snapshot.selected_connections[0..state.selected_connection_len]);
+                    }
+                }
+                state.selected_connection = snapshot.selected_connection;
                 resetInteractionState(state);
                 return true;
             }
@@ -447,6 +488,16 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.hover_output_node_id = null;
             state.hover_connection = null;
             state.box_selecting = false;
+        }
+
+        fn writeSelectedConnections(state: anytype, destination: []Connection) void {
+            for (destination, 0..) |*selected, index| {
+                selected.* = state.connectionSelectionAt(index).?;
+            }
+        }
+
+        fn connectionSelectionCapacity(state: anytype) usize {
+            return if (state.selected_connections.len > 0) state.selected_connections.len else 1;
         }
 
         fn slotSlice(comptime T: type, storage: []T, capacity: usize, slot: usize) []T {

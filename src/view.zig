@@ -1003,6 +1003,89 @@ test "node editor view creates connections from output to input ports" {
     try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
 }
 
+test "node editor view shift-click toggles multiple connections and paints all selected" {
+    var selected_nodes: [4]u32 = .{0} ** 4;
+    var selected_connections: [4]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -180, -70 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 2, .title = "B", .pos = .{ -180, 70 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 3, .title = "C", .pos = .{ 100, -70 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 4, .title = "D", .pos = .{ 100, 70 }, .size = .{ .w = 80, .h = 40 } },
+    };
+    const connections = [_]node_editor.Connection{
+        .{ .from_id = 1, .to_id = 3 },
+        .{ .from_id = 2, .to_id = 4 },
+    };
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 520, .h = 300 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 520, .h = 300 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9424,
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .show_minimap = false,
+        .grid_color = Color.transparent,
+        .style = .{ .width = .{ .px = 500 }, .height = .{ .px = 280 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 500, .h = 280 };
+
+    const first_path = node_editor.connectionPathForPoints(
+        node_editor.outputPortPosition(editor_node.rect, state, nodes[0]),
+        node_editor.inputPortPosition(editor_node.rect, state, nodes[2]),
+    );
+    const second_path = node_editor.connectionPathForPoints(
+        node_editor.outputPortPosition(editor_node.rect, state, nodes[1]),
+        node_editor.inputPortPosition(editor_node.rect, state, nodes[3]),
+    );
+    const first_point = [2]f32{ (first_path.start[0] + first_path.end[0]) * 0.5, (first_path.start[1] + first_path.end[1]) * 0.5 };
+    const second_point = [2]f32{ (second_path.start[0] + second_path.end[0]) * 0.5, (second_path.start[1] + second_path.end[1]) * 0.5 };
+    var first_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = first_point[0], .y = first_point[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &first_down, editor_node.paint_user_data));
+    editor_node.input_shift_down = true;
+    var second_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = second_point[0], .y = second_point[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &second_down, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(connections[0]));
+    try std.testing.expect(state.isConnectionSelected(connections[1]));
+    editor_node.input_shift_down = false;
+    const first_output = node_editor.outputPortPosition(editor_node.rect, state, nodes[0]);
+    var reconnect_first = ElementEvent{ .mouse_down = .{ .button = .left, .x = first_output[0], .y = first_output[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &reconnect_first, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.reconnecting_connection);
+    try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    _ = state.endDrag();
+
+    editor_node.input_shift_down = false;
+    var first_right = ElementEvent{ .mouse_down = .{ .button = .right, .x = first_point[0], .y = first_point[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &first_right, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
+
+    var out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (out.items) |command| zui.ui_draw_cmd.freePayload(std.testing.allocator, command);
+        out.deinit(std.testing.allocator);
+    }
+    _ = try node_editor.appendNodeEditor(std.testing.allocator, &out, editor_node.rect, @as(*Binding, @ptrCast(@alignCast(editor_node.paint_user_data.?))).editor(), 0);
+    var selected_strokes: usize = 0;
+    for (out.items) |command| switch (command) {
+        .stroke_path => |stroke| if (stroke.style.width == 3.25) {
+            selected_strokes += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), selected_strokes);
+
+    editor_node.input_shift_down = true;
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &second_down, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(connections[0]));
+    try std.testing.expect(!state.isConnectionSelected(connections[1]));
+}
+
 test "node editor view retains borrowed connection commands across rebuilds" {
     var selected: [4]u32 = .{0} ** 4;
     var state = node_editor.State{ .selected_node_ids = &selected };

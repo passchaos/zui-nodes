@@ -35,7 +35,7 @@ pub const node_editor_context_menu_capacity: usize = 40;
 
 pub const node_editor_selection_commands = [_]Command{
     .{ .id = SelectionCommand.rename.commandId(), .title = "Rename Selected Node", .description = "Begin renaming the active node selection", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "Enter" },
-    .{ .id = SelectionCommand.delete.commandId(), .title = "Delete Selected Nodes", .description = "Delete selected nodes or the selected node link", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "Delete", .destructive = true },
+    .{ .id = SelectionCommand.delete.commandId(), .title = "Delete Selection", .description = "Delete selected nodes and node links", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "Delete", .destructive = true },
     .{ .id = SelectionCommand.duplicate.commandId(), .title = "Duplicate Selected Nodes", .description = "Duplicate selected nodes and their internal links", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "Ctrl+D", .pinned = true },
     .{ .id = SelectionCommand.focus.commandId(), .title = "Focus Selection", .description = "Focus the active node selection", .category = node_editor_selection_category, .panel_role = .viewport, .default_shortcut = "F" },
 };
@@ -59,7 +59,7 @@ pub const node_editor_commands = [_]Command{
     .{ .id = NodeEditorCommand.ungroup_selected.commandId(), .title = "Ungroup Selected Nodes", .description = "Remove the selected visual node group", .category = node_editor_command_category, .panel_role = .viewport, .default_shortcut = "Ctrl+Shift+G" },
     .{ .id = NodeEditorCommand.select_group_contents.commandId(), .title = "Select Group Contents", .description = "Select all nodes contained by the active group", .category = node_editor_command_category, .panel_role = .viewport },
     .{ .id = NodeEditorCommand.fit_group_to_selection.commandId(), .title = "Fit Group to Selection", .description = "Resize the selected group to wrap selected nodes", .category = node_editor_command_category, .panel_role = .viewport },
-    .{ .id = NodeEditorCommand.disconnect_selected_link.commandId(), .title = "Disconnect Selected Link", .description = "Remove the selected node link", .category = node_editor_command_category, .panel_role = .viewport, .destructive = true },
+    .{ .id = NodeEditorCommand.disconnect_selected_link.commandId(), .title = "Disconnect Selected Links", .description = "Remove all selected node links", .category = node_editor_command_category, .panel_role = .viewport, .destructive = true },
     .{ .id = NodeEditorCommand.disconnect_selected_inputs.commandId(), .title = "Disconnect Selected Inputs", .description = "Remove incoming links for selected nodes", .category = node_editor_command_category, .panel_role = .viewport, .destructive = true },
     .{ .id = NodeEditorCommand.disconnect_selected_outputs.commandId(), .title = "Disconnect Selected Outputs", .description = "Remove outgoing links for selected nodes", .category = node_editor_command_category, .panel_role = .viewport, .destructive = true },
     .{ .id = NodeEditorCommand.disconnect_selected_links.commandId(), .title = "Disconnect Selected Node Links", .description = "Remove all links attached to selected nodes", .category = node_editor_command_category, .panel_role = .viewport, .destructive = true },

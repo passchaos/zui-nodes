@@ -225,6 +225,7 @@ pub const Clipboard = struct {
 
 pub const InspectorSnapshot = struct {
     selected_node_count: usize = 0,
+    selected_connection_count: usize = 0,
     selected_group_id: ?u32 = null,
     selected_connection: ?Connection = null,
     title: []const u8 = "Canvas",
@@ -235,7 +236,7 @@ pub const InspectorSnapshot = struct {
     outgoing_links: usize = 0,
 
     pub fn hasSelection(self: InspectorSnapshot) bool {
-        return self.selected_node_count > 0 or self.selected_group_id != null or self.selected_connection != null;
+        return self.selected_node_count > 0 or self.selected_group_id != null or self.selected_connection_count > 0 or self.selected_connection != null;
     }
 };
 
@@ -960,6 +961,46 @@ pub fn connectionEndpointsEqual(a: Connection, b: Connection) bool {
     return a.from_id == b.from_id and a.to_id == b.to_id and a.from_port == b.from_port and a.to_port == b.to_port;
 }
 
+const ConnectionSelectionFilter = struct {
+    bits: [16]u64 = .{0} ** 16,
+
+    fn add(self: *ConnectionSelectionFilter, connection: Connection) void {
+        const hash = connectionSelectionHash(connection);
+        self.setBit(hash);
+        self.setBit(std.math.rotr(u64, hash, 29));
+    }
+
+    fn mayContain(self: ConnectionSelectionFilter, connection: Connection) bool {
+        const hash = connectionSelectionHash(connection);
+        return self.hasBit(hash) and self.hasBit(std.math.rotr(u64, hash, 29));
+    }
+
+    fn setBit(self: *ConnectionSelectionFilter, hash: u64) void {
+        self.bits[@as(usize, @intCast((hash >> 6) & 15))] |= @as(u64, 1) << @intCast(hash & 63);
+    }
+
+    fn hasBit(self: ConnectionSelectionFilter, hash: u64) bool {
+        return self.bits[@as(usize, @intCast((hash >> 6) & 15))] & (@as(u64, 1) << @intCast(hash & 63)) != 0;
+    }
+};
+
+fn connectionSelectionHash(connection: Connection) u64 {
+    var value = @as(u64, connection.from_id) << 32 | @as(u64, connection.to_id);
+    value ^= @as(u64, connection.from_port) << 8 | @as(u64, connection.to_port);
+    value ^= value >> 30;
+    value *%= 0xbf58_476d_1ce4_e5b9;
+    value ^= value >> 27;
+    value *%= 0x94d0_49bb_1331_11eb;
+    return value ^ (value >> 31);
+}
+
+fn connectionEndpointMatches(connection: Connection, endpoint: ConnectionEnd, node_id: u32, port: u8) bool {
+    return switch (endpoint) {
+        .from => connection.from_id == node_id and connection.from_port == port,
+        .to => connection.to_id == node_id and connection.to_port == port,
+    };
+}
+
 pub fn nodeById(nodes: []const Node, id: u32) ?Node {
     for (nodes) |node| if (node.id == id) return node;
     return null;
@@ -1256,6 +1297,10 @@ pub const State = struct {
     selected_node_ids: []u32 = &.{},
     selected_node_len: usize = 0,
     selected_group_id: ?u32 = null,
+    /// Caller-owned storage for multi-connection selection. When omitted,
+    /// `selected_connection` preserves the legacy single-selection behavior.
+    selected_connections: []Connection = &.{},
+    selected_connection_len: usize = 0,
     selected_connection: ?Connection = null,
     hover_node_id: ?u32 = null,
     hover_group_id: ?u32 = null,
@@ -1335,7 +1380,7 @@ pub const State = struct {
         const preserve_multi_selection = self.boundedSelectionLen() > 1 and self.isNodeSelected(id);
         const changed = self.dragging_node_id == null or self.dragging_node_id.? != id or
             self.selected_node_id == null or self.selected_node_id.? != id or
-            self.selected_group_id != null or self.selected_connection != null or
+            self.selected_group_id != null or self.boundedConnectionSelectionLen() != 0 or
             (!preserve_multi_selection and (self.boundedSelectionLen() != 1 or !self.isNodeSelected(id)));
         self.dragging_node_id = id;
         self.dragging_group_id = null;
@@ -1346,7 +1391,7 @@ pub const State = struct {
         if (preserve_multi_selection) {
             self.selected_node_id = id;
             self.selected_group_id = null;
-            self.selected_connection = null;
+            _ = self.clearConnectionSelection();
         } else {
             _ = self.setSingleSelection(id);
         }
@@ -1377,7 +1422,7 @@ pub const State = struct {
         const bounded_len = self.boundedSelectionLen();
         const changed = self.selected_node_id == null or self.selected_node_id.? != id or
             (self.selected_node_ids.len > 0 and (bounded_len != 1 or self.selected_node_ids[0] != id)) or
-            (self.selected_node_ids.len == 0 and self.selected_node_len != 0);
+            (self.selected_node_ids.len == 0 and self.selected_node_len != 0) or self.boundedConnectionSelectionLen() != 0;
         self.selected_node_id = id;
         if (self.selected_node_ids.len > 0) {
             self.selected_node_ids[0] = id;
@@ -1386,7 +1431,7 @@ pub const State = struct {
             self.selected_node_len = 0;
         }
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         return changed;
     }
 
@@ -1429,10 +1474,10 @@ pub const State = struct {
 
     pub fn setGroupSelection(self: *State, id: u32) bool {
         const changed = self.selected_group_id == null or self.selected_group_id.? != id or
-            self.selected_node_id != null or self.selected_node_len != 0 or self.selected_connection != null;
+            self.selected_node_id != null or self.selected_node_len != 0 or self.boundedConnectionSelectionLen() != 0;
         _ = self.clearNodeSelection();
         self.selected_group_id = id;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         return changed;
     }
 
@@ -1468,16 +1513,16 @@ pub const State = struct {
             self.addNodeToSelection(id);
         }
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         return self.isNodeSelected(id) != was_selected;
     }
 
     pub fn clearSelection(self: *State) bool {
-        const changed = self.selected_node_id != null or self.selected_node_len != 0 or self.selected_group_id != null or self.selected_connection != null;
+        const changed = self.selected_node_id != null or self.selected_node_len != 0 or self.selected_group_id != null or self.boundedConnectionSelectionLen() != 0;
         self.selected_node_id = null;
         self.selected_node_len = 0;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         return changed;
     }
 
@@ -1489,7 +1534,7 @@ pub const State = struct {
     }
 
     pub fn hasSelection(self: *const State) bool {
-        return self.selected_node_id != null or self.boundedSelectionLen() != 0 or self.selected_group_id != null or self.selected_connection != null;
+        return self.selected_node_id != null or self.boundedSelectionLen() != 0 or self.selected_group_id != null or self.boundedConnectionSelectionLen() != 0;
     }
 
     pub fn selectAllNodes(self: *State, nodes: []const Node, node_len: usize) bool {
@@ -1498,7 +1543,7 @@ pub const State = struct {
         const before_id = self.selected_node_id;
         const before_len = self.selected_node_len;
         const before_group = self.selected_group_id;
-        const before_connection = self.selected_connection;
+        const before_connection_count = self.boundedConnectionSelectionLen();
         var before_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| before_hash = before_hash *% 16777619 +% id;
 
@@ -1510,16 +1555,23 @@ pub const State = struct {
         }
         self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else nodes[count - 1].id;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         self.box_selecting = false;
 
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
         return before_id != self.selected_node_id or before_len != self.selected_node_len or before_group != self.selected_group_id or
-            !optionalConnectionEqual(before_connection, self.selected_connection) or before_hash != after_hash;
+            before_connection_count != 0 or before_hash != after_hash;
     }
 
     pub fn isConnectionSelected(self: *const State, connection: Connection) bool {
+        const stored = self.storedConnectionSelectionLen();
+        if (stored > 0) {
+            for (self.selected_connections[0..stored]) |selected| {
+                if (State.connectionEndpointsEqual(selected, connection)) return true;
+            }
+            return false;
+        }
         const selected = self.selected_connection orelse return false;
         return State.connectionEndpointsEqual(selected, connection);
     }
@@ -1530,6 +1582,22 @@ pub const State = struct {
     }
 
     pub fn setConnectionSelection(self: *State, connection: Connection) bool {
+        const changed = self.boundedConnectionSelectionLen() != 1 or !self.isConnectionSelected(connection) or
+            self.selected_node_id != null or self.selected_node_len != 0 or self.selected_group_id != null;
+        _ = self.clearNodeSelection();
+        self.selected_group_id = null;
+        self.selected_connection = connection;
+        if (self.selected_connections.len > 0) {
+            self.selected_connections[0] = connection;
+            self.selected_connection_len = 1;
+        } else {
+            self.selected_connection_len = 0;
+        }
+        return changed;
+    }
+
+    pub fn setConnectionSelectionPrimary(self: *State, connection: Connection) bool {
+        if (!self.isConnectionSelected(connection)) return self.setConnectionSelection(connection);
         const changed = self.selected_connection == null or !State.connectionEndpointsEqual(self.selected_connection.?, connection) or
             self.selected_node_id != null or self.selected_node_len != 0 or self.selected_group_id != null;
         _ = self.clearNodeSelection();
@@ -1539,9 +1607,105 @@ pub const State = struct {
     }
 
     pub fn clearConnectionSelection(self: *State) bool {
-        if (self.selected_connection == null) return false;
+        const changed = self.selected_connection != null or self.selected_connection_len != 0;
         self.selected_connection = null;
+        self.selected_connection_len = 0;
+        return changed;
+    }
+
+    pub fn boundedConnectionSelectionLen(self: *const State) usize {
+        if (self.selected_connection == null) return 0;
+        const stored = self.storedConnectionSelectionLen();
+        return if (stored > 0) stored else @intFromBool(self.selected_connection != null);
+    }
+
+    pub fn connectionSelectionAt(self: *const State, index: usize) ?Connection {
+        const stored = self.storedConnectionSelectionLen();
+        if (stored > 0) return if (index < stored) self.selected_connections[index] else null;
+        return if (index == 0) self.selected_connection else null;
+    }
+
+    pub fn storedConnectionSelection(self: *const State) []const Connection {
+        return self.selected_connections[0..self.storedConnectionSelectionLen()];
+    }
+
+    fn connectionSelectionFilter(self: *const State) ConnectionSelectionFilter {
+        var filter = ConnectionSelectionFilter{};
+        var index: usize = 0;
+        while (index < self.boundedConnectionSelectionLen()) : (index += 1) {
+            if (self.connectionSelectionAt(index)) |connection| filter.add(connection);
+        }
+        return filter;
+    }
+
+    fn isConnectionSelectedFiltered(self: *const State, filter: ConnectionSelectionFilter, connection: Connection) bool {
+        return filter.mayContain(connection) and self.isConnectionSelected(connection);
+    }
+
+    pub fn toggleConnectionSelection(self: *State, connection: Connection) bool {
+        if (self.selected_connection == null) self.selected_connection_len = 0;
+        const was_selected = self.isConnectionSelected(connection);
+        if (!was_selected and self.selected_connections.len == 0) return self.setConnectionSelection(connection);
+        const stored_before = self.storedConnectionSelectionLen();
+        const needed = if (!was_selected and stored_before == 0 and self.selected_connection != null) @as(usize, 2) else stored_before + @intFromBool(!was_selected);
+        if (needed > self.selected_connections.len) return false;
+
+        _ = self.clearNodeSelection();
+        self.selected_group_id = null;
+        if (!was_selected) {
+            if (self.storedConnectionSelectionLen() == 0) {
+                if (self.selected_connection) |primary| {
+                    self.selected_connections[0] = primary;
+                    self.selected_connection_len = 1;
+                }
+            }
+            self.selected_connections[self.selected_connection_len] = connection;
+            self.selected_connection_len += 1;
+            self.selected_connection = connection;
+            return true;
+        }
+
+        const stored = self.storedConnectionSelectionLen();
+        if (stored == 0) return self.clearConnectionSelection();
+        const primary_removed = self.selected_connection != null and State.connectionEndpointsEqual(self.selected_connection.?, connection);
+        var write: usize = 0;
+        for (self.selected_connections[0..stored]) |selected| {
+            if (State.connectionEndpointsEqual(selected, connection)) continue;
+            if (write < self.selected_connections.len) self.selected_connections[write] = selected;
+            write += 1;
+        }
+        self.selected_connection_len = write;
+        if (primary_removed or self.selected_connection == null) self.selected_connection = if (write > 0) self.selected_connections[write - 1] else null;
         return true;
+    }
+
+    fn storedConnectionSelectionLen(self: *const State) usize {
+        const primary = self.selected_connection orelse return 0;
+        const len = @min(self.selected_connection_len, self.selected_connections.len);
+        for (self.selected_connections[0..len]) |selected| {
+            if (State.connectionEndpointsEqual(primary, selected)) return len;
+        }
+        return 0;
+    }
+
+    fn replaceSelectedConnection(self: *State, previous: Connection, replacement: Connection) void {
+        for (self.selected_connections[0..self.storedConnectionSelectionLen()]) |*selected| {
+            if (State.connectionEndpointsEqual(selected.*, previous)) selected.* = replacement;
+        }
+        self.selected_connection = replacement;
+    }
+
+    fn selectedConnectionAtEndpoint(self: *const State, endpoint: ConnectionEnd, node_id: u32, port: u8) ?Connection {
+        if (self.selected_connection) |primary| {
+            if (connectionEndpointMatches(primary, endpoint, node_id, port)) return primary;
+        }
+        var index = self.storedConnectionSelectionLen();
+        while (index > 0) {
+            index -= 1;
+            const connection = self.selected_connections[index];
+            if (connectionEndpointMatches(connection, endpoint, node_id, port)) return connection;
+        }
+        return null;
     }
 
     pub fn canHandleSelectionCommand(self: State, command: SelectionCommand) bool {
@@ -1670,7 +1834,7 @@ pub const State = struct {
         self.selected_node_len = 0;
         self.selected_node_id = null;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         for (nodes[active_node_len..insert_index]) |node| {
             if (self.selected_node_len < self.selected_node_ids.len) {
                 self.selected_node_ids[self.selected_node_len] = node.id;
@@ -1713,14 +1877,26 @@ pub const State = struct {
 
     pub fn deleteSelectedNodesAndConnections(self: *State, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize) bool {
         const removed_ids = self.selectedNodeIdsInStorage(nodes, node_len.*);
-        const selected_connection_before = self.selected_connection;
-        const nodes_changed = self.deleteSelectedNodes(nodes, node_len);
-        var connections_changed = removeConnectionsTouchingIds(connections, connection_len, removed_ids.ids[0..removed_ids.len]);
-        if (selected_connection_before) |connection| {
-            connections_changed = removeConnection(connections, connection_len, connection) or connections_changed;
+        const count = @min(connection_len.*, connections.len);
+        connection_len.* = count;
+        var write: usize = 0;
+        var connections_changed = false;
+        const selected_filter = self.connectionSelectionFilter();
+        for (connections[0..count], 0..) |connection, read| {
+            if (idInList(removed_ids.ids[0..removed_ids.len], connection.from_id) or
+                idInList(removed_ids.ids[0..removed_ids.len], connection.to_id) or
+                self.isConnectionSelectedFiltered(selected_filter, connection))
+            {
+                connections_changed = true;
+                continue;
+            }
+            if (write != read) connections[write] = connection;
+            write += 1;
         }
+        connection_len.* = write;
+        const nodes_changed = self.deleteSelectedNodes(nodes, node_len);
         if (connections_changed) {
-            self.selected_connection = null;
+            _ = self.clearConnectionSelection();
             self.hover_connection = null;
         }
         return nodes_changed or connections_changed;
@@ -1743,7 +1919,7 @@ pub const State = struct {
         }
         self.selected_node_len = 0;
         self.selected_node_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         for (nodes[count..append_index]) |duplicate| {
             if (self.selected_node_len < self.selected_node_ids.len) {
                 self.selected_node_ids[self.selected_node_len] = duplicate.id;
@@ -1805,8 +1981,11 @@ pub const State = struct {
     }
 
     pub fn selectedConnectionExists(self: *const State, connections: []const Connection, connection_len: usize) bool {
-        const selected = self.selected_connection orelse return false;
-        return connectionExists(connections[0..@min(connection_len, connections.len)], selected);
+        const filter = self.connectionSelectionFilter();
+        for (connections[0..@min(connection_len, connections.len)]) |connection| {
+            if (self.isConnectionSelectedFiltered(filter, connection)) return true;
+        }
+        return false;
     }
 
     pub fn selectedGraphBounds(self: *const State, nodes: []const Node, node_len: usize, groups: []const Group) ?Rect {
@@ -1823,10 +2002,13 @@ pub const State = struct {
                 }
             }
         }
-        if (self.selected_connection) |selected| {
-            for (nodes[0..count]) |node| {
+        for (nodes[0..count]) |node| {
+            var connection_index: usize = 0;
+            while (connection_index < self.boundedConnectionSelectionLen()) : (connection_index += 1) {
+                const selected = self.connectionSelectionAt(connection_index) orelse continue;
                 if (node.id == selected.from_id or node.id == selected.to_id) {
                     includeBounds(&bounds, nodeGraphRect(node));
+                    break;
                 }
             }
         }
@@ -1940,7 +2122,7 @@ pub const State = struct {
         }
         self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else null;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
         return before_len != self.selected_node_len or before_id != self.selected_node_id or before_hash != after_hash;
@@ -1967,10 +2149,23 @@ pub const State = struct {
     }
 
     pub fn disconnectSelectedLink(self: *State, connections: []Connection, connection_len: *usize) bool {
-        const selected = self.selected_connection orelse return false;
-        const changed = removeConnection(connections, connection_len, selected);
+        if (self.boundedConnectionSelectionLen() == 0) return false;
+        const count = @min(connection_len.*, connections.len);
+        connection_len.* = count;
+        var write: usize = 0;
+        var changed = false;
+        const selected_filter = self.connectionSelectionFilter();
+        for (connections[0..count], 0..) |connection, read| {
+            if (self.isConnectionSelectedFiltered(selected_filter, connection)) {
+                changed = true;
+                continue;
+            }
+            if (write != read) connections[write] = connection;
+            write += 1;
+        }
+        connection_len.* = write;
         if (changed) {
-            self.selected_connection = null;
+            _ = self.clearConnectionSelection();
             self.hover_connection = null;
         }
         return changed;
@@ -1999,7 +2194,7 @@ pub const State = struct {
         }
         connection_len.* = write;
         if (changed) {
-            self.selected_connection = null;
+            _ = self.clearConnectionSelection();
             self.hover_connection = null;
         }
         return changed;
@@ -2061,7 +2256,7 @@ pub const State = struct {
         }
         self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else null;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
         return before_len != self.selected_node_len or before_id != self.selected_node_id or before_hash != after_hash;
@@ -2094,7 +2289,7 @@ pub const State = struct {
         else
             lastReachableNodeId(topology, active_nodes);
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
 
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
@@ -2129,7 +2324,7 @@ pub const State = struct {
         }
         connection_len.* = write;
         if (changed) {
-            self.selected_connection = null;
+            _ = self.clearConnectionSelection();
             self.hover_connection = null;
         }
         return changed;
@@ -2154,7 +2349,7 @@ pub const State = struct {
         }
         self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else null;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
         return before_len != self.selected_node_len or before_id != self.selected_node_id or before_hash != after_hash;
@@ -2243,7 +2438,7 @@ pub const State = struct {
         self.selected_node_id = null;
         self.selected_node_len = 0;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
         for (nodes[active_node_len..append_node]) |node| {
             if (self.selected_node_len < self.selected_node_ids.len) {
                 self.selected_node_ids[self.selected_node_len] = node.id;
@@ -2295,6 +2490,7 @@ pub const State = struct {
         const count = @min(node_len, nodes.len);
         var snapshot = InspectorSnapshot{
             .selected_node_count = self.selectedNodeStorageCount(nodes, count),
+            .selected_connection_count = self.boundedConnectionSelectionLen(),
             .selected_group_id = self.selected_group_id,
             .selected_connection = self.selected_connection,
             .bounds = self.selectedGraphBounds(nodes, count, groups[0..@min(group_len, groups.len)]),
@@ -2311,7 +2507,9 @@ pub const State = struct {
             snapshot.title = "Multiple Nodes";
         } else if (self.selected_group_id != null) {
             snapshot.title = "Group";
-        } else if (self.selected_connection != null) {
+        } else if (snapshot.selected_connection_count > 1) {
+            snapshot.title = "Multiple Connections";
+        } else if (snapshot.selected_connection_count == 1) {
             snapshot.title = "Connection";
         }
         for (connections[0..@min(connection_len, connections.len)]) |connection| {
@@ -2444,13 +2642,14 @@ pub const State = struct {
         var out = SelectedNodeIdList{};
         if (command != .select_upstream_nodes and command != .select_downstream_nodes) return out;
 
-        if (self.selected_connection) |connection| {
-            const seed_id = switch (command) {
+        var selected_connection_index: usize = 0;
+        while (selected_connection_index < self.boundedConnectionSelectionLen()) : (selected_connection_index += 1) {
+            const connection = self.connectionSelectionAt(selected_connection_index) orelse continue;
+            appendUniqueNodeId(&out, active_nodes, switch (command) {
                 .select_upstream_nodes => connection.from_id,
                 .select_downstream_nodes => connection.to_id,
                 else => unreachable,
-            };
-            appendUniqueNodeId(&out, active_nodes, seed_id);
+            });
         }
         for (active_nodes) |node| {
             if (self.isNodeSelected(node.id)) appendUniqueNodeId(&out, active_nodes, node.id);
@@ -2480,12 +2679,13 @@ pub const State = struct {
             else => return null,
         };
         if (!topology.ensure(nodes, connections).usable()) return null;
-        const connection_seed = if (self.selected_connection) |connection| switch (direction) {
+        const stored_connections = self.selected_connections[0..self.storedConnectionSelectionLen()];
+        const connection_seed = if (stored_connections.len == 0) if (self.selected_connection) |connection| switch (direction) {
             .upstream => connection.from_id,
             .downstream => connection.to_id,
-        } else null;
+        } else null else null;
         const primary_seed = connection_seed orelse if (self.boundedSelectionLen() == 0) self.selected_node_id else null;
-        return topology.traverse(direction, primary_seed, self.selected_node_ids[0..self.boundedSelectionLen()]);
+        return topology.traverseWithConnectionSeeds(direction, primary_seed, self.selected_node_ids[0..self.boundedSelectionLen()], stored_connections);
     }
 
     fn lastReachableNodeId(topology: *const graph_topology.Index, nodes: []const Node) ?u32 {
@@ -2660,7 +2860,7 @@ pub const State = struct {
         for (connections[0..count]) |*connection| {
             if (!State.connectionEndpointsEqual(connection.*, selected)) continue;
             connection.* = replacement;
-            self.selected_connection = replacement;
+            self.replaceSelectedConnection(selected, replacement);
             self.hover_connection = replacement;
             return true;
         }
@@ -2701,7 +2901,7 @@ pub const State = struct {
         self.selected_node_len += 1;
         self.selected_node_id = id;
         self.selected_group_id = null;
-        self.selected_connection = null;
+        _ = self.clearConnectionSelection();
     }
 
     fn removeNodeFromSelection(self: *State, id: u32) void {
@@ -2928,7 +3128,7 @@ pub const State = struct {
 
     pub fn beginReconnectConnection(self: *State, connection: Connection, endpoint: ConnectionEnd, preview: [2]f32) bool {
         const changed = self.reconnecting_connection == null or !State.connectionEndpointsEqual(self.reconnecting_connection.?, connection) or self.reconnecting_connection_end != endpoint;
-        _ = self.setConnectionSelection(connection);
+        _ = self.setConnectionSelectionPrimary(connection);
         self.reconnecting_connection = connection;
         self.reconnecting_connection_end = endpoint;
         self.dragging_connection_from_id = null;
@@ -2980,7 +3180,7 @@ pub const State = struct {
             },
         }
         if (State.connectionEndpointsEqual(replacement, target)) {
-            self.selected_connection = replacement;
+            self.replaceSelectedConnection(target, replacement);
             return false;
         }
         if (!connectionAllowed(nodes, connections[0..clamped_len], replacement, policy, .{
@@ -2989,7 +3189,7 @@ pub const State = struct {
         for (connections[0..clamped_len]) |*connection| {
             if (!State.connectionEndpointsEqual(connection.*, target)) continue;
             connection.* = replacement;
-            self.selected_connection = replacement;
+            self.replaceSelectedConnection(target, replacement);
             self.hover_connection = replacement;
             return true;
         }
@@ -3931,7 +4131,8 @@ fn beginEditorHistory(editor: anytype) ?EditorHistoryMutation {
     const connections = editor.mutable_connections orelse &.{};
     const node_len = if (editor.mutable_node_len) |len| @min(len.*, editor.nodes.len) else editor.nodes.len;
     const connection_len = if (editor.mutable_connection_len) |len| @min(len.*, connections.len) else connections.len;
-    if (!history.supportsGraphCapacity(node_len, group_len, connection_len, editor.state.boundedSelectionLen())) return null;
+    const connection_selection_capacity = if (editor.state.selected_connections.len > 0) editor.state.selected_connections.len else 1;
+    if (!history.supportsGraphCapacityWithSelections(node_len, group_len, connection_len, editor.state.boundedSelectionLen(), connection_selection_capacity)) return null;
     const snapshot = history.captureWithGroups(editor.state.*, editor.nodes, node_len, groups[0..group_len], connections, connection_len);
     if (!snapshot.complete) return null;
     return .{ .history = history, .snapshot = snapshot };
@@ -4297,7 +4498,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                     return editor.state.openContextMenu(.node, point);
                 }
                 if (connectionAtEditorPoint(rect, editor, viewport_index, point)) |connection| {
-                    _ = editor.state.setConnectionSelection(connection);
+                    _ = editor.state.setConnectionSelectionPrimary(connection);
                     editor.state.context_menu.connection = connection;
                     editor.state.context_menu.node_id = null;
                     editor.state.context_menu.group_id = null;
@@ -4327,14 +4528,12 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             }
             if (editor.state.selected_connection) |selected_connection| {
                 if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
-                    if (editor.nodes[hit.node_index].id == selected_connection.from_id and hit.port_index == selected_connection.from_port) {
-                        return editor.state.beginReconnectConnection(selected_connection, .from, .{ m.x, m.y });
-                    }
+                    const connection = editor.state.selectedConnectionAtEndpoint(.from, editor.nodes[hit.node_index].id, hit.port_index) orelse selected_connection;
+                    if (connectionEndpointMatches(connection, .from, editor.nodes[hit.node_index].id, hit.port_index)) return editor.state.beginReconnectConnection(connection, .from, .{ m.x, m.y });
                 }
                 if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
-                    if (editor.nodes[hit.node_index].id == selected_connection.to_id and hit.port_index == selected_connection.to_port) {
-                        return editor.state.beginReconnectConnection(selected_connection, .to, .{ m.x, m.y });
-                    }
+                    const connection = editor.state.selectedConnectionAtEndpoint(.to, editor.nodes[hit.node_index].id, hit.port_index) orelse selected_connection;
+                    if (connectionEndpointMatches(connection, .to, editor.nodes[hit.node_index].id, hit.port_index)) return editor.state.beginReconnectConnection(connection, .to, .{ m.x, m.y });
                 }
             }
             if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
@@ -4357,7 +4556,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return editor.state.beginGroupResize(editor.groups[hit.group_index].id, hit.edges);
             }
             if (connectionAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |connection| {
-                return editor.state.setConnectionSelection(connection);
+                return if (input.shift_down) editor.state.toggleConnectionSelection(connection) else editor.state.setConnectionSelection(connection);
             }
             if (groupAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |index| {
                 return editor.state.beginGroupDrag(editor.groups[index].id);
@@ -4447,7 +4646,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                                 const can_append = before_len < connections.len and connectionAllowed(editor.nodes, active_connections, connection, editorConnectionPolicy(editor), .{});
                                 if (can_append) {
                                     const history_capacity_ok = if (editor.history) |history|
-                                        history.supportsGraphCapacity(if (editor.mutable_node_len) |node_len| @min(node_len.*, editor.nodes.len) else editor.nodes.len, if (editor.mutable_group_len) |group_len| @min(group_len.*, editor.groups.len) else editor.groups.len, before_len + 1, 1)
+                                        history.supportsGraphCapacityWithSelections(if (editor.mutable_node_len) |node_len| @min(node_len.*, editor.nodes.len) else editor.nodes.len, if (editor.mutable_group_len) |group_len| @min(group_len.*, editor.groups.len) else editor.groups.len, before_len + 1, editor.state.boundedSelectionLen(), @max(editor.state.boundedConnectionSelectionLen(), 1))
                                     else
                                         true;
                                     if (history_capacity_ok) {
@@ -5402,6 +5601,68 @@ test "NodeEditor strict dataflow policy rejects cyclic link mutation" {
     try std.testing.expect(!graph_report.validFor(.strict_dataflow));
 }
 
+test "NodeEditor connection selection toggles without truncating at capacity" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [2]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    const a = Connection{ .from_id = 1, .to_id = 2 };
+    const b = Connection{ .from_id = 2, .to_id = 3 };
+    const c = Connection{ .from_id = 3, .to_id = 4 };
+
+    try std.testing.expect(state.setConnectionSelection(a));
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.toggleConnectionSelection(b));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(a));
+    try std.testing.expect(state.isConnectionSelected(b));
+    try std.testing.expectEqual(@as(?Connection, b), state.selected_connection);
+
+    try std.testing.expect(!state.toggleConnectionSelection(c));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expect(!state.isConnectionSelected(c));
+    try std.testing.expect(state.toggleConnectionSelection(a));
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expectEqual(@as(?Connection, b), state.selected_connection);
+    try std.testing.expect(state.toggleConnectionSelection(b));
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+    try std.testing.expectEqual(@as(?Connection, null), state.selected_connection);
+}
+
+test "NodeEditor promotes a selected connection without discarding peers" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [3]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    const a = Connection{ .from_id = 1, .to_id = 2 };
+    const b = Connection{ .from_id = 2, .to_id = 3 };
+    _ = state.setConnectionSelection(a);
+    try std.testing.expect(state.toggleConnectionSelection(b));
+    try std.testing.expect(state.setConnectionSelectionPrimary(a));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(a));
+    try std.testing.expect(state.isConnectionSelected(b));
+    try std.testing.expectEqual(@as(?Connection, a), state.selected_connection);
+}
+
+test "NodeEditor disconnect selected link removes every selected connection in storage order" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [4]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 3, .to_id = 4 },
+        .{ .from_id = 4, .to_id = 5 },
+    };
+    var connection_len: usize = connections.len;
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[2]));
+    try std.testing.expect(state.disconnectSelectedLink(&connections, &connection_len));
+    try std.testing.expectEqual(@as(usize, 2), connection_len);
+    try std.testing.expectEqual(Connection{ .from_id = 2, .to_id = 3 }, connections[0]);
+    try std.testing.expectEqual(Connection{ .from_id = 4, .to_id = 5 }, connections[1]);
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+}
+
 test "NodeEditor connected selection follows full upstream and downstream chains" {
     var selected: [8]u32 = .{0} ** 8;
     var state = State{ .selected_node_ids = &selected };
@@ -5463,6 +5724,38 @@ test "NodeEditor connected selection can start from a selected connection" {
     try std.testing.expect(state.isNodeSelected(3));
     try std.testing.expect(state.isNodeSelected(4));
     try std.testing.expectEqual(@as(?u32, 4), state.selected_node_id);
+}
+
+test "NodeEditor connected selection starts from every selected connection" {
+    var selected_nodes: [8]u32 = .{0} ** 8;
+    var selected_connections: [4]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 240, 0 } },
+        .{ .id = 4, .title = "D", .pos = .{ 0, 120 } },
+        .{ .id = 5, .title = "E", .pos = .{ 120, 120 } },
+        .{ .id = 6, .title = "F", .pos = .{ 240, 120 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 4, .to_id = 5 },
+        .{ .from_id = 5, .to_id = 6 },
+    };
+    _ = state.setConnectionSelection(connections[1]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[3]));
+    try std.testing.expect(state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_upstream_nodes));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 4, 5 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[2]));
+    var storage = graph_topology.StaticWorkspace(nodes.len, connections.len){};
+    var topology = graph_topology.Index.init(storage.workspace());
+    const result = state.selectConnectedNodesIndexedDetailed(&topology, &connections, connections.len, &nodes, nodes.len, .select_downstream_nodes);
+    try std.testing.expect(result.complete());
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 5, 6 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
 }
 
 test "NodeEditor connected selection handles cycles branches and no-op capabilities" {

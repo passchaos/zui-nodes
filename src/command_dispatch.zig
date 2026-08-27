@@ -170,8 +170,8 @@ pub fn canDispatchHistory(context: *const CommandContext, command: HistoryComman
     const history = context.history orelse return false;
     if (!canRecordHistory(context)) return false;
     return switch (command) {
-        .undo => history.canUndoFor(context.nodes.len, context.groups.len, context.connections.len, context.state.selected_node_ids.len),
-        .redo => history.canRedoFor(context.nodes.len, context.groups.len, context.connections.len, context.state.selected_node_ids.len),
+        .undo => history.canUndoForSelections(context.nodes.len, context.groups.len, context.connections.len, context.state.selected_node_ids.len, if (context.state.selected_connections.len > 0) context.state.selected_connections.len else 1),
+        .redo => history.canRedoForSelections(context.nodes.len, context.groups.len, context.connections.len, context.state.selected_node_ids.len, if (context.state.selected_connections.len > 0) context.state.selected_connections.len else 1),
     };
 }
 
@@ -229,7 +229,7 @@ fn beginHistoryMutation(context: *CommandContext) ?HistoryMutation {
 
 pub fn canRecordHistory(context: *const CommandContext) bool {
     const history = context.history orelse return true;
-    return history.supportsGraphCapacity(activeNodeCount(context), activeGroupCount(context), activeConnectionCount(context), context.state.boundedSelectionLen());
+    return history.supportsGraphCapacityWithSelections(activeNodeCount(context), activeGroupCount(context), activeConnectionCount(context), context.state.boundedSelectionLen(), context.state.boundedConnectionSelectionLen());
 }
 
 pub fn canRecordSelectionCommand(context: *const CommandContext, command: SelectionCommand) bool {
@@ -279,7 +279,7 @@ pub fn canRecordNodeEditorCommand(context: *const CommandContext, command: NodeE
 
 fn historyCanRecordProjected(context: *const CommandContext, node_count: usize, group_count: usize, connection_count: usize, selection_count: usize) bool {
     const history = context.history orelse return true;
-    return canRecordHistory(context) and history.supportsGraphCapacity(node_count, group_count, connection_count, selection_count);
+    return canRecordHistory(context) and history.supportsGraphCapacityWithSelections(node_count, group_count, connection_count, selection_count, context.state.boundedConnectionSelectionLen());
 }
 
 fn historyCanRecordDuplicate(context: *const CommandContext, node_count: usize, connection_count: usize) bool {
@@ -760,6 +760,104 @@ test "zui-nodes command dispatch reconnects selected connection and supports his
     try std.testing.expectEqual(@as(u32, 2), connections[0].to_id);
     try std.testing.expect(dispatchHistoryId(&ctx, HistoryCommand.redo.commandId()));
     try std.testing.expectEqual(@as(u32, 3), connections[0].to_id);
+}
+
+test "zui-nodes command dispatch deletes multi-selected connections as one undo" {
+    var selected_nodes: [4]u32 = .{0} ** 4;
+    var selected_connections: [4]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 200, 0 } },
+        .{ .id = 4, .title = "D", .pos = .{ 300, 0 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections = [_]node_editor.Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 3, .to_id = 4 },
+    };
+    const before = connections;
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var history_storage = node_editor.StaticHistoryWorkspace(nodes.len, 0, connections.len, selected_connections.len){};
+    try std.testing.expect(history.bindWorkspace(history_storage.workspace()));
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[2]));
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len, .history = &history };
+
+    try std.testing.expect(canDispatchSelection(&context, .delete));
+    try std.testing.expect(dispatchSelection(&context, .delete));
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(node_editor.Connection{ .from_id = 2, .to_id = 3 }, connections[0]);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expectEqual(@as(usize, 3), connection_len);
+    try std.testing.expectEqual(before, connections);
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(before[0]));
+    try std.testing.expect(state.isConnectionSelected(before[2]));
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+}
+
+test "zui-nodes multi-connection delete rejects undersized history atomically" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [2]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 200, 0 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections = [_]node_editor.Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+    };
+    const before = connections;
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var history_storage = node_editor.StaticHistoryWorkspace(nodes.len, 0, connections.len, 1){};
+    try std.testing.expect(history.bindWorkspace(history_storage.workspace()));
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[1]));
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len, .history = &history };
+
+    try std.testing.expect(!canRecordHistory(&context));
+    try std.testing.expect(!canDispatchSelection(&context, .delete));
+    try std.testing.expect(!dispatchSelection(&context, .delete));
+    try std.testing.expectEqual(@as(usize, 2), connection_len);
+    try std.testing.expectEqual(before, connections);
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+}
+
+test "zui-nodes reconnect preserves non-primary selected connections" {
+    var selected_nodes: [4]u32 = .{0} ** 4;
+    var selected_connections: [4]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 200, 0 } },
+        .{ .id = 4, .title = "D", .pos = .{ 300, 0 } },
+    };
+    var connections = [_]node_editor.Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+    };
+    var connection_len: usize = connections.len;
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[1]));
+    const previous_primary = connections[1];
+    try std.testing.expect(state.reconnectConnectionPortWithPolicy(&connections, &connection_len, previous_primary, .to, 4, 0, &nodes, .default));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(connections[0]));
+    try std.testing.expect(state.isConnectionSelected(connections[1]));
+    try std.testing.expectEqual(@as(?node_editor.Connection, connections[1]), state.selected_connection);
 }
 
 test "zui-nodes selection dispatch duplicates, deletes, and records history" {

@@ -122,7 +122,7 @@ fn selectionDisabledReason(context: *const CommandContext, command: SelectionCom
     const selected_count = context.state.selectedNodeStorageCount(context.nodes, node_count);
     return switch (command) {
         .rename, .focus => if (selected_count == 0) "selection unavailable" else "node unavailable",
-        .delete => if (selected_count == 0 and context.state.selected_connection == null) "nothing selected" else "delete unavailable",
+        .delete => if (selected_count == 0 and context.state.boundedConnectionSelectionLen() == 0) "nothing selected" else "delete unavailable",
         .duplicate => if (selected_count == 0) "selection unavailable" else "node capacity full",
     };
 }

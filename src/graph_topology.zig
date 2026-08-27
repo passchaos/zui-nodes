@@ -122,7 +122,12 @@ pub const Index = struct {
     }
 
     pub fn traverse(self: *Index, direction: Direction, primary_seed: ?u32, seed_ids: []const u32) TraversalResult {
-        var result = TraversalResult{ .requested_seed_count = seed_ids.len + @as(usize, if (primary_seed != null) 1 else 0) };
+        const no_connections = [_]struct { from_id: u32, to_id: u32 }{};
+        return self.traverseWithConnectionSeeds(direction, primary_seed, seed_ids, &no_connections);
+    }
+
+    pub fn traverseWithConnectionSeeds(self: *Index, direction: Direction, primary_seed: ?u32, seed_ids: []const u32, seed_connections: anytype) TraversalResult {
+        var result = TraversalResult{ .requested_seed_count = seed_ids.len + seed_connections.len + @as(usize, if (primary_seed != null) 1 else 0) };
         if (!self.valid) {
             result.topology_unavailable = true;
             return result;
@@ -134,6 +139,12 @@ pub const Index = struct {
         var queue_len: usize = 0;
         if (primary_seed) |id| self.enqueueSeed(id, visited, queue, &queue_len, &result);
         for (seed_ids) |id| self.enqueueSeed(id, visited, queue, &queue_len, &result);
+        for (seed_connections) |connection| {
+            self.enqueueSeed(switch (direction) {
+                .upstream => connection.from_id,
+                .downstream => connection.to_id,
+            }, visited, queue, &queue_len, &result);
+        }
 
         var scan: usize = 0;
         while (scan < queue_len) : (scan += 1) {

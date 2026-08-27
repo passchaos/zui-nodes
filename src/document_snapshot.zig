@@ -27,6 +27,7 @@ pub const DocumentSnapshot = struct {
     selected_node_id: ?u32 = null,
     selected_node_ids: []const u32 = &.{},
     selected_group_id: ?u32 = null,
+    selected_connections: []const Connection = &.{},
     selected_connection: ?Connection = null,
     nodes: []const Node = &.{},
     connections: []const Connection = &.{},
@@ -67,6 +68,7 @@ pub const ApplyResult = struct {
     connection_count: usize = 0,
     group_count: usize = 0,
     selected_node_count: usize = 0,
+    selected_connection_count: usize = 0,
     selection_truncated: bool = false,
 };
 
@@ -88,6 +90,9 @@ pub const ValidationReport = struct {
     selected_node_present: bool = false,
     selected_group_present: bool = false,
     selected_connection_present: bool = false,
+    selected_connection_primary_in_selection: bool = false,
+    missing_selected_connection_count: usize = 0,
+    duplicate_selected_connection_count: usize = 0,
 
     pub fn valid(self: ValidationReport) bool {
         return self.validFor(.default);
@@ -106,7 +111,10 @@ pub const ValidationReport = struct {
             (policy.allow_cycles or (self.cycle_count == 0 and self.cycle_check_truncated_count == 0)) and
             self.selected_node_present and
             self.selected_group_present and
-            self.selected_connection_present;
+            self.selected_connection_present and
+            self.selected_connection_primary_in_selection and
+            self.duplicate_selected_connection_count == 0 and
+            self.missing_selected_connection_count == 0;
     }
 };
 
@@ -115,6 +123,7 @@ pub const Summary = struct {
     connection_count: usize = 0,
     group_count: usize = 0,
     selected_node_count: usize = 0,
+    selected_connection_count: usize = 0,
     selected_node_id: ?u32 = null,
     selected_group_id: ?u32 = null,
     has_selected_connection: bool = false,
@@ -142,6 +151,7 @@ pub fn captureDocumentSnapshot(options: CaptureOptions) DocumentSnapshot {
         .selected_node_id = options.state.selected_node_id,
         .selected_node_ids = options.state.selected_node_ids[0..options.state.boundedSelectionLen()],
         .selected_group_id = options.state.selected_group_id,
+        .selected_connections = options.state.storedConnectionSelection(),
         .selected_connection = options.state.selected_connection,
         .nodes = options.nodes[0..node_count],
         .connections = options.connections[0..connection_count],
@@ -181,15 +191,51 @@ pub fn applyDocumentSnapshot(options: ApplyOptions) !ApplyResult {
     if (selected_count > 0) {
         @memcpy(options.state.selected_node_ids[0..selected_count], snapshot.selected_node_ids[0..selected_count]);
     }
+    const selected_connection_count = @min(snapshot.selected_connections.len, options.state.selected_connections.len);
+    options.state.selected_connection_len = selected_connection_count;
+    if (selected_connection_count > 0) {
+        @memcpy(options.state.selected_connections[0..selected_connection_count], snapshot.selected_connections[0..selected_connection_count]);
+        var primary_stored = false;
+        if (options.state.selected_connection) |primary| {
+            for (options.state.selected_connections[0..selected_connection_count]) |selected| {
+                if (node_editor.connectionEndpointsEqual(primary, selected)) {
+                    primary_stored = true;
+                    break;
+                }
+            }
+        }
+        if (!primary_stored) {
+            options.state.selected_connection = options.state.selected_connections[selected_connection_count - 1];
+        }
+    } else if (snapshot.selected_connections.len > 0) {
+        options.state.selected_connection = snapshot.selected_connections[snapshot.selected_connections.len - 1];
+    } else if (snapshot.selected_connection == null) {
+        options.state.selected_connection_len = 0;
+    }
     options.state.dragging_canvas = false;
     options.state.dragging_node_id = null;
     options.state.dragging_group_id = null;
     options.state.resizing_group_id = null;
+    options.state.resizing_group_edges = .{};
+    options.state.interaction_history_pushed = false;
+    options.state.node_drag_tracking = false;
+    options.state.node_drag_origin = .{ 0, 0 };
+    options.state.node_drag_accumulated_delta = .{ 0, 0 };
+    options.state.node_drag_applied_delta = .{ 0, 0 };
+    options.state.snap_guide_x = null;
+    options.state.snap_guide_y = null;
+    options.state.snap_guide_x_span = null;
+    options.state.snap_guide_y_span = null;
+    options.state.spacing_guide_x = null;
+    options.state.spacing_guide_y = null;
     options.state.dragging_connection_from_id = null;
+    options.state.dragging_connection_from_port = 0;
     options.state.reconnecting_connection = null;
     options.state.pending_connection = null;
     options.state.hover_node_id = null;
     options.state.hover_group_id = null;
+    options.state.hover_input_node_id = null;
+    options.state.hover_output_node_id = null;
     options.state.hover_connection = null;
     options.state.box_selecting = false;
     options.state.dragging_minimap = false;
@@ -199,7 +245,8 @@ pub fn applyDocumentSnapshot(options: ApplyOptions) !ApplyResult {
         .connection_count = snapshot.connections.len,
         .group_count = snapshot.groups.len,
         .selected_node_count = selected_count,
-        .selection_truncated = selected_count < snapshot.selected_node_ids.len,
+        .selected_connection_count = options.state.boundedConnectionSelectionLen(),
+        .selection_truncated = selected_count < snapshot.selected_node_ids.len or selected_connection_count < snapshot.selected_connections.len,
     };
 }
 
@@ -214,9 +261,10 @@ pub fn summarizeDocumentSnapshotWithPolicy(snapshot: DocumentSnapshot, policy: n
         .connection_count = snapshot.connections.len,
         .group_count = snapshot.groups.len,
         .selected_node_count = snapshot.selected_node_ids.len,
+        .selected_connection_count = if (snapshot.selected_connections.len > 0) snapshot.selected_connections.len else @intFromBool(snapshot.selected_connection != null),
         .selected_node_id = snapshot.selected_node_id,
         .selected_group_id = snapshot.selected_group_id,
-        .has_selected_connection = snapshot.selected_connection != null,
+        .has_selected_connection = snapshot.selected_connection != null or snapshot.selected_connections.len > 0,
         .bounds = node_editor.graphBounds(snapshot.nodes, snapshot.groups),
         .valid = validation.validFor(policy),
         .graph_validation = node_editor.validateGraph(snapshot.nodes, snapshot.connections, policy),
@@ -236,6 +284,7 @@ pub fn validateDocumentSnapshotWithPolicy(snapshot: DocumentSnapshot, policy: no
         .selected_node_present = snapshot.selected_node_id == null,
         .selected_group_present = snapshot.selected_group_id == null,
         .selected_connection_present = snapshot.selected_connection == null,
+        .selected_connection_primary_in_selection = snapshot.selected_connections.len == 0,
     };
 
     for (snapshot.nodes, 0..) |node, index| {
@@ -254,7 +303,23 @@ pub fn validateDocumentSnapshotWithPolicy(snapshot: DocumentSnapshot, policy: no
     }
     for (snapshot.connections) |connection| {
         if (snapshot.selected_connection) |selected| {
-            if (std.meta.eql(selected, connection)) report.selected_connection_present = true;
+            if (node_editor.connectionEndpointsEqual(selected, connection)) report.selected_connection_present = true;
+        }
+    }
+    for (snapshot.selected_connections, 0..) |selected, selected_index| {
+        var present = false;
+        for (snapshot.connections) |connection| {
+            if (node_editor.connectionEndpointsEqual(selected, connection)) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) report.missing_selected_connection_count += 1;
+        if (snapshot.selected_connection) |primary| {
+            if (node_editor.connectionEndpointsEqual(primary, selected)) report.selected_connection_primary_in_selection = true;
+        }
+        for (snapshot.selected_connections[selected_index + 1 ..]) |later| {
+            if (node_editor.connectionEndpointsEqual(selected, later)) report.duplicate_selected_connection_count += 1;
         }
     }
     const graph_report = node_editor.validateGraph(snapshot.nodes, snapshot.connections, policy);
@@ -350,6 +415,87 @@ test "zui-nodes document snapshot round-trips and restores graph state" {
     try std.testing.expectEqual(@as(?u32, 2), restored_state.selected_node_id);
     try std.testing.expectEqual(@as(usize, 1), restored_state.boundedSelectionLen());
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), restored_state.zoom, 0.001);
+}
+
+test "zui-nodes document snapshot preserves multi-connection selection" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [4]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 240, 0 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+    };
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.toggleConnectionSelection(connections[1]));
+    const snapshot = captureDocumentSnapshot(.{ .state = &state, .nodes = &nodes, .connections = &connections });
+    const json = try snapshot.toJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    var parsed = try parseDocumentSnapshotJson(std.testing.allocator, json);
+    defer parsed.deinit();
+    try std.testing.expect(validateDocumentSnapshot(parsed.value).valid());
+    try std.testing.expectEqual(@as(usize, 2), summarizeDocumentSnapshot(parsed.value).selected_connection_count);
+
+    var restored_selected_nodes: [2]u32 = .{0} ** 2;
+    var restored_selected_connections: [4]Connection = undefined;
+    var restored_state = State{ .selected_node_ids = &restored_selected_nodes, .selected_connections = &restored_selected_connections };
+    var restored_nodes: [3]Node = undefined;
+    var restored_node_len: usize = 0;
+    var restored_connections: [2]Connection = undefined;
+    var restored_connection_len: usize = 0;
+    const result = try applyDocumentSnapshot(.{
+        .snapshot = parsed.value,
+        .state = &restored_state,
+        .nodes = &restored_nodes,
+        .node_len = &restored_node_len,
+        .connections = &restored_connections,
+        .connection_len = &restored_connection_len,
+    });
+    try std.testing.expectEqual(@as(usize, 2), result.selected_connection_count);
+    try std.testing.expect(!result.selection_truncated);
+    try std.testing.expect(restored_state.isConnectionSelected(connections[0]));
+    try std.testing.expect(restored_state.isConnectionSelected(connections[1]));
+    try std.testing.expectEqual(@as(?Connection, connections[1]), restored_state.selected_connection);
+}
+
+test "zui-nodes document snapshot reports connection selection truncation and missing links" {
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 240, 0 } },
+    };
+    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    const selections = [_]Connection{ connections[0], .{ .from_id = 2, .to_id = 3 } };
+    const snapshot = DocumentSnapshot{ .nodes = &nodes, .connections = &connections, .selected_connections = &selections, .selected_connection = selections[1] };
+    const report = validateDocumentSnapshot(snapshot);
+    try std.testing.expectEqual(@as(usize, 1), report.missing_selected_connection_count);
+    try std.testing.expect(!report.valid());
+
+    var selected_nodes: [1]u32 = .{0};
+    var selected_connections: [1]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var restored_nodes: [3]Node = undefined;
+    var node_len: usize = 0;
+    var restored_connections: [1]Connection = undefined;
+    var connection_len: usize = 0;
+    const applied = try applyDocumentSnapshot(.{ .snapshot = snapshot, .state = &state, .nodes = &restored_nodes, .node_len = &node_len, .connections = &restored_connections, .connection_len = &connection_len });
+    try std.testing.expect(applied.selection_truncated);
+    try std.testing.expectEqual(@as(usize, 1), applied.selected_connection_count);
+    try std.testing.expectEqual(@as(?Connection, selections[0]), state.selected_connection);
+    try std.testing.expect(state.isConnectionSelected(selections[0]));
+}
+
+test "zui-nodes document snapshot parses legacy single-connection selection" {
+    const json = "{\"version\":1,\"selected_connection\":{\"from_id\":1,\"to_id\":2},\"nodes\":[{\"id\":1,\"title\":\"A\",\"pos\":[0,0]},{\"id\":2,\"title\":\"B\",\"pos\":[120,0]}],\"connections\":[{\"from_id\":1,\"to_id\":2}]}";
+    var parsed = try parseDocumentSnapshotJson(std.testing.allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.selected_connections.len);
+    try std.testing.expect(validateDocumentSnapshot(parsed.value).valid());
+    try std.testing.expectEqual(@as(usize, 1), summarizeDocumentSnapshot(parsed.value).selected_connection_count);
 }
 
 test "zui-nodes document validation reports duplicate and orphan graph data" {

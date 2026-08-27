@@ -45,6 +45,7 @@ pub const Summary = struct {
     connection_count: usize = 0,
     group_count: usize = 0,
     selected_node_count: usize = 0,
+    selected_connection_count: usize = 0,
     selected_node_id: ?u32 = null,
     selected_group_id: ?u32 = null,
     has_selected_connection: bool = false,
@@ -118,9 +119,10 @@ pub fn summarize(options: SummaryOptions) Summary {
         .connection_count = options.connections.len,
         .group_count = options.groups.len,
         .selected_node_count = state.boundedSelectionLen(),
+        .selected_connection_count = state.boundedConnectionSelectionLen(),
         .selected_node_id = state.selected_node_id,
         .selected_group_id = state.selected_group_id,
-        .has_selected_connection = state.selected_connection != null,
+        .has_selected_connection = state.boundedConnectionSelectionLen() > 0,
         .hover_node_id = state.hover_node_id,
         .hover_group_id = state.hover_group_id,
         .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.resizing_group_id != null or state.box_selecting or state.dragging_minimap,
@@ -175,8 +177,9 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.group_count,
         options.summary.statusText(),
     }), .{ .font_size = 10, .color = ctx.theme().text_muted, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const selection = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "selection={d} node={?d} group={?d} conn={}", .{
+    const selection = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "selection nodes={d} links={d} node={?d} group={?d} conn={}", .{
         options.summary.selected_node_count,
+        options.summary.selected_connection_count,
         options.summary.selected_node_id,
         options.summary.selected_group_id,
         options.summary.has_selected_connection,
