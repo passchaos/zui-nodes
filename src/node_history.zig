@@ -488,6 +488,12 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.hover_output_node_id = null;
             state.hover_connection = null;
             state.box_selecting = false;
+            state.box_select_mode = .replace;
+            state.box_select_scope = .nodes_only;
+            state.box_select_start = .{ 0, 0 };
+            state.box_select_end = .{ 0, 0 };
+            state.box_select_origin_x = 0;
+            state.box_select_crossing = false;
         }
 
         fn writeSelectedConnections(state: anytype, destination: []Connection) void {

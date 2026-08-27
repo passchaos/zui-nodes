@@ -36,6 +36,7 @@ pub const SummaryOptions = struct {
     drag_snap: node_editor.DragSnapOptions = .{},
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
     distribution_snap: node_editor.DistributionSnapOptions = .{},
+    box_select_scope: node_editor.BoxSelectScope = .nodes_only,
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -63,6 +64,8 @@ pub const Summary = struct {
     alignment_snap_active: bool = false,
     distribution_snap_enabled: bool = false,
     distribution_snap_active: bool = false,
+    box_select_scope: node_editor.BoxSelectScope = .nodes_only,
+    box_select_crossing: bool = false,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -139,6 +142,8 @@ pub fn summarize(options: SummaryOptions) Summary {
         .alignment_snap_active = state.dragging_node_id != null and (state.snap_guide_x_span != null or state.snap_guide_y_span != null),
         .distribution_snap_enabled = options.distribution_snap.enabled,
         .distribution_snap_active = state.dragging_node_id != null and (state.spacing_guide_x != null or state.spacing_guide_y != null),
+        .box_select_scope = if (state.box_selecting) state.box_select_scope else options.box_select_scope,
+        .box_select_crossing = state.box_selecting and state.box_select_crossing,
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -194,6 +199,10 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
     const auto_pan = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "auto-pan enabled={} active={}", .{
         options.summary.drag_auto_pan_enabled,
         options.summary.drag_auto_pan_active,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const box_select = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "box={s} crossing={}", .{
+        @tagName(options.summary.box_select_scope),
+        options.summary.box_select_crossing,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const drag_snap = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "snap grid={} align={} distribute={} active={}/{}/{} guides={?d:.1},{?d:.1}", .{
         options.summary.drag_snap_enabled,
@@ -256,7 +265,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, drag_snap, path_cache, connection_draw, topology, viewport_index, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, box_select, drag_snap, path_cache, connection_draw, topology, viewport_index, history, graph });
     return root;
 }
 
@@ -302,6 +311,9 @@ test "zui-nodes devtools exposes active drag snap guides" {
         .selected_node_len = 1,
         .selected_node_id = 1,
         .dragging_node_id = 1,
+        .box_selecting = true,
+        .box_select_scope = .visible_only,
+        .box_select_crossing = true,
         .snap_guide_x = 32,
         .snap_guide_x_span = .{ 0, 80 },
         .snap_guide_y = 16,
@@ -318,6 +330,8 @@ test "zui-nodes devtools exposes active drag snap guides" {
     try std.testing.expect(summary.alignment_snap_enabled);
     try std.testing.expect(summary.alignment_snap_active);
     try std.testing.expect(summary.distribution_snap_enabled);
+    try std.testing.expectEqual(node_editor.BoxSelectScope.visible_only, summary.box_select_scope);
+    try std.testing.expect(summary.box_select_crossing);
     try std.testing.expectEqual(@as(?f32, 32), summary.snap_guide_x);
     try std.testing.expectEqual(@as(?f32, 16), summary.snap_guide_y);
 }

@@ -335,6 +335,15 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 return self.workspace.connection_hit_indices[0..count];
             }
 
+            pub fn connectionIndicesInScreenRect(self: *Index, viewport: Rect, pan: [2]f32, zoom_value: f32, screen_rect: Rect) []const usize {
+                if (!self.valid) return &.{};
+                const zoom = @max(0.001, zoom_value);
+                const query_rect = expandRect(graphScreenRect(viewport, pan, zoom, screen_rect), 40.0 / zoom, 0);
+                const count = queryIntervals(self.workspace.connection_bounds[0..self.connection_count], self.workspace.connection_order[0..self.indexed_connection_count], self.workspace.connection_prefix_max_x[0..self.indexed_connection_count], query_rect, self.workspace.connection_hit_indices);
+                std.sort.pdq(usize, self.workspace.connection_hit_indices[0..count], {}, std.sort.asc(usize));
+                return self.workspace.connection_hit_indices[0..count];
+            }
+
             pub fn nodeIndexForId(self: *const Index, id: u32) ?usize {
                 if (!self.id_lookup_valid) return null;
                 return self.nodeIndex(id);
@@ -738,11 +747,25 @@ test "viewport index culls nodes groups and connections in storage order" {
     try std.testing.expectEqualSlices(usize, &.{1}, index.nodeIndicesNearPoint(viewport, .{ 0, 0 }, 1, point, 1));
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, index.nodeIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 100, .y = 70, .w = 240, .h = 100 }));
     try std.testing.expectEqualSlices(usize, &.{0}, index.connectionIndicesNearPoint(viewport, .{ 0, 0 }, 1, point, 8));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, index.connectionIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 100, .y = 60, .w = 240, .h = 120 }));
 
     const repeated = index.prepare(&nodes, &groups, &connections, viewport, .{ 0, 0 }, 1);
     try std.testing.expect(repeated.geometry_reused);
     try std.testing.expect(repeated.viewport_reused);
     try std.testing.expectEqual(@as(u64, 1), index.summary().viewport_reuse_count);
+}
+
+test "connection rectangle query retains minimum-handle Bezier lobes" {
+    const nodes = [_]TestNode{
+        .{ .id = 1, .pos = .{ -80, -80 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .pos = .{ 0, 20 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]TestConnection{.{ .from_id = 1, .to_id = 2 }};
+    var storage = TestIndexTypes.StaticWorkspace(nodes.len, 0, connections.len){};
+    var index = TestIndexTypes.Index.init(storage.workspace());
+    const viewport = TestRect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    try std.testing.expect(index.prepare(&nodes, &.{}, &connections, viewport, .{ 0, 0 }, 1).ready);
+    try std.testing.expectEqualSlices(usize, &.{0}, index.connectionIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 209, .y = 77, .w = 5, .h = 7 }));
 }
 
 test "viewport index versioned mode rebuilds only on geometry revision" {

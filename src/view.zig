@@ -90,6 +90,7 @@ pub const NodeEditorViewOptions = struct {
     drag_snap: node_editor.DragSnapOptions = .{},
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
     distribution_snap: node_editor.DistributionSnapOptions = .{},
+    box_select_scope: node_editor.BoxSelectScope = .nodes_only,
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -132,6 +133,7 @@ const Binding = struct {
     drag_snap: node_editor.DragSnapOptions = .{},
     alignment_snap: node_editor.AlignmentSnapOptions = .{},
     distribution_snap: node_editor.DistributionSnapOptions = .{},
+    box_select_scope: node_editor.BoxSelectScope = .nodes_only,
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -167,6 +169,7 @@ const Binding = struct {
             .drag_snap = self.drag_snap,
             .alignment_snap = self.alignment_snap,
             .distribution_snap = self.distribution_snap,
+            .box_select_scope = self.box_select_scope,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -216,6 +219,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .drag_snap = options.drag_snap,
         .alignment_snap = options.alignment_snap,
         .distribution_snap = options.distribution_snap,
+        .box_select_scope = options.box_select_scope,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -289,8 +293,7 @@ const InteractionSnapshot = struct {
                 state.resizing_group_id != null or
                 state.resizing_group_edges.any() or
                 state.dragging_connection_from_id != null or
-                state.reconnecting_connection != null or
-                state.box_selecting,
+                state.reconnecting_connection != null,
         };
     }
 
@@ -1219,6 +1222,150 @@ test "node editor view handles minimap panning and shift box selection" {
     try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
     try std.testing.expect(state.isNodeSelected(1));
     try std.testing.expect(state.isNodeSelected(2));
+}
+
+test "node editor view visible box selection supports contain crossing and modifiers" {
+    var selected_nodes: [4]u32 = .{0} ** 4;
+    var selected_connections: [4]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 60, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 2 }};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var draw_storage = node_editor.StaticConnectionDrawWorkspace(connections.len){};
+    var draw_workspace = draw_storage.workspace();
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 400, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 400, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9424,
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .viewport_index = &viewport_index,
+        .connection_draw_workspace = &draw_workspace,
+        .box_select_scope = .visible_only,
+        .drag_auto_pan = .{ .enabled = false },
+        .show_minimap = false,
+        .grid_color = Color.transparent,
+        .style = .{ .width = .{ .px = 400 }, .height = .{ .px = 240 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    editor_node.input_shift_down = true;
+
+    var contain_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = 50, .y = 70 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &contain_down, editor_node.paint_user_data));
+    var contain_move = ElementEvent{ .mouse_move = .{ .x = 350, .y = 170, .dx = 300, .dy = 100 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &contain_move, editor_node.paint_user_data));
+    try std.testing.expect(!state.box_select_crossing);
+    var contain_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = 350, .y = 170 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &contain_up, editor_node.paint_user_data));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+
+    editor_node.input_alt_down = true;
+    var subtract_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = 220, .y = 100 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &subtract_down, editor_node.paint_user_data));
+    var subtract_move = ElementEvent{ .mouse_move = .{ .x = 180, .y = 140, .dx = -40, .dy = 40 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &subtract_move, editor_node.paint_user_data));
+    try std.testing.expect(state.box_select_crossing);
+    var subtract_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = 180, .y = 140 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &subtract_up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+
+    editor_node.input_alt_down = false;
+    editor_node.input_control_down = true;
+    var add_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = 220, .y = 100 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &add_down, editor_node.paint_user_data));
+    var add_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = 180, .y = 140 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &add_up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+
+    var out = std.ArrayList(DrawCmd).empty;
+    defer out.deinit(std.testing.allocator);
+    _ = try node_editor.appendNodeEditor(std.testing.allocator, &out, editor_node.rect, @as(*Binding, @ptrCast(@alignCast(editor_node.paint_user_data.?))).editor(), 0);
+    var selected_strokes: usize = 0;
+    for (out.items) |command| switch (command) {
+        .stroke_path => |stroke| if (stroke.style.width == 3.25) {
+            selected_strokes += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), selected_strokes);
+
+    editor_node.input_alt_down = true;
+    var toggle_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = 220, .y = 100 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &toggle_down, editor_node.paint_user_data));
+    var toggle_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = 180, .y = 140 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &toggle_up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+    try std.testing.expectEqual(node_editor.BoxSelectScope.nodes_only, state.box_select_scope);
+    try std.testing.expect(!state.box_selecting);
+}
+
+test "node editor view visible box selection clips viewport and rejects overflow atomically" {
+    var selected_nodes = [_]u32{ 4, 0, 0 };
+    var selected_connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 4 }};
+    var state = node_editor.State{
+        .selected_node_ids = &selected_nodes,
+        .selected_node_len = 1,
+        .selected_node_id = 4,
+        .selected_connections = &selected_connections,
+        .selected_connection_len = 1,
+        .selected_connection = selected_connections[0],
+    };
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ -40, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 3, .title = "C", .pos = .{ 60, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 4, .title = "outside", .pos = .{ -300, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]node_editor.Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 1, .to_id = 4 },
+    };
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 400, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 400, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9425,
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .viewport_index = &viewport_index,
+        .box_select_scope = .visible_only,
+        .drag_auto_pan = .{ .enabled = false },
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 400 }, .height = .{ .px = 240 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    editor_node.input_shift_down = true;
+
+    var overflow_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = 50, .y = 70 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &overflow_down, editor_node.paint_user_data));
+    var overflow_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = 350, .y = 170 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &overflow_up, editor_node.paint_user_data));
+    try std.testing.expectEqualSlices(u32, &.{4}, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(connections[2]));
+    try std.testing.expect(viewport_index.summary().valid);
+
+    _ = state.clearSelection();
+    var clipped_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = 40, .y = 60 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &clipped_down, editor_node.paint_user_data));
+    var clipped_up = ElementEvent{ .mouse_up = .{ .button = .left, .x = -120, .y = 180 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &clipped_up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 0), state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(connections[2]));
+    try std.testing.expect(!state.box_selecting);
 }
 
 test "node editor view handles groups and reconnect gestures through shared event adapter" {

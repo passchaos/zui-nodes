@@ -271,6 +271,13 @@ pub const BoxSelectMode = enum {
     toggle,
 };
 
+pub const BoxSelectScope = enum {
+    /// Preserve the original node-only intersection selection behavior.
+    nodes_only,
+    /// Select visible nodes and links. Left-to-right contains; right-to-left crosses.
+    visible_only,
+};
+
 pub const Node = struct {
     id: u32,
     title: []const u8,
@@ -458,6 +465,7 @@ pub fn Options(comptime StateType: type) type {
         drag_snap: DragSnapOptions = .{},
         alignment_snap: AlignmentSnapOptions = .{},
         distribution_snap: DistributionSnapOptions = .{},
+        box_select_scope: BoxSelectScope = .nodes_only,
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -951,6 +959,145 @@ pub fn connectionHit(rect: Rect, state: anytype, nodes: []const Node, connection
     return cubicDistanceToPoint(a, .{ a[0] + @max(40.0, @abs(b[0] - a[0]) * 0.5), a[1] }, .{ b[0] - @max(40.0, @abs(b[0] - a[0]) * 0.5), b[1] }, b, point) <= 7.0;
 }
 
+fn nodeMatchesBox(node: Node, selection: Rect, editor_rect: Rect, state: State, crossing: bool) bool {
+    const node_rect = nodeRectFromState(editor_rect, state, node);
+    return if (crossing) rectIntersects(node_rect, selection) else rectContainsRect(selection, node_rect);
+}
+
+fn connectionMatchesBox(editor_rect: Rect, state: State, nodes: []const Node, node_lookup: ?*const ViewportIndex, connection: Connection, selection: Rect, crossing: bool) bool {
+    const from = nodeForBoxSelection(nodes, node_lookup, connection.from_id) orelse return false;
+    const to = nodeForBoxSelection(nodes, node_lookup, connection.to_id) orelse return false;
+    const start = outputPortPositionAt(editor_rect, state, from, connection.from_port);
+    const end = inputPortPositionAt(editor_rect, state, to, connection.to_port);
+    const path = connectionPathForPoints(start, end);
+    const bounds = cubicBounds(path);
+    if (!rectIntersects(bounds, selection)) return false;
+    if (!crossing) return rectContainsRect(selection, bounds);
+    if (selection.contains(path.start) or selection.contains(path.end)) return true;
+    return cubicIntersectsRect(path, selection, 0);
+}
+
+fn nodeForBoxSelection(nodes: []const Node, node_lookup: ?*const ViewportIndex, id: u32) ?Node {
+    if (node_lookup) |index| {
+        const node_index = index.nodeIndexForId(id) orelse return null;
+        return if (node_index < nodes.len) nodes[node_index] else null;
+    }
+    return nodeById(nodes, id);
+}
+
+fn rectContainsRect(outer: Rect, inner: Rect) bool {
+    return inner.x >= outer.x and inner.y >= outer.y and
+        inner.x + inner.w <= outer.x + outer.w and inner.y + inner.h <= outer.y + outer.h;
+}
+
+fn clippedRect(rect: Rect, clip: Rect) ?Rect {
+    const x0 = @max(rect.x, clip.x);
+    const y0 = @max(rect.y, clip.y);
+    const x1 = @min(rect.x + rect.w, clip.x + clip.w);
+    const y1 = @min(rect.y + rect.h, clip.y + clip.h);
+    if (x1 < x0 or y1 < y0) return null;
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+fn cubicBounds(path: ConnectionPath) Rect {
+    var min_x = @min(path.start[0], path.end[0]);
+    var max_x = @max(path.start[0], path.end[0]);
+    var min_y = @min(path.start[1], path.end[1]);
+    var max_y = @max(path.start[1], path.end[1]);
+    includeCubicAxisBounds(path.start[0], path.c0[0], path.c1[0], path.end[0], &min_x, &max_x);
+    includeCubicAxisBounds(path.start[1], path.c0[1], path.c1[1], path.end[1], &min_y, &max_y);
+    return .{ .x = min_x, .y = min_y, .w = max_x - min_x, .h = max_y - min_y };
+}
+
+fn includeCubicAxisBounds(p0: f32, p1: f32, p2: f32, p3: f32, min_value: *f32, max_value: *f32) void {
+    const a = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
+    const b = 2.0 * (p0 - 2.0 * p1 + p2);
+    const c = p1 - p0;
+    if (@abs(a) <= 0.000001) {
+        if (@abs(b) > 0.000001) includeCubicAxisValue(p0, p1, p2, p3, -c / b, min_value, max_value);
+        return;
+    }
+    const discriminant = b * b - 4.0 * a * c;
+    if (discriminant < 0) return;
+    const root = @sqrt(discriminant);
+    includeCubicAxisValue(p0, p1, p2, p3, (-b + root) / (2.0 * a), min_value, max_value);
+    includeCubicAxisValue(p0, p1, p2, p3, (-b - root) / (2.0 * a), min_value, max_value);
+}
+
+fn includeCubicAxisValue(p0: f32, p1: f32, p2: f32, p3: f32, t: f32, min_value: *f32, max_value: *f32) void {
+    if (t <= 0 or t >= 1) return;
+    const u = 1.0 - t;
+    const value = p0 * u * u * u + 3.0 * p1 * u * u * t + 3.0 * p2 * u * t * t + p3 * t * t * t;
+    min_value.* = @min(min_value.*, value);
+    max_value.* = @max(max_value.*, value);
+}
+
+fn cubicIntersectsRect(path: ConnectionPath, rect: Rect, depth: u4) bool {
+    const control_bounds = pointsBounds(.{ path.start, path.c0, path.c1, path.end });
+    if (!rectIntersects(control_bounds, rect)) return false;
+    const flatness = @max(segmentDistanceToPoint(path.start, path.end, path.c0), segmentDistanceToPoint(path.start, path.end, path.c1));
+    if (depth >= 10 or flatness <= 0.25) return segmentIntersectsRect(path.start, path.end, rect);
+
+    const p01 = cubicMidpoint(path.start, path.c0);
+    const p12 = cubicMidpoint(path.c0, path.c1);
+    const p23 = cubicMidpoint(path.c1, path.end);
+    const p012 = cubicMidpoint(p01, p12);
+    const p123 = cubicMidpoint(p12, p23);
+    const split = cubicMidpoint(p012, p123);
+    return cubicIntersectsRect(.{ .start = path.start, .c0 = p01, .c1 = p012, .end = split }, rect, depth + 1) or
+        cubicIntersectsRect(.{ .start = split, .c0 = p123, .c1 = p23, .end = path.end }, rect, depth + 1);
+}
+
+fn pointsBounds(points: [4][2]f32) Rect {
+    var min_x = points[0][0];
+    var max_x = points[0][0];
+    var min_y = points[0][1];
+    var max_y = points[0][1];
+    for (points[1..]) |point| {
+        min_x = @min(min_x, point[0]);
+        max_x = @max(max_x, point[0]);
+        min_y = @min(min_y, point[1]);
+        max_y = @max(max_y, point[1]);
+    }
+    return .{ .x = min_x, .y = min_y, .w = max_x - min_x, .h = max_y - min_y };
+}
+
+fn cubicMidpoint(a: [2]f32, b: [2]f32) [2]f32 {
+    return .{ (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 };
+}
+
+fn segmentIntersectsRect(a: [2]f32, b: [2]f32, rect: Rect) bool {
+    var t0: f32 = 0;
+    var t1: f32 = 1;
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    return clipSegmentAxis(-dx, a[0] - rect.x, &t0, &t1) and
+        clipSegmentAxis(dx, rect.x + rect.w - a[0], &t0, &t1) and
+        clipSegmentAxis(-dy, a[1] - rect.y, &t0, &t1) and
+        clipSegmentAxis(dy, rect.y + rect.h - a[1], &t0, &t1);
+}
+
+fn clipSegmentAxis(p: f32, q: f32, t0: *f32, t1: *f32) bool {
+    if (@abs(p) <= 0.000001) return q >= 0;
+    const ratio = q / p;
+    if (p < 0) {
+        if (ratio > t1.*) return false;
+        t0.* = @max(t0.*, ratio);
+    } else {
+        if (ratio < t0.*) return false;
+        t1.* = @min(t1.*, ratio);
+    }
+    return true;
+}
+
+fn connectionSelectionCapacity(state: *const State) usize {
+    return if (state.selected_connections.len > 0) state.selected_connections.len else 1;
+}
+
+fn nodeSelectionCapacity(state: *const State) usize {
+    return if (state.selected_node_ids.len > 0) state.selected_node_ids.len else 1;
+}
+
 pub fn optionalConnectionEqual(a: ?Connection, b: ?Connection) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -1311,6 +1458,9 @@ pub const State = struct {
     box_select_start: [2]f32 = .{ 0.0, 0.0 },
     box_select_end: [2]f32 = .{ 0.0, 0.0 },
     box_select_mode: BoxSelectMode = .replace,
+    box_select_scope: BoxSelectScope = .nodes_only,
+    box_select_origin_x: f32 = 0.0,
+    box_select_crossing: bool = false,
     dragging_minimap: bool = false,
     minimap_drag_offset: [2]f32 = .{ 0.0, 0.0 },
     context_menu: ContextMenuState = .{},
@@ -1387,7 +1537,7 @@ pub const State = struct {
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
         self.dragging_canvas = false;
-        self.box_selecting = false;
+        _ = self.finishBoxSelection(false);
         if (preserve_multi_selection) {
             self.selected_node_id = id;
             self.selected_group_id = null;
@@ -1411,7 +1561,7 @@ pub const State = struct {
         self.dragging_connection_from_port = 0;
         self.connection_preview_valid = true;
         self.reconnecting_connection = null;
-        self.box_selecting = false;
+        _ = self.finishBoxSelection(false);
         self.dragging_minimap = false;
         self.minimap_drag_offset = .{ 0.0, 0.0 };
         self.hover_group_id = null;
@@ -1447,7 +1597,7 @@ pub const State = struct {
         self.dragging_connection_from_port = 0;
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
-        self.box_selecting = false;
+        _ = self.finishBoxSelection(false);
         return self.setGroupSelection(id) or changed;
     }
 
@@ -1464,7 +1614,7 @@ pub const State = struct {
         self.dragging_connection_from_port = 0;
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
-        self.box_selecting = false;
+        _ = self.finishBoxSelection(false);
         return self.setGroupSelection(id) or changed;
     }
 
@@ -1556,7 +1706,7 @@ pub const State = struct {
         self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else nodes[count - 1].id;
         self.selected_group_id = null;
         _ = self.clearConnectionSelection();
-        self.box_selecting = false;
+        _ = self.finishBoxSelection(false);
 
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
@@ -1693,6 +1843,28 @@ pub const State = struct {
             if (State.connectionEndpointsEqual(selected.*, previous)) selected.* = replacement;
         }
         self.selected_connection = replacement;
+    }
+
+    fn retainExistingConnectionSelection(self: *State, connections: []const Connection) void {
+        const stored = self.storedConnectionSelectionLen();
+        if (stored == 0) {
+            if (self.selected_connection) |primary| {
+                if (!connectionExists(connections, primary)) _ = self.clearConnectionSelection();
+            }
+            return;
+        }
+        var write: usize = 0;
+        for (self.selected_connections[0..stored], 0..) |selected, read| {
+            if (!connectionExists(connections, selected)) continue;
+            if (write != read) self.selected_connections[write] = selected;
+            write += 1;
+        }
+        self.selected_connection_len = write;
+        if (write == 0) {
+            self.selected_connection = null;
+        } else if (self.selected_connection == null or !connectionExists(self.selected_connections[0..write], self.selected_connection.?)) {
+            self.selected_connection = self.selected_connections[write - 1];
+        }
     }
 
     fn selectedConnectionAtEndpoint(self: *const State, endpoint: ConnectionEnd, node_id: u32, port: u8) ?Connection {
@@ -2194,7 +2366,7 @@ pub const State = struct {
         }
         connection_len.* = write;
         if (changed) {
-            _ = self.clearConnectionSelection();
+            self.retainExistingConnectionSelection(connections[0..write]);
             self.hover_connection = null;
         }
         return changed;
@@ -2324,7 +2496,7 @@ pub const State = struct {
         }
         connection_len.* = write;
         if (changed) {
-            _ = self.clearConnectionSelection();
+            self.retainExistingConnectionSelection(connections[0..write]);
             self.hover_connection = null;
         }
         return changed;
@@ -2895,7 +3067,13 @@ pub const State = struct {
     }
 
     fn addNodeToSelection(self: *State, id: u32) void {
-        if (self.isNodeSelected(id) or self.selected_node_ids.len == 0) return;
+        if (self.isNodeSelected(id)) return;
+        if (self.selected_node_ids.len == 0) {
+            self.selected_node_id = id;
+            self.selected_group_id = null;
+            _ = self.clearConnectionSelection();
+            return;
+        }
         if (self.selected_node_len >= self.selected_node_ids.len) return;
         self.selected_node_ids[self.selected_node_len] = id;
         self.selected_node_len += 1;
@@ -3003,9 +3181,16 @@ pub const State = struct {
     }
 
     pub fn beginBoxSelectMode(self: *State, point: [2]f32, mode: BoxSelectMode) bool {
+        return self.beginBoxSelectModeWithScope(point, mode, .nodes_only);
+    }
+
+    pub fn beginBoxSelectModeWithScope(self: *State, point: [2]f32, mode: BoxSelectMode, scope: BoxSelectScope) bool {
         self.resetNodeDragTracking();
         self.box_selecting = true;
         self.box_select_mode = mode;
+        self.box_select_scope = scope;
+        self.box_select_origin_x = point[0];
+        self.box_select_crossing = false;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
         self.dragging_group_id = null;
@@ -3035,8 +3220,10 @@ pub const State = struct {
 
     pub fn updateBoxSelect(self: *State, point: [2]f32) bool {
         if (!self.box_selecting) return false;
-        const changed = @abs(self.box_select_end[0] - point[0]) > 0.001 or @abs(self.box_select_end[1] - point[1]) > 0.001;
+        const crossing = point[0] < self.box_select_origin_x;
+        const changed = @abs(self.box_select_end[0] - point[0]) > 0.001 or @abs(self.box_select_end[1] - point[1]) > 0.001 or self.box_select_crossing != crossing;
         self.box_select_end = point;
+        self.box_select_crossing = crossing;
         return changed;
     }
 
@@ -3057,14 +3244,18 @@ pub const State = struct {
     }
 
     fn applyBoxSelectionIndexed(self: *State, nodes: []const Node, node_indices: ?[]const usize, rect: Rect, editor_rect: Rect, zoom: f32, pan: [2]f32) bool {
+        var temp_state = self.*;
+        temp_state.zoom = zoom;
+        temp_state.pan = pan;
+        if (self.boxSelectionNodeTargetCount(nodes, node_indices, rect, editor_rect, temp_state, true) > nodeSelectionCapacity(self)) return self.finishBoxSelection(false);
         const before_len = self.selected_node_len;
         const before_id = self.selected_node_id;
         var before_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| before_hash = before_hash *% 16777619 +% id;
-        if (self.box_select_mode == .replace) self.selected_node_len = 0;
-        var temp_state = self.*;
-        temp_state.zoom = zoom;
-        temp_state.pan = pan;
+        if (self.box_select_mode == .replace) {
+            self.selected_node_len = 0;
+            self.selected_node_id = null;
+        }
         if (node_indices) |indices| {
             for (indices) |node_index| {
                 if (node_index >= nodes.len) continue;
@@ -3073,12 +3264,10 @@ pub const State = struct {
         } else {
             for (nodes) |node| self.applyBoxSelectionNode(node, rect, editor_rect, temp_state);
         }
-        self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else null;
-        self.box_selecting = false;
-        self.box_select_mode = .replace;
+        if (self.selected_node_ids.len > 0) self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else null;
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
-        return before_len != self.selected_node_len or before_id != self.selected_node_id or before_hash != after_hash;
+        return self.finishBoxSelection(before_len != self.selected_node_len or before_id != self.selected_node_id or before_hash != after_hash);
     }
 
     fn applyBoxSelectionNode(self: *State, node: Node, rect: Rect, editor_rect: Rect, temp_state: State) void {
@@ -3092,6 +3281,239 @@ pub const State = struct {
             else
                 self.addNodeToSelection(node.id),
         }
+    }
+
+    pub fn applyVisibleBoxSelection(
+        self: *State,
+        nodes: []const Node,
+        node_indices: ?[]const usize,
+        connections: []const Connection,
+        connection_indices: ?[]const usize,
+        rect: Rect,
+        editor_rect: Rect,
+        zoom: f32,
+        pan: [2]f32,
+    ) bool {
+        return self.applyVisibleBoxSelectionWithLookup(nodes, node_indices, connections, connection_indices, null, rect, editor_rect, zoom, pan);
+    }
+
+    pub fn applyVisibleBoxSelectionIndexed(
+        self: *State,
+        nodes: []const Node,
+        node_indices: []const usize,
+        connections: []const Connection,
+        connection_indices: []const usize,
+        node_lookup: *const ViewportIndex,
+        rect: Rect,
+        editor_rect: Rect,
+        zoom: f32,
+        pan: [2]f32,
+    ) bool {
+        return self.applyVisibleBoxSelectionWithLookup(nodes, node_indices, connections, connection_indices, node_lookup, rect, editor_rect, zoom, pan);
+    }
+
+    fn applyVisibleBoxSelectionWithLookup(
+        self: *State,
+        nodes: []const Node,
+        node_indices: ?[]const usize,
+        connections: []const Connection,
+        connection_indices: ?[]const usize,
+        node_lookup: ?*const ViewportIndex,
+        rect: Rect,
+        editor_rect: Rect,
+        zoom: f32,
+        pan: [2]f32,
+    ) bool {
+        var temp_state = self.*;
+        temp_state.zoom = zoom;
+        temp_state.pan = pan;
+        const crossing = self.box_select_crossing;
+        const node_target_count = self.boxSelectionNodeTargetCount(nodes, node_indices, rect, editor_rect, temp_state, crossing);
+        const connection_target_count = self.boxSelectionConnectionTargetCount(nodes, connections, connection_indices, node_lookup, rect, editor_rect, temp_state, crossing);
+        if (node_target_count > nodeSelectionCapacity(self) or connection_target_count > connectionSelectionCapacity(self)) return self.finishBoxSelection(false);
+
+        const before_node_len = self.boundedSelectionLen();
+        const before_node_id = self.selected_node_id;
+        const before_connection_len = self.boundedConnectionSelectionLen();
+        const before_connection = self.selected_connection;
+        const before_node_hash = self.selectedNodeSelectionHash();
+        const before_connection_hash = self.selectedConnectionSelectionHash();
+
+        const before_group_id = self.selected_group_id;
+        if (self.box_select_mode == .replace) {
+            self.selected_node_len = 0;
+            self.selected_node_id = null;
+            _ = self.clearConnectionSelection();
+        }
+        if (node_indices) |indices| {
+            for (indices) |node_index| {
+                if (node_index >= nodes.len) continue;
+                self.applyVisibleBoxSelectionNode(nodes[node_index], rect, editor_rect, temp_state, crossing);
+            }
+        } else {
+            for (nodes) |node| self.applyVisibleBoxSelectionNode(node, rect, editor_rect, temp_state, crossing);
+        }
+        if (connection_indices) |indices| {
+            for (indices) |connection_index| {
+                if (connection_index >= connections.len) continue;
+                self.applyVisibleBoxSelectionConnection(nodes, node_lookup, connections[connection_index], rect, editor_rect, temp_state, crossing);
+            }
+        } else {
+            for (connections) |connection| self.applyVisibleBoxSelectionConnection(nodes, node_lookup, connection, rect, editor_rect, temp_state, crossing);
+        }
+        if (self.selected_node_ids.len > 0) self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else null;
+        self.selected_group_id = null;
+        return self.finishBoxSelection(before_node_len != self.boundedSelectionLen() or before_node_id != self.selected_node_id or before_group_id != null or
+            before_connection_len != self.boundedConnectionSelectionLen() or !optionalConnectionEqual(before_connection, self.selected_connection) or
+            before_node_hash != self.selectedNodeSelectionHash() or before_connection_hash != self.selectedConnectionSelectionHash());
+    }
+
+    fn boxSelectionNodeTargetCount(self: *const State, nodes: []const Node, node_indices: ?[]const usize, rect: Rect, editor_rect: Rect, temp_state: State, crossing: bool) usize {
+        var count = if (self.box_select_mode == .replace) @as(usize, 0) else if (self.boundedSelectionLen() > 0) self.boundedSelectionLen() else @intFromBool(self.selected_node_id != null);
+        if (node_indices) |indices| {
+            for (indices) |node_index| {
+                if (node_index >= nodes.len) continue;
+                count = self.adjustedNodeSelectionCount(count, nodes[node_index], rect, editor_rect, temp_state, crossing);
+            }
+        } else {
+            for (nodes) |node| count = self.adjustedNodeSelectionCount(count, node, rect, editor_rect, temp_state, crossing);
+        }
+        return count;
+    }
+
+    fn adjustedNodeSelectionCount(self: *const State, count: usize, node: Node, rect: Rect, editor_rect: Rect, temp_state: State, crossing: bool) usize {
+        if (!nodeMatchesBox(node, rect, editor_rect, temp_state, crossing)) return count;
+        const selected = self.box_select_mode != .replace and self.isNodeSelected(node.id);
+        return switch (self.box_select_mode) {
+            .replace => count + 1,
+            .add => count + @intFromBool(!selected),
+            .subtract => count - @intFromBool(selected),
+            .toggle => if (selected) count - 1 else count + 1,
+        };
+    }
+
+    fn boxSelectionConnectionTargetCount(self: *const State, nodes: []const Node, connections: []const Connection, connection_indices: ?[]const usize, node_lookup: ?*const ViewportIndex, rect: Rect, editor_rect: Rect, temp_state: State, crossing: bool) usize {
+        var count = if (self.box_select_mode == .replace) @as(usize, 0) else self.boundedConnectionSelectionLen();
+        if (connection_indices) |indices| {
+            for (indices) |connection_index| {
+                if (connection_index >= connections.len) continue;
+                count = self.adjustedConnectionSelectionCount(count, nodes, node_lookup, connections[connection_index], rect, editor_rect, temp_state, crossing);
+            }
+        } else {
+            for (connections) |connection| count = self.adjustedConnectionSelectionCount(count, nodes, node_lookup, connection, rect, editor_rect, temp_state, crossing);
+        }
+        return count;
+    }
+
+    fn adjustedConnectionSelectionCount(self: *const State, count: usize, nodes: []const Node, node_lookup: ?*const ViewportIndex, connection: Connection, rect: Rect, editor_rect: Rect, temp_state: State, crossing: bool) usize {
+        if (!connectionMatchesBox(editor_rect, temp_state, nodes, node_lookup, connection, rect, crossing)) return count;
+        const selected = self.box_select_mode != .replace and self.isConnectionSelected(connection);
+        return switch (self.box_select_mode) {
+            .replace => count + 1,
+            .add => count + @intFromBool(!selected),
+            .subtract => count - @intFromBool(selected),
+            .toggle => if (selected) count - 1 else count + 1,
+        };
+    }
+
+    fn applyVisibleBoxSelectionNode(self: *State, node: Node, rect: Rect, editor_rect: Rect, temp_state: State, crossing: bool) void {
+        if (!nodeMatchesBox(node, rect, editor_rect, temp_state, crossing)) return;
+        switch (self.box_select_mode) {
+            .replace, .add => self.addNodeToSelectionMixed(node.id),
+            .subtract => self.removeNodeFromSelection(node.id),
+            .toggle => if (self.isNodeSelected(node.id)) self.removeNodeFromSelection(node.id) else self.addNodeToSelectionMixed(node.id),
+        }
+    }
+
+    fn addNodeToSelectionMixed(self: *State, id: u32) void {
+        if (self.isNodeSelected(id)) return;
+        if (self.selected_node_ids.len == 0) {
+            if (self.selected_node_id == null) self.selected_node_id = id;
+            return;
+        }
+        if (self.boundedSelectionLen() == 0) {
+            if (self.selected_node_id) |primary| {
+                if (self.selected_node_ids.len < 2) return;
+                self.selected_node_ids[0] = primary;
+                self.selected_node_len = 1;
+            }
+        }
+        if (self.selected_node_len >= self.selected_node_ids.len) return;
+        self.selected_node_ids[self.selected_node_len] = id;
+        self.selected_node_len += 1;
+        self.selected_node_id = id;
+    }
+
+    fn addConnectionToSelectionMixed(self: *State, connection: Connection) void {
+        if (self.isConnectionSelected(connection)) return;
+        if (self.selected_connections.len == 0) {
+            if (self.selected_connection == null) self.selected_connection = connection;
+            return;
+        }
+        if (self.storedConnectionSelectionLen() == 0) {
+            if (self.selected_connection) |primary| {
+                if (self.selected_connections.len < 2) return;
+                self.selected_connections[0] = primary;
+                self.selected_connection_len = 1;
+            }
+        }
+        if (self.selected_connection_len >= self.selected_connections.len) return;
+        self.selected_connections[self.selected_connection_len] = connection;
+        self.selected_connection_len += 1;
+        self.selected_connection = connection;
+    }
+
+    fn removeConnectionFromSelectionMixed(self: *State, connection: Connection) void {
+        const stored = self.storedConnectionSelectionLen();
+        if (stored == 0) {
+            if (self.selected_connection != null and State.connectionEndpointsEqual(self.selected_connection.?, connection)) _ = self.clearConnectionSelection();
+            return;
+        }
+        const primary_removed = self.selected_connection != null and State.connectionEndpointsEqual(self.selected_connection.?, connection);
+        var write: usize = 0;
+        for (self.selected_connections[0..stored]) |selected| {
+            if (State.connectionEndpointsEqual(selected, connection)) continue;
+            if (write != self.selected_connection_len) self.selected_connections[write] = selected;
+            write += 1;
+        }
+        self.selected_connection_len = write;
+        if (primary_removed) self.selected_connection = if (write > 0) self.selected_connections[write - 1] else null;
+    }
+
+    fn selectedNodeSelectionHash(self: *const State) u64 {
+        var hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| hash = (hash ^ id) *% 0x0000_0100_0000_01b3;
+        return hash;
+    }
+
+    fn selectedConnectionSelectionHash(self: *const State) u64 {
+        var hash: u64 = 0xcbf2_9ce4_8422_2325;
+        var index: usize = 0;
+        while (index < self.boundedConnectionSelectionLen()) : (index += 1) {
+            const connection = self.connectionSelectionAt(index) orelse continue;
+            hash = (hash ^ connectionSelectionHash(connection)) *% 0x0000_0100_0000_01b3;
+        }
+        return hash;
+    }
+
+    fn applyVisibleBoxSelectionConnection(self: *State, nodes: []const Node, node_lookup: ?*const ViewportIndex, connection: Connection, rect: Rect, editor_rect: Rect, temp_state: State, crossing: bool) void {
+        if (!connectionMatchesBox(editor_rect, temp_state, nodes, node_lookup, connection, rect, crossing)) return;
+        switch (self.box_select_mode) {
+            .replace, .add => self.addConnectionToSelectionMixed(connection),
+            .subtract => self.removeConnectionFromSelectionMixed(connection),
+            .toggle => if (self.isConnectionSelected(connection)) self.removeConnectionFromSelectionMixed(connection) else self.addConnectionToSelectionMixed(connection),
+        }
+    }
+
+    fn finishBoxSelection(self: *State, changed: bool) bool {
+        self.box_selecting = false;
+        self.box_select_mode = .replace;
+        self.box_select_scope = .nodes_only;
+        self.box_select_start = .{ 0, 0 };
+        self.box_select_end = .{ 0, 0 };
+        self.box_select_origin_x = 0;
+        self.box_select_crossing = false;
+        return changed;
     }
 
     pub fn takePendingConnection(self: *State) ?Connection {
@@ -3136,7 +3558,7 @@ pub const State = struct {
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
-        self.box_selecting = false;
+        _ = self.finishBoxSelection(false);
         self.connection_preview = preview;
         return changed;
     }
@@ -3293,6 +3715,11 @@ fn editorDistributionSnapOptions(editor: anytype) DistributionSnapOptions {
     return if (@hasField(Editor, "distribution_snap")) editor.distribution_snap else .{};
 }
 
+fn editorBoxSelectScope(editor: anytype) BoxSelectScope {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "box_select_scope")) editor.box_select_scope else .nodes_only;
+}
+
 fn editorDragAutoPanActive(editor: anytype) bool {
     return editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or
         editor.state.resizing_group_id != null or editor.state.dragging_connection_from_id != null or
@@ -3310,6 +3737,7 @@ fn applyEditorDragAutoPan(editor: anytype, delta: [2]f32) bool {
     if (editor.state.box_selecting) {
         editor.state.box_select_start[0] += delta[0];
         editor.state.box_select_start[1] += delta[1];
+        editor.state.box_select_origin_x += delta[0];
     }
     return true;
 }
@@ -3382,8 +3810,12 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     if (editor.state.box_selecting) {
         const box = editor.state.boxSelectRect();
         if (box.w > 0.0 and box.h > 0.0) {
-            try paint_primitives.appendFillRect(allocator, out, box, editor.selected_color.withAlpha(0.16), 0.0, layer + 7);
-            try paint_primitives.appendBorder(allocator, out, box, editor.selected_color.withAlpha(0.72), 1.0, 0.0, layer + 8);
+            const box_color = if (editor.state.box_select_scope == .visible_only and editor.state.box_select_crossing)
+                Color.rgb8(45, 212, 191)
+            else
+                editor.selected_color;
+            try paint_primitives.appendFillRect(allocator, out, box, box_color.withAlpha(0.16), 0.0, layer + 7);
+            try paint_primitives.appendBorder(allocator, out, box, box_color.withAlpha(0.72), 1.0, 0.0, layer + 8);
         }
     }
     if (editor.show_minimap) try appendNodeEditorMinimap(allocator, out, rect, editor, viewport_index, layer + 9);
@@ -4570,7 +5002,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                     .add
                 else
                     .replace;
-                return editor.state.beginBoxSelectMode(.{ m.x, m.y }, mode);
+                return editor.state.beginBoxSelectModeWithScope(.{ m.x, m.y }, mode, editorBoxSelectScope(editor));
             }
             _ = editor.state.clearSelection();
             editor.state.dragging_canvas = true;
@@ -4584,13 +5016,29 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return true;
             }
             if (editor.state.box_selecting) {
-                editor.state.box_select_end = .{ m.x, m.y };
-                const box = editor.state.boxSelectRect();
+                _ = editor.state.updateBoxSelect(.{ m.x, m.y });
+                const box = clippedRect(editor.state.boxSelectRect(), rect) orelse {
+                    _ = editor.state.finishBoxSelection(false);
+                    return true;
+                };
+                if (editor.state.box_select_scope == .visible_only) {
+                    const connections = editorActiveConnections(editor);
+                    if (viewport_index) |index| {
+                        const node_candidates = index.nodeIndicesInScreenRect(rect, editor.state.pan, editor.state.zoom, box);
+                        const connection_candidates = index.connectionIndicesInScreenRect(rect, editor.state.pan, editor.state.zoom, box);
+                        _ = editor.state.applyVisibleBoxSelectionIndexed(editor.nodes, node_candidates, connections, connection_candidates, index, box, rect, editor.state.zoom, editor.state.pan);
+                        return true;
+                    }
+                    _ = editor.state.applyVisibleBoxSelection(editor.nodes, null, connections, null, box, rect, editor.state.zoom, editor.state.pan);
+                    return true;
+                }
                 if (viewport_index) |index| {
                     const candidates = index.nodeIndicesInScreenRect(rect, editor.state.pan, editor.state.zoom, box);
-                    return editor.state.applyBoxSelectionCandidates(editor.nodes, candidates, box, rect, editor.state.zoom, editor.state.pan);
+                    _ = editor.state.applyBoxSelectionCandidates(editor.nodes, candidates, box, rect, editor.state.zoom, editor.state.pan);
+                    return true;
                 }
-                return editor.state.applyBoxSelection(editor.nodes, box, rect, editor.state.zoom, editor.state.pan);
+                _ = editor.state.applyBoxSelection(editor.nodes, box, rect, editor.state.zoom, editor.state.pan);
+                return true;
             }
             if (editor.state.reconnecting_connection) |connection| {
                 const endpoint = editor.state.reconnecting_connection_end;
@@ -5482,6 +5930,115 @@ test "NodeEditor indexed box selection matches full scan in every mode" {
         try std.testing.expectEqual(full.boundedSelectionLen(), indexed.boundedSelectionLen());
         try std.testing.expectEqualSlices(u32, full.selected_node_ids[0..full.boundedSelectionLen()], indexed.selected_node_ids[0..indexed.boundedSelectionLen()]);
     }
+}
+
+test "NodeEditor visible box selection contains or crosses nodes and Bezier links" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "upper", .pos = .{ -80, -80 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "lower", .pos = .{ 0, 20 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [1]Connection = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+
+    try std.testing.expect(state.beginBoxSelectModeWithScope(.{ 110, 30 }, .replace, .visible_only));
+    try std.testing.expect(state.updateBoxSelect(.{ 150, 80 }));
+    try std.testing.expect(!state.applyVisibleBoxSelection(&nodes, null, &connections, null, state.boxSelectRect(), viewport, 1, .{ 0, 0 }));
+    try std.testing.expectEqual(@as(usize, 0), state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+
+    try std.testing.expect(state.beginBoxSelectModeWithScope(.{ 110, 30 }, .replace, .visible_only));
+    try std.testing.expect(state.updateBoxSelect(.{ 290, 210 }));
+    try std.testing.expect(state.applyVisibleBoxSelection(&nodes, null, &connections, null, state.boxSelectRect(), viewport, 1, .{ 0, 0 }));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+
+    try std.testing.expect(state.beginBoxSelectModeWithScope(.{ 214, 84 }, .replace, .visible_only));
+    try std.testing.expect(state.updateBoxSelect(.{ 209, 77 }));
+    try std.testing.expect(state.box_select_crossing);
+    try std.testing.expect(state.applyVisibleBoxSelection(&nodes, null, &connections, null, state.boxSelectRect(), viewport, 1, .{ 0, 0 }));
+    try std.testing.expectEqual(@as(usize, 0), state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(!state.box_selecting);
+    try std.testing.expectEqual(BoxSelectScope.nodes_only, state.box_select_scope);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, state.box_select_start);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, state.box_select_end);
+    try std.testing.expectEqual(@as(f32, 0), state.box_select_origin_x);
+    try std.testing.expect(!state.box_select_crossing);
+}
+
+test "NodeEditor visible box selection rejects mixed capacity overflow atomically" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 60, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 3, .title = "kept", .pos = .{ 500, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+    };
+    var selected_nodes = [_]u32{3};
+    var selected_connections = [_]Connection{connections[1]};
+    var state = State{
+        .selected_node_ids = &selected_nodes,
+        .selected_node_len = 1,
+        .selected_node_id = 3,
+        .selected_connections = &selected_connections,
+        .selected_connection_len = 1,
+        .selected_connection = connections[1],
+    };
+
+    try std.testing.expect(state.beginBoxSelectModeWithScope(.{ 50, 70 }, .replace, .visible_only));
+    try std.testing.expect(state.updateBoxSelect(.{ 360, 170 }));
+    try std.testing.expect(!state.applyVisibleBoxSelection(&nodes, null, &connections, null, state.boxSelectRect(), viewport, 1, .{ 0, 0 }));
+    try std.testing.expectEqualSlices(u32, &.{3}, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(?u32, 3), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(connections[1]));
+    try std.testing.expect(!state.isConnectionSelected(connections[0]));
+    try std.testing.expect(!state.box_selecting);
+}
+
+test "NodeEditor visible box selection preserves legacy single-selection storage" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 60, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    var state = State{};
+
+    try std.testing.expect(state.beginBoxSelectModeWithScope(.{ 40, 70 }, .replace, .visible_only));
+    try std.testing.expect(state.updateBoxSelect(.{ 160, 170 }));
+    try std.testing.expect(state.applyVisibleBoxSelection(&nodes, null, &connections, null, state.boxSelectRect(), viewport, 1, .{ 0, 0 }));
+    try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+    try std.testing.expectEqual(@as(usize, 0), state.boundedSelectionLen());
+
+    try std.testing.expect(state.beginBoxSelectModeWithScope(.{ 220, 100 }, .replace, .visible_only));
+    try std.testing.expect(state.updateBoxSelect(.{ 180, 140 }));
+    try std.testing.expect(state.applyVisibleBoxSelection(&nodes, null, &connections, null, state.boxSelectRect(), viewport, 1, .{ 0, 0 }));
+    try std.testing.expectEqual(@as(?u32, null), state.selected_node_id);
+    try std.testing.expectEqual(@as(?Connection, connections[0]), state.selected_connection);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+}
+
+test "NodeEditor visible box add promotes legacy primary selection atomically" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 60, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    var selected_nodes: [2]u32 = undefined;
+    var state = State{ .selected_node_ids = &selected_nodes, .selected_node_id = 1 };
+
+    try std.testing.expect(state.beginBoxSelectModeWithScope(.{ 240, 70 }, .add, .visible_only));
+    try std.testing.expect(state.updateBoxSelect(.{ 360, 170 }));
+    try std.testing.expect(state.applyVisibleBoxSelection(&nodes, null, &.{}, null, state.boxSelectRect(), viewport, 1, .{ 0, 0 }));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
 }
 
 test "NodeEditor semantic zoom keeps paint and port hit detail aligned" {

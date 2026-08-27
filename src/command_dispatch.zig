@@ -803,6 +803,55 @@ test "zui-nodes command dispatch deletes multi-selected connections as one undo"
     try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
 }
 
+test "zui-nodes command dispatch deletes mixed node and connection selection as one undo" {
+    var selected_nodes = [_]u32{ 2, 0, 0, 0 };
+    var selected_connections = [_]node_editor.Connection{.{ .from_id = 3, .to_id = 4 }} ** 4;
+    var state = node_editor.State{
+        .selected_node_ids = &selected_nodes,
+        .selected_node_len = 1,
+        .selected_node_id = 2,
+        .selected_connections = &selected_connections,
+        .selected_connection_len = 1,
+        .selected_connection = selected_connections[0],
+    };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 200, 0 } },
+        .{ .id = 4, .title = "D", .pos = .{ 300, 0 } },
+    };
+    const before_nodes = nodes;
+    var node_len: usize = nodes.len;
+    var connections = [_]node_editor.Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 3, .to_id = 4 },
+    };
+    const before_connections = connections;
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var history_storage = node_editor.StaticHistoryWorkspace(nodes.len, 0, connections.len, selected_connections.len){};
+    try std.testing.expect(history.bindWorkspace(history_storage.workspace()));
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len, .history = &history };
+
+    try std.testing.expect(dispatchSelection(&context, .delete));
+    try std.testing.expectEqual(@as(usize, 3), node_len);
+    try std.testing.expectEqual(@as(usize, 0), connection_len);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expectEqual(@as(usize, 0), state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(usize, 0), state.boundedConnectionSelectionLen());
+
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expectEqual(@as(usize, 4), node_len);
+    try std.testing.expectEqual(@as(usize, 3), connection_len);
+    try std.testing.expectEqual(before_nodes, nodes);
+    try std.testing.expectEqual(before_connections, connections);
+    try std.testing.expectEqual(@as(usize, 1), state.boundedSelectionLen());
+    try std.testing.expect(state.isNodeSelected(2));
+    try std.testing.expectEqual(@as(usize, 1), state.boundedConnectionSelectionLen());
+    try std.testing.expect(state.isConnectionSelected(before_connections[2]));
+}
+
 test "zui-nodes multi-connection delete rejects undersized history atomically" {
     var selected_nodes: [2]u32 = .{0} ** 2;
     var selected_connections: [2]node_editor.Connection = undefined;

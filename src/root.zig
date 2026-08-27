@@ -155,6 +155,7 @@ pub const InspectorSnapshot = node_editor.InspectorSnapshot;
 pub const InspectorDraft = node_editor.InspectorDraft;
 pub const MinimapSnapshot = node_editor.MinimapSnapshot;
 pub const BoxSelectMode = node_editor.BoxSelectMode;
+pub const BoxSelectScope = node_editor.BoxSelectScope;
 pub const State = node_editor.State;
 pub const Node = node_editor.Node;
 pub const NodeTemplate = node_editor.NodeTemplate;

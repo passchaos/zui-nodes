@@ -17,6 +17,7 @@ const Options = struct {
     iterations: usize = default_iterations,
     max_paint_ns: ?f64 = null,
     max_multi_drag_ns: ?f64 = null,
+    max_box_connection_ns: ?f64 = null,
 };
 
 const Report = struct {
@@ -34,6 +35,9 @@ const Report = struct {
     selected_connection_count: usize,
     selected_connection_paint_ns_per_frame: f64,
     selected_connection_delete_ns: f64,
+    box_connection_ns_per_iteration: f64,
+    max_box_connection_candidates: usize,
+    box_connection_candidate_misses: usize,
     max_visible_nodes: usize,
     max_visible_connections: usize,
     max_draw_commands: usize,
@@ -361,17 +365,68 @@ fn run(init: std.process.Init, options: Options) !Report {
     const selected_connection_correct = selected_connection_count == selected_connections.len and selected_stroke_count == selected_connection_count and
         delete_changed and delete_connection_len == delete_len - selected_connection_count and state.boundedConnectionSelectionLen() == 0;
     const draw_summary = draw_workspace.summary();
+    const selected_paint_visible_connection_count = viewport_index.summary().visible_connection_count;
+
+    var indexed_box_nodes: [64]u32 = .{0} ** 64;
+    var indexed_box_connections: [64]node_editor.Connection = undefined;
+    var indexed_box_state = node_editor.State{ .selected_node_ids = &indexed_box_nodes, .selected_connections = &indexed_box_connections };
+    var full_box_nodes: [64]u32 = .{0} ** 64;
+    var full_box_connections: [64]node_editor.Connection = undefined;
+    var full_box_state = node_editor.State{ .selected_node_ids = &full_box_nodes, .selected_connections = &full_box_connections };
+    const box_rect = zui.Rect{ .x = 460, .y = 250, .w = 360, .h = 220 };
+    const box_revision: u64 = 5;
+    var box_elapsed_ns: u64 = 0;
+    var max_box_connection_candidates: usize = 0;
+    var box_connection_candidate_misses: usize = 0;
+    var box_selection_correct = true;
+    for (0..options.iterations) |iteration| {
+        const row = (iteration * 37) % rows;
+        const column = (iteration * 61) % columns;
+        const target = nodes[row * columns + column];
+        indexed_box_state.pan = .{ -target.pos[0], -target.pos[1] };
+        const box_started = std.Io.Clock.awake.now(init.io);
+        if (!viewport_index.prepareVersioned(nodes, &.{}, connections, viewport, indexed_box_state.pan, 1, box_revision).ready) return error.EditorBoxSelectionViewportUnavailable;
+        const node_candidates = viewport_index.nodeIndicesInScreenRect(viewport, indexed_box_state.pan, 1, box_rect);
+        const connection_candidates = viewport_index.connectionIndicesInScreenRect(viewport, indexed_box_state.pan, 1, box_rect);
+        max_box_connection_candidates = @max(max_box_connection_candidates, connection_candidates.len);
+        _ = indexed_box_state.beginBoxSelectModeWithScope(.{ box_rect.x + box_rect.w, box_rect.y }, .replace, .visible_only);
+        _ = indexed_box_state.updateBoxSelect(.{ box_rect.x, box_rect.y + box_rect.h });
+        _ = indexed_box_state.applyVisibleBoxSelectionIndexed(nodes, node_candidates, connections, connection_candidates, &viewport_index, box_rect, viewport, 1, indexed_box_state.pan);
+        box_elapsed_ns += @intCast(box_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+
+        if (iteration % @max(@as(usize, 1), options.iterations / 8) == 0) {
+            full_box_state.pan = indexed_box_state.pan;
+            _ = full_box_state.beginBoxSelectModeWithScope(.{ box_rect.x + box_rect.w, box_rect.y }, .replace, .visible_only);
+            _ = full_box_state.updateBoxSelect(.{ box_rect.x, box_rect.y + box_rect.h });
+            _ = full_box_state.applyVisibleBoxSelection(nodes, null, connections, null, box_rect, viewport, 1, full_box_state.pan);
+            box_selection_correct = box_selection_correct and
+                full_box_state.boundedSelectionLen() == indexed_box_state.boundedSelectionLen() and
+                full_box_state.boundedConnectionSelectionLen() == indexed_box_state.boundedConnectionSelectionLen();
+            for (full_box_state.selected_node_ids[0..full_box_state.boundedSelectionLen()]) |node_id| {
+                if (!indexed_box_state.isNodeSelected(node_id)) box_connection_candidate_misses += 1;
+            }
+            var full_connection_index: usize = 0;
+            while (full_connection_index < full_box_state.boundedConnectionSelectionLen()) : (full_connection_index += 1) {
+                if (!indexed_box_state.isConnectionSelected(full_box_state.connectionSelectionAt(full_connection_index).?)) box_connection_candidate_misses += 1;
+            }
+        }
+    }
+    const box_connection_ns_per_iteration = @as(f64, @floatFromInt(box_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+    box_selection_correct = box_selection_correct and full_box_state.boundedSelectionLen() > 0 and full_box_state.boundedConnectionSelectionLen() > 0 and
+        box_connection_candidate_misses == 0 and max_box_connection_candidates > 0 and max_box_connection_candidates < connection_count / 20;
     const quality_passed = connection_index == connection_count and paint_summary.valid and paint_summary.rebuild_count == 1 and
         max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
         max_visible_connections > 0 and max_visible_connections < connection_count / 10 and
         max_draw_commands < draw_command_capacity and owned_payload_count == 0 and fixed.end_index == 0 and
-        draw_summary.frame_count == options.iterations * 2 + 2 and draw_summary.borrowed_connection_count == viewport_index.summary().visible_connection_count and
+        draw_summary.frame_count == options.iterations * 2 + 2 and draw_summary.borrowed_connection_count == selected_paint_visible_connection_count and
         draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and
-        overview_adaptive_commands * 3 < overview_full_commands and drag_correct and alignment_snap_count > 0 and distribution_correct and selected_connection_correct and checksum != 0;
+        overview_adaptive_commands * 3 < overview_full_commands and drag_correct and alignment_snap_count > 0 and distribution_correct and
+        selected_connection_correct and box_selection_correct and checksum != 0;
     const performance_passed = options.max_paint_ns == null or paint_ns_per_frame <= options.max_paint_ns.?;
     const drag_performance_passed = options.max_multi_drag_ns == null or
         (multi_drag_ns_per_iteration <= options.max_multi_drag_ns.? and distribution_snap_ns_per_iteration <= options.max_multi_drag_ns.? and
             selected_connection_paint_ns_per_frame <= options.max_multi_drag_ns.? and selected_connection_delete_ns <= options.max_multi_drag_ns.?);
+    const box_performance_passed = options.max_box_connection_ns == null or box_connection_ns_per_iteration <= options.max_box_connection_ns.?;
     return .{
         .node_count = node_count,
         .connection_count = connection_count,
@@ -387,6 +442,9 @@ fn run(init: std.process.Init, options: Options) !Report {
         .selected_connection_count = selected_connection_count,
         .selected_connection_paint_ns_per_frame = selected_connection_paint_ns_per_frame,
         .selected_connection_delete_ns = selected_connection_delete_ns,
+        .box_connection_ns_per_iteration = box_connection_ns_per_iteration,
+        .max_box_connection_candidates = max_box_connection_candidates,
+        .box_connection_candidate_misses = box_connection_candidate_misses,
         .max_visible_nodes = max_visible_nodes,
         .max_visible_connections = max_visible_connections,
         .max_draw_commands = max_draw_commands,
@@ -397,8 +455,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         .owning_payload_count = owning_payload_count,
         .checksum = checksum,
         .quality_passed = quality_passed,
-        .performance_passed = performance_passed and drag_performance_passed,
-        .passed = quality_passed and performance_passed and drag_performance_passed,
+        .performance_passed = performance_passed and drag_performance_passed and box_performance_passed,
+        .passed = quality_passed and performance_passed and drag_performance_passed and box_performance_passed,
     };
 }
 
@@ -414,6 +472,8 @@ fn parseOptions(init: std.process.Init) !Options {
             options.max_paint_ns = try std.fmt.parseFloat(f64, arg["--max-paint-ns=".len..])
         else if (std.mem.startsWith(u8, arg, "--max-multi-drag-ns="))
             options.max_multi_drag_ns = try std.fmt.parseFloat(f64, arg["--max-multi-drag-ns=".len..])
+        else if (std.mem.startsWith(u8, arg, "--max-box-connection-ns="))
+            options.max_box_connection_ns = try std.fmt.parseFloat(f64, arg["--max-box-connection-ns=".len..])
         else
             return error.InvalidArgument;
     }
@@ -426,8 +486,8 @@ fn printReport(io: std.Io, report: Report) !void {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
     try stdout.print(
-        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x multi_drag={d}@{d:.3}ns alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
-        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x multi_drag={d}@{d:.3}ns alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns box_connections={d:.3}ns candidates={d} misses={d} max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.box_connection_ns_per_iteration, report.max_box_connection_candidates, report.box_connection_candidate_misses, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
     );
     try stdout.flush();
 }
