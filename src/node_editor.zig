@@ -314,167 +314,13 @@ pub const Group = struct {
     radius: f32 = 10.0,
 };
 
-pub const HistorySnapshot = struct {
-    nodes: [16]Node = undefined,
-    node_len: usize = 0,
-    groups: [16]Group = undefined,
-    group_len: usize = 0,
-    connections: [32]Connection = undefined,
-    connection_len: usize = 0,
-    selected_node_ids: [64]u32 = .{0} ** 64,
-    selected_node_len: usize = 0,
-    selected_node_id: ?u32 = null,
-    selected_group_id: ?u32 = null,
-    selected_connection: ?Connection = null,
-};
-
-pub const History = struct {
-    undo_stack: [16]HistorySnapshot = undefined,
-    undo_len: usize = 0,
-    redo_stack: [16]HistorySnapshot = undefined,
-    redo_len: usize = 0,
-
-    pub fn reset(self: *History) void {
-        self.undo_len = 0;
-        self.redo_len = 0;
-    }
-
-    pub fn capture(_: *History, state: anytype, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize) HistorySnapshot {
-        return captureHistorySnapshot(state, nodes, node_len, &.{}, connections, connection_len);
-    }
-
-    pub fn captureWithGroups(_: *History, state: anytype, nodes: []const Node, node_len: usize, groups: []const Group, connections: []const Connection, connection_len: usize) HistorySnapshot {
-        return captureHistorySnapshot(state, nodes, node_len, groups, connections, connection_len);
-    }
-
-    fn captureHistorySnapshot(state: anytype, nodes: []const Node, node_len: usize, groups: []const Group, connections: []const Connection, connection_len: usize) HistorySnapshot {
-        var snapshot = HistorySnapshot{};
-        snapshot.node_len = @min(@min(node_len, nodes.len), snapshot.nodes.len);
-        snapshot.group_len = @min(groups.len, snapshot.groups.len);
-        snapshot.connection_len = @min(@min(connection_len, connections.len), snapshot.connections.len);
-        if (snapshot.node_len > 0) @memcpy(snapshot.nodes[0..snapshot.node_len], nodes[0..snapshot.node_len]);
-        if (snapshot.group_len > 0) @memcpy(snapshot.groups[0..snapshot.group_len], groups[0..snapshot.group_len]);
-        if (snapshot.connection_len > 0) @memcpy(snapshot.connections[0..snapshot.connection_len], connections[0..snapshot.connection_len]);
-        snapshot.selected_node_id = state.selected_node_id;
-        snapshot.selected_group_id = state.selected_group_id;
-        snapshot.selected_connection = state.selected_connection;
-        snapshot.selected_node_len = @min(state.boundedSelectionLen(), snapshot.selected_node_ids.len);
-        if (snapshot.selected_node_len > 0) @memcpy(snapshot.selected_node_ids[0..snapshot.selected_node_len], state.selected_node_ids[0..snapshot.selected_node_len]);
-        return snapshot;
-    }
-
-    pub fn pushBefore(self: *History, state: anytype, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize) void {
-        self.pushUndo(self.capture(state, nodes, node_len, connections, connection_len));
-        self.redo_len = 0;
-    }
-
-    pub fn pushBeforeWithGroups(self: *History, state: anytype, nodes: []const Node, node_len: usize, groups: []const Group, connections: []const Connection, connection_len: usize) void {
-        self.pushUndo(self.captureWithGroups(state, nodes, node_len, groups, connections, connection_len));
-        self.redo_len = 0;
-    }
-
-    pub fn undo(self: *History, state: anytype, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize) bool {
-        if (self.undo_len == 0) return false;
-        self.pushRedo(self.capture(state.*, nodes, node_len.*, connections, connection_len.*));
-        self.undo_len -= 1;
-        return applyHistorySnapshot(state, nodes, node_len, connections, connection_len, self.undo_stack[self.undo_len]);
-    }
-
-    pub fn undoWithGroups(self: *History, state: anytype, nodes: []Node, node_len: *usize, groups: []Group, group_len: ?*usize, connections: []Connection, connection_len: *usize) bool {
-        if (self.undo_len == 0) return false;
-        const current_group_len = if (group_len) |len| @min(len.*, groups.len) else groups.len;
-        self.pushRedo(self.captureWithGroups(state.*, nodes, node_len.*, groups[0..current_group_len], connections, connection_len.*));
-        self.undo_len -= 1;
-        return applyHistorySnapshotWithGroups(state, nodes, node_len, groups, group_len, connections, connection_len, self.undo_stack[self.undo_len]);
-    }
-
-    pub fn redo(self: *History, state: anytype, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize) bool {
-        if (self.redo_len == 0) return false;
-        self.pushUndo(self.capture(state.*, nodes, node_len.*, connections, connection_len.*));
-        self.redo_len -= 1;
-        return applyHistorySnapshot(state, nodes, node_len, connections, connection_len, self.redo_stack[self.redo_len]);
-    }
-
-    pub fn redoWithGroups(self: *History, state: anytype, nodes: []Node, node_len: *usize, groups: []Group, group_len: ?*usize, connections: []Connection, connection_len: *usize) bool {
-        if (self.redo_len == 0) return false;
-        const current_group_len = if (group_len) |len| @min(len.*, groups.len) else groups.len;
-        self.pushUndo(self.captureWithGroups(state.*, nodes, node_len.*, groups[0..current_group_len], connections, connection_len.*));
-        self.redo_len -= 1;
-        return applyHistorySnapshotWithGroups(state, nodes, node_len, groups, group_len, connections, connection_len, self.redo_stack[self.redo_len]);
-    }
-
-    pub fn canUndo(self: History) bool {
-        return self.undo_len > 0;
-    }
-
-    pub fn canRedo(self: History) bool {
-        return self.redo_len > 0;
-    }
-
-    fn pushUndo(self: *History, snapshot: HistorySnapshot) void {
-        pushSnapshot(&self.undo_stack, &self.undo_len, snapshot);
-    }
-
-    fn pushRedo(self: *History, snapshot: HistorySnapshot) void {
-        pushSnapshot(&self.redo_stack, &self.redo_len, snapshot);
-    }
-
-    fn pushSnapshot(stack: *[16]HistorySnapshot, len: *usize, snapshot: HistorySnapshot) void {
-        if (len.* >= stack.len) {
-            var i: usize = 1;
-            while (i < stack.len) : (i += 1) stack[i - 1] = stack[i];
-            len.* = stack.len - 1;
-        }
-        stack[len.*] = snapshot;
-        len.* += 1;
-    }
-};
-
-fn applyHistorySnapshot(state: anytype, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, snapshot: HistorySnapshot) bool {
-    return applyHistorySnapshotWithGroups(state, nodes, node_len, &.{}, null, connections, connection_len, snapshot);
-}
-
-fn applyHistorySnapshotWithGroups(state: anytype, nodes: []Node, node_len: *usize, groups: []Group, group_len: ?*usize, connections: []Connection, connection_len: *usize, snapshot: HistorySnapshot) bool {
-    const new_node_len = @min(snapshot.node_len, nodes.len);
-    const new_group_len = @min(snapshot.group_len, groups.len);
-    const new_connection_len = @min(snapshot.connection_len, connections.len);
-    if (new_node_len > 0) @memcpy(nodes[0..new_node_len], snapshot.nodes[0..new_node_len]);
-    if (new_group_len > 0) @memcpy(groups[0..new_group_len], snapshot.groups[0..new_group_len]);
-    if (new_connection_len > 0) @memcpy(connections[0..new_connection_len], snapshot.connections[0..new_connection_len]);
-    node_len.* = new_node_len;
-    if (group_len) |len| len.* = new_group_len;
-    connection_len.* = new_connection_len;
-    _ = state.clearSelection();
-    state.selected_node_id = snapshot.selected_node_id;
-    state.selected_group_id = snapshot.selected_group_id;
-    state.selected_connection = snapshot.selected_connection;
-    state.selected_node_len = @min(snapshot.selected_node_len, state.selected_node_ids.len);
-    if (state.selected_node_len > 0) {
-        @memcpy(state.selected_node_ids[0..state.selected_node_len], snapshot.selected_node_ids[0..state.selected_node_len]);
-    } else if (snapshot.selected_node_id) |id| {
-        if (state.selected_node_ids.len > 0) {
-            state.selected_node_ids[0] = id;
-            state.selected_node_len = 1;
-        }
-    }
-    state.dragging_canvas = false;
-    state.dragging_node_id = null;
-    state.dragging_group_id = null;
-    state.resizing_group_id = null;
-    state.resizing_group_edges = .{};
-    state.group_interaction_history_pushed = false;
-    state.dragging_connection_from_id = null;
-    state.dragging_connection_from_port = 0;
-    state.reconnecting_connection = null;
-    state.pending_connection = null;
-    state.hover_node_id = null;
-    state.hover_group_id = null;
-    state.hover_input_node_id = null;
-    state.hover_output_node_id = null;
-    state.hover_connection = null;
-    state.box_selecting = false;
-    return true;
-}
+const history_types = @import("node_history.zig").Types(Node, Group, Connection);
+pub const HistorySnapshot = history_types.HistorySnapshot;
+pub const HistoryWorkspace = history_types.HistoryWorkspace;
+pub const HistoryStorage = history_types.HistoryStorage;
+pub const StaticHistoryWorkspace = history_types.StaticHistoryWorkspace;
+pub const HistorySummary = history_types.HistorySummary;
+pub const History = history_types.History;
 
 pub fn Options(comptime StateType: type) type {
     return struct {
@@ -1201,7 +1047,7 @@ pub const State = struct {
     dragging_group_id: ?u32 = null,
     resizing_group_id: ?u32 = null,
     resizing_group_edges: GroupResizeEdges = .{},
-    group_interaction_history_pushed: bool = false,
+    interaction_history_pushed: bool = false,
     selected_node_id: ?u32 = null,
     selected_node_ids: []u32 = &.{},
     selected_node_len: usize = 0,
@@ -1285,6 +1131,7 @@ pub const State = struct {
         const changed = self.dragging_node_id == null or self.dragging_node_id.? != id;
         self.dragging_node_id = id;
         self.dragging_group_id = null;
+        self.interaction_history_pushed = false;
         self.dragging_canvas = false;
         self.box_selecting = false;
         self.selected_node_id = id;
@@ -1299,7 +1146,7 @@ pub const State = struct {
         self.dragging_group_id = null;
         self.resizing_group_id = null;
         self.resizing_group_edges = .{};
-        self.group_interaction_history_pushed = false;
+        self.interaction_history_pushed = false;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
         self.connection_preview_valid = true;
@@ -1333,7 +1180,7 @@ pub const State = struct {
         self.dragging_group_id = id;
         self.resizing_group_id = null;
         self.resizing_group_edges = .{};
-        self.group_interaction_history_pushed = false;
+        self.interaction_history_pushed = false;
         self.dragging_node_id = null;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
@@ -1349,7 +1196,7 @@ pub const State = struct {
         self.resizing_group_id = id;
         self.resizing_group_edges = edges;
         self.dragging_group_id = null;
-        self.group_interaction_history_pushed = false;
+        self.interaction_history_pushed = false;
         self.dragging_node_id = null;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
@@ -2734,7 +2581,7 @@ pub const State = struct {
         self.dragging_group_id = null;
         self.resizing_group_id = null;
         self.resizing_group_edges = .{};
-        self.group_interaction_history_pushed = false;
+        self.interaction_history_pushed = false;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
         self.connection_preview_valid = true;
@@ -3200,14 +3047,42 @@ fn dragNodeBy(editor: anytype, id: u32, delta_screen: [2]f32) bool {
     return false;
 }
 
-fn pushGroupInteractionHistoryIfNeeded(editor: anytype) void {
-    if (editor.state.group_interaction_history_pushed) return;
-    const history = editor.history orelse return;
-    const groups = editor.mutable_groups orelse return;
+const EditorHistoryMutation = struct {
+    history: ?*History = null,
+    snapshot: HistorySnapshot = .{},
+};
+
+fn beginEditorHistory(editor: anytype) ?EditorHistoryMutation {
+    const history = editor.history orelse return .{};
+    const groups = editor.mutable_groups orelse editor.groups;
+    const group_len = if (editor.mutable_group_len) |len| @min(len.*, groups.len) else groups.len;
     const connections = editor.mutable_connections orelse &.{};
+    const node_len = if (editor.mutable_node_len) |len| @min(len.*, editor.nodes.len) else editor.nodes.len;
     const connection_len = if (editor.mutable_connection_len) |len| @min(len.*, connections.len) else connections.len;
-    history.pushBeforeWithGroups(editor.state.*, editor.nodes, editor.nodes.len, groups, connections, connection_len);
-    editor.state.group_interaction_history_pushed = true;
+    if (!history.supportsGraphCapacity(node_len, group_len, connection_len, editor.state.boundedSelectionLen())) return null;
+    const snapshot = history.captureWithGroups(editor.state.*, editor.nodes, node_len, groups[0..group_len], connections, connection_len);
+    if (!snapshot.complete) return null;
+    return .{ .history = history, .snapshot = snapshot };
+}
+
+fn finishEditorHistory(mutation: EditorHistoryMutation, changed: bool) bool {
+    if (!changed) return false;
+    if (mutation.history) |history| return history.commitBefore(mutation.snapshot);
+    return true;
+}
+
+fn beginInteractionHistoryIfNeeded(editor: anytype) ?EditorHistoryMutation {
+    if (editor.state.interaction_history_pushed) return .{};
+    return beginEditorHistory(editor);
+}
+
+fn finishInteractionHistory(editor: anytype, mutation: EditorHistoryMutation, changed: bool) bool {
+    if (!changed) return false;
+    if (!editor.state.interaction_history_pushed) {
+        if (!finishEditorHistory(mutation, true)) return false;
+        editor.state.interaction_history_pushed = true;
+    }
+    return true;
 }
 
 fn dragGroupBy(editor: anytype, id: u32, delta_screen: [2]f32) bool {
@@ -3350,15 +3225,19 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return valid_changed or true;
             }
             if (editor.state.dragging_node_id) |id| {
-                return dragNodeBy(editor, id, .{ m.dx, m.dy });
+                if (@abs(m.dx) <= 0.001 and @abs(m.dy) <= 0.001) return false;
+                const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
+                return finishInteractionHistory(editor, history_mutation, dragNodeBy(editor, id, .{ m.dx, m.dy }));
             }
             if (editor.state.resizing_group_id) |id| {
-                pushGroupInteractionHistoryIfNeeded(editor);
-                return resizeGroupBy(editor, id, editor.state.resizing_group_edges, .{ m.dx, m.dy });
+                if (@abs(m.dx) <= 0.001 and @abs(m.dy) <= 0.001) return false;
+                const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
+                return finishInteractionHistory(editor, history_mutation, resizeGroupBy(editor, id, editor.state.resizing_group_edges, .{ m.dx, m.dy }));
             }
             if (editor.state.dragging_group_id) |id| {
-                pushGroupInteractionHistoryIfNeeded(editor);
-                return dragGroupBy(editor, id, .{ m.dx, m.dy });
+                if (@abs(m.dx) <= 0.001 and @abs(m.dy) <= 0.001) return false;
+                const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
+                return finishInteractionHistory(editor, history_mutation, dragGroupBy(editor, id, .{ m.dx, m.dy }));
             }
             if (editor.state.dragging_canvas) return editor.state.panBy(.{ m.dx, m.dy });
             const input_hover = inputPortAtElementPoint(rect, editor, .{ m.x, m.y });
@@ -3533,10 +3412,10 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                             if (connectionAllowed(editor.nodes, connections[0..@min(len.*, connections.len)], replacement, editorConnectionPolicy(editor), .{
                                 .ignore_connection = graph_validation.ConnectionKey.from(connection),
                             })) {
-                                if (editor.history) |history| {
-                                    history.pushBefore(editor.state.*, editor.nodes, editor.nodes.len, connections, len.*);
+                                if (beginEditorHistory(editor)) |history_mutation| {
+                                    changed = editor.state.reconnectConnectionPortWithPolicy(connections, len, connection, endpoint, id, target_port, editor.nodes, editorConnectionPolicy(editor));
+                                    _ = finishEditorHistory(history_mutation, changed);
                                 }
-                                changed = editor.state.reconnectConnectionPortWithPolicy(connections, len, connection, endpoint, id, target_port, editor.nodes, editorConnectionPolicy(editor));
                             }
                         }
                     }
@@ -3558,10 +3437,16 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                                 const active_connections = connections[0..@min(before_len, connections.len)];
                                 const can_append = before_len < connections.len and connectionAllowed(editor.nodes, active_connections, connection, editorConnectionPolicy(editor), .{});
                                 if (can_append) {
-                                    if (editor.history) |history| {
-                                        history.pushBefore(editor.state.*, editor.nodes, editor.nodes.len, connections, before_len);
+                                    const history_capacity_ok = if (editor.history) |history|
+                                        history.supportsGraphCapacity(if (editor.mutable_node_len) |node_len| @min(node_len.*, editor.nodes.len) else editor.nodes.len, if (editor.mutable_group_len) |group_len| @min(group_len.*, editor.groups.len) else editor.groups.len, before_len + 1, 1)
+                                    else
+                                        true;
+                                    if (history_capacity_ok) {
+                                        if (beginEditorHistory(editor)) |history_mutation| {
+                                            const changed = editor.state.appendConnectionWithPolicy(connections, len, connection, editor.nodes, editorConnectionPolicy(editor));
+                                            _ = finishEditorHistory(history_mutation, changed);
+                                        }
                                     }
-                                    _ = editor.state.appendConnectionWithPolicy(connections, len, connection, editor.nodes, editorConnectionPolicy(editor));
                                 } else {
                                     editor.state.pending_connection = null;
                                 }
@@ -3820,6 +3705,21 @@ test "NodeEditor indexed connected selection scales past inline traversal capaci
     try std.testing.expectEqual(node_count, state.boundedSelectionLen());
     try std.testing.expectEqual(@as(u64, 1), topology.summary().rebuild_count);
     try std.testing.expectEqual(@as(u64, 1), topology.summary().cache_hit_count);
+}
+
+test "NodeEditor inline history rejects oversized snapshots without truncation" {
+    var selected: [24]u32 = .{0} ** 24;
+    const state = State{ .selected_node_ids = &selected };
+    var nodes: [24]Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{
+        .id = @intCast(index + 1),
+        .title = "Node",
+        .pos = .{ @floatFromInt(index), 0 },
+    };
+    var history = History{};
+    try std.testing.expect(!history.pushBefore(state, &nodes, nodes.len, &.{}, 0));
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+    try std.testing.expectEqual(@as(u64, 1), history.summary().rejected_snapshot_count);
 }
 
 test "NodeEditor connection path cache reuses cubic controls" {

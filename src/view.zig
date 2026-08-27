@@ -310,10 +310,14 @@ test "node editor view drags mutable nodes" {
         .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
         .{ .id = 2, .title = "Output", .pos = .{ 180, 80 } },
     };
+    var connections: [2]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 2;
+    var node_len: usize = nodes.len;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
     var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
     defer view.deinit();
     var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
-    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9402, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9402, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .mutable_connections = &connections, .mutable_connection_len = &connection_len, .history = &history, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
     editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
     const before = nodes[1].pos;
     const node_rect = node_editor.nodeRectFromState(.{ .x = 0, .y = 0, .w = 340, .h = 200 }, state, nodes[1]);
@@ -328,6 +332,9 @@ test "node editor view drags mutable nodes" {
     try std.testing.expect(nodes[1].pos[0] > before[0]);
     try std.testing.expect(nodes[1].pos[1] > before[1]);
     try std.testing.expect(state.dragging_node_id == null);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expectEqual(before, nodes[1].pos);
 }
 
 test "node editor view reports dirty canvas invalidation" {

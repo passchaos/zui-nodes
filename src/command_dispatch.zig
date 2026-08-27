@@ -55,10 +55,15 @@ pub fn selectionCommandFromId(command_id: CommandId) ?SelectionCommand {
 }
 
 pub fn canDispatchSelection(context: *const CommandContext, command: SelectionCommand) bool {
+    if (!canRecordSelectionCommand(context, command)) return false;
     const node_count = activeNodeCount(context);
     const connection_count = activeConnectionCount(context);
     return switch (command) {
-        .delete, .duplicate => if (context.connection_len != null)
+        .delete => if (context.connection_len != null)
+            context.state.canMutateSelectedNodeGraph(command, context.nodes, node_count, context.connections, connection_count)
+        else
+            context.state.canMutateSelectedNodes(command, context.nodes, node_count),
+        .duplicate => if (context.connection_len != null)
             context.state.canMutateSelectedNodeGraph(command, context.nodes, node_count, context.connections, connection_count)
         else
             context.state.canMutateSelectedNodes(command, context.nodes, node_count),
@@ -80,6 +85,7 @@ pub fn dispatchSelectionId(context: *CommandContext, command_id: CommandId) bool
 }
 
 pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) bool {
+    if (!canRecordNodeEditorCommand(context, command)) return false;
     const node_count = activeNodeCount(context);
     const connection_count = activeConnectionCount(context);
     return switch (command) {
@@ -87,7 +93,7 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .select_all => node_count > 0,
         .focus_selection, .frame_all => node_count > 0,
         .copy_selection => if (context.clipboard) |_| context.state.selectedNodeStorageCount(context.nodes, node_count) > 0 else false,
-        .paste_clipboard => if (context.clipboard) |clipboard| context.state.canPasteClipboardWithPolicy(context.nodes, node_count, context.connections, connection_count, clipboard.*, context.connection_policy) else false,
+        .paste_clipboard => if (context.clipboard) |clipboard| context.connection_len != null and context.state.canPasteClipboardWithPolicy(context.nodes, node_count, context.connections, connection_count, clipboard.*, context.connection_policy) else false,
         .insert_image_input, .insert_processing_node, .insert_output_node => node_count < context.nodes.len,
         .insert_processing_chain => context.insert_chain.nodes.len > 0 and context.connection_len != null and context.state.canInsertNodeChainWithPolicy(context.nodes, node_count, context.connections, connection_count, context.insert_chain, context.connection_policy),
         .align_left, .align_center_x, .align_right, .align_top, .align_center_y, .align_bottom => context.state.canArrangeSelectedNodes(context.nodes, node_count, command),
@@ -162,9 +168,10 @@ pub fn historyCommandFromId(command_id: CommandId) ?HistoryCommand {
 
 pub fn canDispatchHistory(context: *const CommandContext, command: HistoryCommand) bool {
     const history = context.history orelse return false;
+    if (!canRecordHistory(context)) return false;
     return switch (command) {
-        .undo => history.canUndo(),
-        .redo => history.canRedo(),
+        .undo => history.canUndoFor(context.nodes.len, context.groups.len, context.connections.len, context.state.selected_node_ids.len),
+        .redo => history.canRedoFor(context.nodes.len, context.groups.len, context.connections.len, context.state.selected_node_ids.len),
     };
 }
 
@@ -208,9 +215,81 @@ fn activeGroupCount(context: *const CommandContext) usize {
     return count;
 }
 
-fn pushHistory(context: *CommandContext) void {
-    const history = context.history orelse return;
-    history.pushBeforeWithGroups(context.state.*, context.nodes, activeNodeCount(context), context.groups[0..activeGroupCount(context)], context.connections, activeConnectionCount(context));
+const HistoryMutation = struct {
+    history: ?*node_editor.History = null,
+    snapshot: node_editor.HistorySnapshot = .{},
+};
+
+fn beginHistoryMutation(context: *CommandContext) ?HistoryMutation {
+    const history = context.history orelse return .{};
+    const snapshot = history.captureWithGroups(context.state.*, context.nodes, activeNodeCount(context), context.groups[0..activeGroupCount(context)], context.connections, activeConnectionCount(context));
+    if (!snapshot.complete) return null;
+    return .{ .history = history, .snapshot = snapshot };
+}
+
+pub fn canRecordHistory(context: *const CommandContext) bool {
+    const history = context.history orelse return true;
+    return history.supportsGraphCapacity(activeNodeCount(context), activeGroupCount(context), activeConnectionCount(context), context.state.boundedSelectionLen());
+}
+
+pub fn canRecordSelectionCommand(context: *const CommandContext, command: SelectionCommand) bool {
+    const node_count = activeNodeCount(context);
+    const connection_count = activeConnectionCount(context);
+    return switch (command) {
+        .delete => canRecordHistory(context),
+        .duplicate => historyCanRecordDuplicate(context, node_count, connection_count),
+        .rename, .focus => true,
+    };
+}
+
+pub fn canRecordNodeEditorCommand(context: *const CommandContext, command: NodeEditorCommand) bool {
+    const node_count = activeNodeCount(context);
+    const group_count = activeGroupCount(context);
+    const connection_count = activeConnectionCount(context);
+    return switch (command) {
+        .paste_clipboard => if (context.clipboard) |clipboard|
+            historyCanRecordProjected(context, node_count + clipboard.node_len, group_count, connection_count + clipboard.connection_len, @min(clipboard.node_len, context.state.selected_node_ids.len))
+        else
+            true,
+        .insert_image_input, .insert_processing_node, .insert_output_node => historyCanRecordProjected(context, node_count + 1, group_count, connection_count, @min(@as(usize, 1), context.state.selected_node_ids.len)),
+        .insert_processing_chain => historyCanRecordProjected(context, node_count + context.insert_chain.nodes.len, group_count, connection_count + context.insert_chain.connections.len, @min(context.insert_chain.nodes.len, context.state.selected_node_ids.len)),
+        .group_selected_nodes => historyCanRecordProjected(context, node_count, group_count + 1, connection_count, context.state.boundedSelectionLen()),
+        .align_left,
+        .align_center_x,
+        .align_right,
+        .align_top,
+        .align_center_y,
+        .align_bottom,
+        .distribute_horizontal,
+        .distribute_vertical,
+        .ungroup_selected,
+        .fit_group_to_selection,
+        .disconnect_selected_link,
+        .disconnect_selected_inputs,
+        .disconnect_selected_outputs,
+        .disconnect_selected_links,
+        .disconnect_context_port_links,
+        .reconnect_to_previous,
+        .reconnect_to_next,
+        .auto_layout_layered,
+        => canRecordHistory(context),
+        else => true,
+    };
+}
+
+fn historyCanRecordProjected(context: *const CommandContext, node_count: usize, group_count: usize, connection_count: usize, selection_count: usize) bool {
+    const history = context.history orelse return true;
+    return canRecordHistory(context) and history.supportsGraphCapacity(node_count, group_count, connection_count, selection_count);
+}
+
+fn historyCanRecordDuplicate(context: *const CommandContext, node_count: usize, connection_count: usize) bool {
+    const selected_count = context.state.selectedNodeStorageCount(context.nodes, node_count);
+    var internal_connection_count: usize = 0;
+    for (context.connections[0..connection_count]) |connection| {
+        if (context.state.isNodeSelected(connection.from_id) and context.state.isNodeSelected(connection.to_id)) internal_connection_count += 1;
+    }
+    const projected_connection_count = if (context.connection_len != null) connection_count + internal_connection_count else connection_count;
+    return historyCanRecordProjected(context, node_count + selected_count, activeGroupCount(context), projected_connection_count, @min(selected_count, context.state.selected_node_ids.len));
 }
 
 fn layoutOptions(context: *const CommandContext) graph_layout.LayeredLayoutOptions {
@@ -232,7 +311,7 @@ fn dispatchSelectionMutation(context: *CommandContext, command: SelectionCommand
         .delete => context.state.lastSelectedStoredNodeId(context.nodes, node_count) orelse context.state.lastSelectedNodeId(),
         else => context.state.lastSelectedNodeId(),
     };
-    pushHistory(context);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
     const changed = if (context.connection_len) |connection_len|
         switch (command) {
             .delete => context.state.deleteSelectedNodesAndConnections(context.nodes, context.node_len, context.connections, connection_len),
@@ -244,7 +323,7 @@ fn dispatchSelectionMutation(context: *CommandContext, command: SelectionCommand
         .duplicate => context.state.duplicateSelectedNodes(context.nodes, context.node_len, context.duplicate_id_offset, context.duplicate_offset),
         .rename, .focus => false,
     };
-    if (!changed) return false;
+    if (!finishHistoryMutation(history_mutation, changed)) return false;
     if (context.selection_state) |selection| {
         selection.selected_id = context.state.selected_node_id;
         switch (command) {
@@ -266,81 +345,87 @@ fn copySelection(context: *CommandContext) bool {
 
 fn pasteSelection(context: *CommandContext) bool {
     const clipboard = context.clipboard orelse return false;
-    pushHistory(context);
-    return context.state.pasteClipboardWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len orelse return false, clipboard, .{ 24, 24 }, context.connection_policy);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.pasteClipboardWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len orelse return false, clipboard, .{ 24, 24 }, context.connection_policy));
 }
 
 fn insertTemplate(context: *CommandContext, template: node_editor.NodeTemplate) bool {
-    pushHistory(context);
-    return context.state.insertNodeTemplate(context.nodes, context.node_len, template, node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)]));
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.insertNodeTemplate(context.nodes, context.node_len, template, node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)])));
 }
 
 fn insertChain(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
     _ = connection_len;
-    pushHistory(context);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
     var chain = context.insert_chain;
     chain.start_pos = node_editor.defaultInsertPosition(context.nodes[0..activeNodeCount(context)]);
-    return context.state.insertNodeChainWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len.?, chain, context.connection_policy);
+    return finishHistoryMutation(history_mutation, context.state.insertNodeChainWithPolicy(context.nodes, context.node_len, context.connections, context.connection_len.?, chain, context.connection_policy));
 }
 
 fn arrange(context: *CommandContext, command: NodeEditorCommand) bool {
-    pushHistory(context);
-    return context.state.arrangeSelectedNodes(context.nodes, activeNodeCount(context), command);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.arrangeSelectedNodes(context.nodes, activeNodeCount(context), command));
 }
 
 fn disconnectSelectedLink(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
-    pushHistory(context);
-    return context.state.disconnectSelectedLink(context.connections, connection_len);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.disconnectSelectedLink(context.connections, connection_len));
 }
 
 fn disconnectSelectedNodeLinks(context: *CommandContext, command: NodeEditorCommand) bool {
     const connection_len = context.connection_len orelse return false;
-    pushHistory(context);
-    return context.state.disconnectSelectedNodeLinks(context.connections, connection_len, command);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.disconnectSelectedNodeLinks(context.connections, connection_len, command));
 }
 
 fn groupSelected(context: *CommandContext) bool {
     const group_len = context.group_len orelse return false;
-    pushHistory(context);
-    return context.state.groupSelectedNodes(context.nodes, activeNodeCount(context), context.groups, group_len, "Group");
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.groupSelectedNodes(context.nodes, activeNodeCount(context), context.groups, group_len, "Group"));
 }
 
 fn ungroupSelected(context: *CommandContext) bool {
     const group_len = context.group_len orelse return false;
-    pushHistory(context);
-    return context.state.ungroupSelected(context.groups, group_len);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.ungroupSelected(context.groups, group_len));
 }
 
 fn fitGroupToSelection(context: *CommandContext) bool {
-    pushHistory(context);
-    return context.state.fitSelectedGroupToSelection(context.nodes, activeNodeCount(context), context.groups, activeGroupCount(context));
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.fitSelectedGroupToSelection(context.nodes, activeNodeCount(context), context.groups, activeGroupCount(context)));
 }
 
 fn reconnectPrevious(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
-    pushHistory(context);
-    return context.state.reconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.reconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy));
 }
 
 fn reconnectNext(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
-    pushHistory(context);
-    return context.state.reconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.reconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_len, context.nodes, activeNodeCount(context), context.connection_policy));
 }
 
 fn disconnectContextPortLinks(context: *CommandContext) bool {
     const connection_len = context.connection_len orelse return false;
-    pushHistory(context);
-    return context.state.disconnectContextPortLinks(context.connections, connection_len);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    return finishHistoryMutation(history_mutation, context.state.disconnectContextPortLinks(context.connections, connection_len));
 }
 
 fn autoLayoutLayered(context: *CommandContext) bool {
     const workspace = context.layout_workspace orelse return false;
-    pushHistory(context);
+    const history_mutation = beginHistoryMutation(context) orelse return false;
     const result = graph_layout.layoutLayered(context.nodes, activeNodeCount(context), context.connections[0..activeConnectionCount(context)], workspace, layoutOptions(context));
-    return result.changed();
+    return finishHistoryMutation(history_mutation, result.changed());
+}
+
+fn finishHistoryMutation(mutation: HistoryMutation, changed: bool) bool {
+    if (!changed) return false;
+    if (mutation.history) |history| return history.commitBefore(mutation.snapshot);
+    return true;
 }
 
 test "zui-nodes command dispatch handles selection mutation and insertion" {
@@ -465,6 +550,194 @@ test "zui-nodes command dispatch uses indexed traversal for large dependency cha
     try std.testing.expect(topology.summary().cache_hit_count >= 1);
 }
 
+test "zui-nodes scalable history preserves large graph undo and rejects unsafe inline history" {
+    const node_count = 40;
+    const group_count = 20;
+    var selected: [node_count]u32 = .{0} ** node_count;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [node_count]node_editor.Node = undefined;
+    var connections: [node_count - 1]node_editor.Connection = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{
+        .id = @intCast(index + 1),
+        .title = "Node",
+        .pos = .{ @floatFromInt(index * 10), @floatFromInt(index % 5) },
+    };
+    for (&connections, 0..) |*connection, index| connection.* = .{
+        .from_id = nodes[index].id,
+        .to_id = nodes[index + 1].id,
+    };
+    var groups: [group_count]node_editor.Group = undefined;
+    for (&groups, 0..) |*group, index| group.* = .{ .id = @intCast(index + 1), .title = "Group", .rect = .{ .x = @floatFromInt(index * 5), .y = 0, .w = 100, .h = 80 } };
+    const original_nodes = nodes;
+    const original_groups = groups;
+    var node_len: usize = nodes.len;
+    var group_len: usize = groups.len;
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var layout_storage = graph_layout.StaticLayeredLayoutWorkspace(node_count, node_count){};
+    var context = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .groups = &groups,
+        .group_len = &group_len,
+        .history = &history,
+        .layout_workspace = layout_storage.workspace(),
+        .connection_policy = .strict_dataflow,
+    };
+
+    try std.testing.expect(!canDispatch(&context, .auto_layout_layered));
+    try std.testing.expect(!dispatch(&context, .auto_layout_layered));
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+    try std.testing.expectEqual(original_nodes, nodes);
+
+    var history_storage = try node_editor.HistoryStorage.init(std.testing.allocator, node_count, group_count, connections.len, node_count);
+    defer history_storage.deinit();
+    try std.testing.expect(history.bindWorkspace(history_storage.workspace()));
+    _ = state.selectAllNodes(&nodes, node_len);
+    try std.testing.expect(canDispatch(&context, .auto_layout_layered));
+    try std.testing.expect(dispatch(&context, .auto_layout_layered));
+    groups[group_count - 1].rect.x += 17;
+    const laid_out_nodes = nodes;
+    const laid_out_groups = groups;
+    try std.testing.expect(!std.meta.eql(original_nodes, laid_out_nodes));
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expectEqual(original_nodes, nodes);
+    try std.testing.expectEqual(original_groups, groups);
+    try std.testing.expectEqual(node_count, node_len);
+    try std.testing.expectEqual(group_count, group_len);
+    try std.testing.expectEqual(connections.len, connection_len);
+    try std.testing.expectEqual(node_count, state.boundedSelectionLen());
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expectEqual(laid_out_nodes, nodes);
+    try std.testing.expectEqual(laid_out_groups, groups);
+    try std.testing.expect(history.summary().external_workspace);
+    try std.testing.expectEqual(node_count, history.summary().node_capacity);
+    try std.testing.expectEqual(@as(u64, 0), history.summary().rejected_snapshot_count);
+}
+
+test "zui-nodes scalable history rotates full stacks without aliasing snapshots" {
+    const node_count = 24;
+    var selected: [node_count]u32 = .{0} ** node_count;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [node_count]node_editor.Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{ .id = @intCast(index + 1), .title = "Node", .pos = .{ @floatFromInt(index), 0 } };
+    var node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = undefined;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var history_workspace = node_editor.StaticHistoryWorkspace(node_count, 1, 1, node_count){};
+    try std.testing.expect(history.bindWorkspace(history_workspace.workspace()));
+
+    var step: usize = 0;
+    while (step < node_editor.History.stack_capacity + 4) : (step += 1) {
+        try std.testing.expect(history.pushBefore(state, &nodes, node_len, &connections, connection_len));
+        nodes[0].pos[0] += 1;
+    }
+    try std.testing.expectEqual(node_editor.History.stack_capacity, history.undo_len);
+    try std.testing.expectEqual(@as(u64, 4), history.summary().dropped_snapshot_count);
+    const final_x = nodes[0].pos[0];
+    for (0..node_editor.History.stack_capacity) |undo_index| {
+        try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+        try std.testing.expectEqual(final_x - @as(f32, @floatFromInt(undo_index + 1)), nodes[0].pos[0]);
+    }
+    try std.testing.expect(!history.canUndo());
+    for (0..node_editor.History.stack_capacity) |redo_index| {
+        try std.testing.expect(history.redo(&state, &nodes, &node_len, &connections, &connection_len));
+        try std.testing.expectEqual(final_x - @as(f32, @floatFromInt(node_editor.History.stack_capacity - redo_index - 1)), nodes[0].pos[0]);
+    }
+    try std.testing.expectEqual(final_x, nodes[0].pos[0]);
+    try std.testing.expect(!history.canRedo());
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expectEqual(@as(usize, 1), history.redo_len);
+    try std.testing.expect(history.pushBefore(state, &nodes, node_len, &connections, connection_len));
+    nodes[0].pos[0] += 7;
+    try std.testing.expectEqual(@as(usize, 0), history.redo_len);
+    try std.testing.expect(!history.canRedo());
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expectEqual(final_x - 1, nodes[0].pos[0]);
+}
+
+test "zui-nodes no-op mutation preserves redo branch" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 0, 0 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = undefined;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len, .history = &history };
+
+    _ = state.setSingleSelection(1);
+    try std.testing.expect(history.pushBefore(state, &nodes, node_len, &connections, connection_len));
+    nodes[0].pos[0] = 20;
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expect(history.canRedo());
+
+    _ = state.selectAllNodes(&nodes, node_len);
+    try std.testing.expect(canDispatch(&context, .align_left));
+    // The nodes are already aligned, so the started transaction is a no-op and
+    // must not erase the redo entry captured above.
+    try std.testing.expect(!dispatch(&context, .align_left));
+    try std.testing.expect(history.canRedo());
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expectEqual(@as(f32, 20), nodes[0].pos[0]);
+}
+
+test "zui-nodes command capacity includes projected insertion state" {
+    var selected: [24]u32 = .{0} ** 24;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [24]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 24;
+    for (nodes[0..16], 0..) |*node, index| node.* = .{ .id = @intCast(index + 1), .title = "Node", .pos = .{ @floatFromInt(index), 0 } };
+    var node_len: usize = 16;
+    var connections: [1]node_editor.Connection = undefined;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len, .history = &history };
+
+    try std.testing.expect(canRecordHistory(&context));
+    try std.testing.expect(!canRecordNodeEditorCommand(&context, .insert_processing_node));
+    try std.testing.expect(!canDispatch(&context, .insert_processing_node));
+
+    var storage = node_editor.StaticHistoryWorkspace(nodes.len, 1, 1, selected.len){};
+    try std.testing.expect(history.bindWorkspace(storage.workspace()));
+    try std.testing.expect(canRecordNodeEditorCommand(&context, .insert_processing_node));
+    try std.testing.expect(dispatch(&context, .insert_processing_node));
+    try std.testing.expectEqual(@as(usize, 17), node_len);
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expectEqual(@as(usize, 16), node_len);
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expectEqual(@as(usize, 17), node_len);
+}
+
+test "zui-nodes scalable history rejects undo into undersized target storage" {
+    var selected: [24]u32 = .{0} ** 24;
+    const state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [24]node_editor.Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{ .id = @intCast(index + 1), .title = "Node", .pos = .{ @floatFromInt(index), 0 } };
+    const node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = undefined;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var storage = node_editor.StaticHistoryWorkspace(nodes.len, 1, 1, selected.len){};
+    try std.testing.expect(history.bindWorkspace(storage.workspace()));
+    try std.testing.expect(history.pushBefore(state, &nodes, node_len, &connections, connection_len));
+    nodes[0].pos[0] = 99;
+
+    var small_nodes: [8]node_editor.Node = undefined;
+    var small_node_len: usize = small_nodes.len;
+    var small_selected: [8]u32 = .{0} ** 8;
+    var small_state = node_editor.State{ .selected_node_ids = &small_selected };
+    try std.testing.expect(!history.canUndoFor(small_nodes.len, 0, connections.len, small_selected.len));
+    try std.testing.expect(!history.undo(&small_state, &small_nodes, &small_node_len, &connections, &connection_len));
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+}
+
 test "zui-nodes command dispatch reconnects selected connection and supports history" {
     var selected: [8]u32 = .{0} ** 8;
     var state = node_editor.State{ .selected_node_ids = &selected };
@@ -493,7 +766,7 @@ test "zui-nodes selection dispatch duplicates, deletes, and records history" {
     var selected: [8]u32 = .{0} ** 8;
     var state = node_editor.State{ .selected_node_ids = &selected };
     var selection_state = commands.SelectionCommandState{};
-    var nodes: [8]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 8;
+    var nodes: [40]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 40;
     nodes[0] = .{ .id = 1, .title = "A", .pos = .{ 0, 0 } };
     nodes[1] = .{ .id = 2, .title = "B", .pos = .{ 100, 0 } };
     var node_len: usize = 2;

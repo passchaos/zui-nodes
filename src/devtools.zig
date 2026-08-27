@@ -28,6 +28,7 @@ pub const SummaryOptions = struct {
     minimap_size: zui.ui_base.Size = .{ .w = 150, .h = 96 },
     connection_path_cache: ?*const node_editor.ConnectionPathCache = null,
     topology_index: ?*graph_topology.Index = null,
+    history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
 
@@ -48,6 +49,7 @@ pub const Summary = struct {
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
     topology: graph_topology.Summary = .{},
+    history: node_editor.HistorySummary = .{},
     graph_validation: node_editor.GraphValidationReport = .{},
     graph_valid: bool = true,
     graph_issue_count: usize = 0,
@@ -95,6 +97,7 @@ pub fn summarize(options: SummaryOptions) Summary {
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
         .topology = if (options.topology_index) |topology| topology.summary() else .{},
+        .history = if (options.history) |history| history.summary() else .{},
         .graph_validation = graph_report,
         .graph_valid = graph_report.validFor(options.connection_policy),
         .graph_issue_count = graph_report.issueCountFor(options.connection_policy),
@@ -159,7 +162,16 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.topology.cache_hit_count,
         options.summary.topology.valid,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, topology, graph });
+    const history = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "history bound={} undo={d} redo={d} nodes={d} links={d} rejected={d} dropped={d}", .{
+        options.summary.history.available,
+        options.summary.history.undo_len,
+        options.summary.history.redo_len,
+        options.summary.history.node_capacity,
+        options.summary.history.connection_capacity,
+        options.summary.history.rejected_snapshot_count,
+        options.summary.history.dropped_snapshot_count,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, topology, history, graph });
     return root;
 }
 
@@ -229,6 +241,7 @@ test "zui-nodes devtools exposes topology index reuse" {
     const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
     var topology_storage = graph_topology.StaticWorkspace(4, 4){};
     var topology = graph_topology.Index.init(topology_storage.workspace());
+    var history = node_editor.History{};
     try std.testing.expect(topology.ensure(&nodes, &connections).complete());
     try std.testing.expect(topology.ensure(&nodes, &connections).cache_hit);
 
@@ -237,9 +250,12 @@ test "zui-nodes devtools exposes topology index reuse" {
         .nodes = &nodes,
         .connections = &connections,
         .topology_index = &topology,
+        .history = &history,
     });
     try std.testing.expect(summary.topology.valid);
     try std.testing.expectEqual(@as(usize, 1), summary.topology.indexed_connection_count);
     try std.testing.expectEqual(@as(u64, 1), summary.topology.rebuild_count);
     try std.testing.expectEqual(@as(u64, 2), summary.topology.cache_hit_count);
+    try std.testing.expect(summary.history.available);
+    try std.testing.expectEqual(@as(usize, 16), summary.history.node_capacity);
 }

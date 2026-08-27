@@ -117,6 +117,7 @@ fn contextFromUserData(user_data: ?*anyopaque) ?*CommandContext {
 
 fn selectionDisabledReason(context: *const CommandContext, command: SelectionCommand) []const u8 {
     if (command_dispatch.canDispatchSelection(context, command)) return "enabled";
+    if (!command_dispatch.canRecordSelectionCommand(context, command)) return "history capacity unavailable";
     const node_count = @min(context.node_len.*, context.nodes.len);
     const selected_count = context.state.selectedNodeStorageCount(context.nodes, node_count);
     return switch (command) {
@@ -128,6 +129,7 @@ fn selectionDisabledReason(context: *const CommandContext, command: SelectionCom
 
 fn nodeEditorDisabledReason(context: *const CommandContext, command: NodeEditorCommand) []const u8 {
     if (command_dispatch.canDispatch(context, command)) return "enabled";
+    if (!command_dispatch.canRecordNodeEditorCommand(context, command)) return "history capacity unavailable";
     const node_count = @min(context.node_len.*, context.nodes.len);
     return switch (command) {
         .clear_selection => "nothing selected",
@@ -206,4 +208,18 @@ test "zui-nodes command target handlers route selection, editor, and history com
     registry = command_surface.nodeEditorAllCommandRegistryForContext(&context, &command_storage);
     try std.testing.expect(validation.dispatch(registry, SelectionCommand.delete.commandId()) != null);
     try std.testing.expectEqual(@as(usize, 0), connection_len);
+}
+
+test "zui-nodes command targets explain insufficient history capacity" {
+    var selected: [24]u32 = .{0} ** 24;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [24]node_editor.Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{ .id = @intCast(index + 1), .title = "Node", .pos = .{ @floatFromInt(index), 0 } };
+    var node_len: usize = nodes.len;
+    var history = node_editor.History{};
+    _ = state.setSingleSelection(1);
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .history = &history };
+
+    try std.testing.expect(!command_dispatch.canDispatchSelection(&context, .delete));
+    try std.testing.expectEqualStrings("history capacity unavailable", selectionDisabledReason(&context, .delete));
 }
