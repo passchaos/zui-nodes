@@ -8,6 +8,7 @@ const std = @import("std");
 const zui = @import("zui");
 const commands = @import("commands.zig");
 const graph_layout = @import("graph_layout.zig");
+const graph_topology = @import("graph_topology.zig");
 const node_editor = @import("node_editor.zig");
 
 pub const NodeEditorCommand = commands.NodeEditorCommand;
@@ -34,6 +35,7 @@ pub const CommandContext = struct {
     duplicate_id_offset: u32 = 1000,
     duplicate_offset: [2]f32 = .{ 32.0, 24.0 },
     connection_policy: node_editor.ConnectionPolicy = .default,
+    topology_index: ?*graph_topology.Index = null,
     layout_workspace: ?graph_layout.LayeredLayoutWorkspace = null,
     layout_options: graph_layout.LayeredLayoutOptions = .{},
 };
@@ -92,7 +94,10 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .distribute_horizontal, .distribute_vertical => context.state.canArrangeSelectedNodes(context.nodes, node_count, command),
         .disconnect_selected_link => context.state.canDisconnectSelectedLink(context.connections, connection_count),
         .disconnect_selected_inputs, .disconnect_selected_outputs, .disconnect_selected_links => context.connection_len != null and context.state.canDisconnectSelectedNodeLinks(context.connections, connection_count, context.nodes, node_count, command),
-        .select_upstream_nodes, .select_downstream_nodes => context.state.canSelectConnectedNodes(context.connections, connection_count, context.nodes, node_count, command),
+        .select_upstream_nodes, .select_downstream_nodes => if (context.topology_index) |topology|
+            context.state.canSelectConnectedNodesIndexed(topology, context.connections, connection_count, context.nodes, node_count, command)
+        else
+            context.state.canSelectConnectedNodes(context.connections, connection_count, context.nodes, node_count, command),
         .group_selected_nodes => context.group_len != null and context.state.canGroupSelectedNodes(context.nodes, node_count, context.groups, activeGroupCount(context)),
         .ungroup_selected => context.group_len != null and context.state.canUngroupSelected(context.groups, activeGroupCount(context)),
         .select_group_contents => context.state.canSelectGroupContents(context.nodes, node_count, context.groups, activeGroupCount(context)),
@@ -130,7 +135,10 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .align_left, .align_center_x, .align_right, .align_top, .align_center_y, .align_bottom, .distribute_horizontal, .distribute_vertical => arrange(context, command),
         .disconnect_selected_link => disconnectSelectedLink(context),
         .disconnect_selected_inputs, .disconnect_selected_outputs, .disconnect_selected_links => disconnectSelectedNodeLinks(context, command),
-        .select_upstream_nodes, .select_downstream_nodes => context.state.selectConnectedNodes(context.connections, activeConnectionCount(context), context.nodes, node_count, command),
+        .select_upstream_nodes, .select_downstream_nodes => if (context.topology_index) |topology|
+            context.state.selectConnectedNodesIndexed(topology, context.connections, activeConnectionCount(context), context.nodes, node_count, command)
+        else
+            context.state.selectConnectedNodes(context.connections, activeConnectionCount(context), context.nodes, node_count, command),
         .group_selected_nodes => groupSelected(context),
         .ungroup_selected => ungroupSelected(context),
         .select_group_contents => context.state.selectGroupContents(context.nodes, node_count, context.groups, activeGroupCount(context)),
@@ -419,6 +427,42 @@ test "zui-nodes command dispatch auto layouts a strict dataflow graph" {
     try std.testing.expectEqual(@as(f32, -40), nodes[0].pos[0]);
     try std.testing.expectEqual(@as(f32, 140), nodes[1].pos[0]);
     try std.testing.expectEqual(@as(f32, 320), nodes[2].pos[0]);
+}
+
+test "zui-nodes command dispatch uses indexed traversal for large dependency chains" {
+    const node_count = 96;
+    var selected: [node_count]u32 = .{0} ** node_count;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [node_count]node_editor.Node = undefined;
+    var connections: [node_count - 1]node_editor.Connection = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{
+        .id = @intCast(index + 1),
+        .title = "Node",
+        .pos = .{ @floatFromInt(index), 0 },
+    };
+    for (&connections, 0..) |*connection, index| connection.* = .{
+        .from_id = nodes[index].id,
+        .to_id = nodes[index + 1].id,
+    };
+    var node_len: usize = nodes.len;
+    var connection_len: usize = connections.len;
+    var topology_storage = graph_topology.StaticWorkspace(node_count, connections.len){};
+    var topology = graph_topology.Index.init(topology_storage.workspace());
+    var context = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .topology_index = &topology,
+    };
+
+    _ = state.setSingleSelection(nodes[node_count - 1].id);
+    try std.testing.expect(canDispatch(&context, .select_upstream_nodes));
+    try std.testing.expect(dispatch(&context, .select_upstream_nodes));
+    try std.testing.expectEqual(node_count, state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(u64, 1), topology.summary().rebuild_count);
+    try std.testing.expect(topology.summary().cache_hit_count >= 1);
 }
 
 test "zui-nodes command dispatch reconnects selected connection and supports history" {

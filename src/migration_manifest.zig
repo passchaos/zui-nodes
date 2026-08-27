@@ -36,7 +36,7 @@ pub const MigrationItem = struct {
 };
 
 pub const migration_manifest = [_]MigrationItem{
-    .{ .name = "node editor model", .area = .model, .status = .native, .note = "nodes, ports, connections, groups, stable transitive upstream/downstream selection" },
+    .{ .name = "node editor model", .area = .model, .status = .native, .note = "nodes, ports, connections, groups, cached topology traversal for large graphs" },
     .{ .name = "node editor history", .area = .model, .status = .native, .note = "undo/redo snapshots" },
     .{ .name = "node editor view", .area = .view, .status = .native, .note = "ElementNode/view adapter lives in zui-nodes" },
     .{ .name = "node editor command dispatch", .area = .commands, .status = .native, .note = "mutation/selection/history commands" },

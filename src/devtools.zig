@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const zui = @import("zui");
+const graph_topology = @import("graph_topology.zig");
 const node_editor = @import("node_editor.zig");
 
 pub const Node = node_editor.Node;
@@ -26,6 +27,7 @@ pub const SummaryOptions = struct {
     viewport: Rect = .zero,
     minimap_size: zui.ui_base.Size = .{ .w = 150, .h = 96 },
     connection_path_cache: ?*const node_editor.ConnectionPathCache = null,
+    topology_index: ?*graph_topology.Index = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
 
@@ -45,6 +47,7 @@ pub const Summary = struct {
     pan: [2]f32 = .{ 0, 0 },
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
+    topology: graph_topology.Summary = .{},
     graph_validation: node_editor.GraphValidationReport = .{},
     graph_valid: bool = true,
     graph_issue_count: usize = 0,
@@ -74,6 +77,7 @@ pub fn summarize(options: SummaryOptions) Summary {
     const state = options.state;
     const minimap = node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size);
     const graph_report = node_editor.validateGraph(options.nodes, options.connections, options.connection_policy);
+    if (options.topology_index) |topology| _ = topology.ensure(options.nodes, options.connections);
     return .{
         .node_count = options.nodes.len,
         .connection_count = options.connections.len,
@@ -90,6 +94,7 @@ pub fn summarize(options: SummaryOptions) Summary {
         .pan = state.pan,
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
+        .topology = if (options.topology_index) |topology| topology.summary() else .{},
         .graph_validation = graph_report,
         .graph_valid = graph_report.validFor(options.connection_policy),
         .graph_issue_count = graph_report.issueCountFor(options.connection_policy),
@@ -147,7 +152,14 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.graph_validation.incompatible_port_type_count,
         options.summary.graph_validation.cycle_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, graph });
+    const topology = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "topology indexed={d}/{d} rebuilds={d} hits={d} valid={}", .{
+        options.summary.topology.indexed_connection_count,
+        options.summary.topology.connection_count,
+        options.summary.topology.rebuild_count,
+        options.summary.topology.cache_hit_count,
+        options.summary.topology.valid,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, topology, graph });
     return root;
 }
 
@@ -205,4 +217,29 @@ test "zui-nodes devtools reports strict graph validation issues" {
     try std.testing.expectEqual(@as(usize, 2), summary.graph_validation.cycle_count);
     try std.testing.expect(!summary.graph_validation.validFor(.strict_dataflow));
     try std.testing.expectEqualStrings("invalid", summary.statusText());
+}
+
+test "zui-nodes devtools exposes topology index reuse" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+    };
+    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    var topology_storage = graph_topology.StaticWorkspace(4, 4){};
+    var topology = graph_topology.Index.init(topology_storage.workspace());
+    try std.testing.expect(topology.ensure(&nodes, &connections).complete());
+    try std.testing.expect(topology.ensure(&nodes, &connections).cache_hit);
+
+    const summary = summarize(.{
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .topology_index = &topology,
+    });
+    try std.testing.expect(summary.topology.valid);
+    try std.testing.expectEqual(@as(usize, 1), summary.topology.indexed_connection_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.topology.rebuild_count);
+    try std.testing.expectEqual(@as(u64, 2), summary.topology.cache_hit_count);
 }

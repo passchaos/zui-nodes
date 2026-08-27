@@ -7,6 +7,7 @@ const command_search = zui.ui_command_search;
 const commands_mod = @import("commands.zig");
 const menu_mod = zui.ui_menu;
 const graph_validation = @import("graph_validation.zig");
+const graph_topology = @import("graph_topology.zig");
 
 const render = struct {
     pub const PathCommand = zui.RenderPathCommand;
@@ -53,6 +54,15 @@ pub const ConnectionPolicy = graph_validation.ConnectionPolicy;
 pub const ConnectionValidation = graph_validation.ConnectionValidation;
 pub const ConnectionValidationOptions = graph_validation.ConnectionValidationOptions;
 pub const GraphValidationReport = graph_validation.GraphValidationReport;
+
+pub const ConnectedSelectionResult = struct {
+    traversal: graph_topology.TraversalResult = .{},
+    changed: bool = false,
+
+    pub fn complete(self: ConnectedSelectionResult) bool {
+        return self.traversal.complete();
+    }
+};
 
 pub const ConnectionEnd = enum {
     from,
@@ -1930,6 +1940,36 @@ pub const State = struct {
         return false;
     }
 
+    /// Check an upstream/downstream selection against a reusable topology
+    /// index. This path scales with the reachable subgraph instead of rescanning
+    /// every connection for every visited node.
+    pub fn canSelectConnectedNodesIndexed(self: *const State, topology: *graph_topology.Index, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, command: NodeEditorCommand) bool {
+        const active_nodes = nodes[0..@min(node_len, nodes.len)];
+        const active_connections = connections[0..@min(connection_len, connections.len)];
+        const traversal = self.traverseConnectedNodes(topology, active_connections, active_nodes, command) orelse
+            return self.canSelectConnectedNodes(active_connections, active_connections.len, active_nodes, active_nodes.len, command);
+        if (traversal.visited_node_count == 0) return false;
+        if (self.selected_connection != null or self.selected_group_id != null) return true;
+
+        const target_len = @min(traversal.visited_node_count, self.selected_node_ids.len);
+        if (self.boundedSelectionLen() != target_len) return true;
+        var target_index: usize = 0;
+        var last_reachable_id: ?u32 = null;
+        for (active_nodes, 0..) |node, index| {
+            if (!topology.nodeReachableAt(index)) continue;
+            last_reachable_id = node.id;
+            if (target_index < target_len) {
+                if (self.selected_node_ids[target_index] != node.id) return true;
+                target_index += 1;
+            }
+        }
+        const target_selected_id = if (target_len > 0)
+            reachableNodeIdAt(topology, active_nodes, target_len - 1)
+        else
+            last_reachable_id;
+        return self.selected_node_id != target_selected_id;
+    }
+
     pub fn selectConnectedNodes(self: *State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, command: NodeEditorCommand) bool {
         const related = self.connectedNodeSelection(connections, connection_len, nodes, node_len, command);
         if (related.len == 0) return false;
@@ -1949,6 +1989,45 @@ pub const State = struct {
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
         return before_len != self.selected_node_len or before_id != self.selected_node_id or before_hash != after_hash;
+    }
+
+    pub fn selectConnectedNodesIndexed(self: *State, topology: *graph_topology.Index, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, command: NodeEditorCommand) bool {
+        return self.selectConnectedNodesIndexedDetailed(topology, connections, connection_len, nodes, node_len, command).changed;
+    }
+
+    pub fn selectConnectedNodesIndexedDetailed(self: *State, topology: *graph_topology.Index, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, command: NodeEditorCommand) ConnectedSelectionResult {
+        const active_nodes = nodes[0..@min(node_len, nodes.len)];
+        const active_connections = connections[0..@min(connection_len, connections.len)];
+        var traversal = self.traverseConnectedNodes(topology, active_connections, active_nodes, command) orelse return .{
+            .changed = self.selectConnectedNodes(active_connections, active_connections.len, active_nodes, active_nodes.len, command),
+            .traversal = .{ .topology_unavailable = true },
+        };
+        if (traversal.visited_node_count == 0) return .{ .traversal = traversal };
+
+        const before_len = self.boundedSelectionLen();
+        const before_id = self.selected_node_id;
+        const before_group = self.selected_group_id;
+        const before_connection = self.selected_connection;
+        var before_hash: u64 = 0;
+        for (self.selected_node_ids[0..before_len]) |id| before_hash = before_hash *% 16777619 +% id;
+
+        topology.writeReachableNodeIds(self.selected_node_ids, &traversal);
+        self.selected_node_len = traversal.output_count;
+        self.selected_node_id = if (self.selected_node_len > 0)
+            self.selected_node_ids[self.selected_node_len - 1]
+        else
+            lastReachableNodeId(topology, active_nodes);
+        self.selected_group_id = null;
+        self.selected_connection = null;
+
+        var after_hash: u64 = 0;
+        for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
+        return .{
+            .traversal = traversal,
+            .changed = before_len != self.selected_node_len or before_id != self.selected_node_id or
+                before_group != self.selected_group_id or !optionalConnectionEqual(before_connection, self.selected_connection) or
+                before_hash != after_hash,
+        };
     }
 
     pub fn canDisconnectContextPortLinks(self: *const State, connections: []const Connection, connection_len: usize) bool {
@@ -2316,6 +2395,39 @@ pub const State = struct {
         }
         sortSelectedNodeIdsByStorageOrder(&out, active_nodes);
         return out;
+    }
+
+    fn traverseConnectedNodes(self: *const State, topology: *graph_topology.Index, connections: []const Connection, nodes: []const Node, command: NodeEditorCommand) ?graph_topology.TraversalResult {
+        const direction: graph_topology.Direction = switch (command) {
+            .select_upstream_nodes => .upstream,
+            .select_downstream_nodes => .downstream,
+            else => return null,
+        };
+        if (!topology.ensure(nodes, connections).usable()) return null;
+        const connection_seed = if (self.selected_connection) |connection| switch (direction) {
+            .upstream => connection.from_id,
+            .downstream => connection.to_id,
+        } else null;
+        const primary_seed = connection_seed orelse if (self.boundedSelectionLen() == 0) self.selected_node_id else null;
+        return topology.traverse(direction, primary_seed, self.selected_node_ids[0..self.boundedSelectionLen()]);
+    }
+
+    fn lastReachableNodeId(topology: *const graph_topology.Index, nodes: []const Node) ?u32 {
+        var last: ?u32 = null;
+        for (nodes, 0..) |node, index| {
+            if (topology.nodeReachableAt(index)) last = node.id;
+        }
+        return last;
+    }
+
+    fn reachableNodeIdAt(topology: *const graph_topology.Index, nodes: []const Node, target_index: usize) ?u32 {
+        var reachable_index: usize = 0;
+        for (nodes, 0..) |node, index| {
+            if (!topology.nodeReachableAt(index)) continue;
+            if (reachable_index == target_index) return node.id;
+            reachable_index += 1;
+        }
+        return null;
     }
 
     fn appendUniqueNodeId(out: *SelectedNodeIdList, nodes: []const Node, id: u32) void {
@@ -3674,6 +3786,40 @@ test "NodeEditor connected selection handles cycles branches and no-op capabilit
     _ = state.setSingleSelection(5);
     try std.testing.expect(!state.canSelectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_upstream_nodes));
     try std.testing.expect(!state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_upstream_nodes));
+}
+
+test "NodeEditor indexed connected selection scales past inline traversal capacity" {
+    const node_count = 192;
+    var selected: [node_count]u32 = .{0} ** node_count;
+    var state = State{ .selected_node_ids = &selected };
+    var nodes: [node_count]Node = undefined;
+    var connections: [node_count - 1]Connection = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{
+        .id = @intCast(index + 1),
+        .title = "Node",
+        .pos = .{ @floatFromInt(index), 0 },
+    };
+    for (&connections, 0..) |*connection, index| connection.* = .{
+        .from_id = nodes[index].id,
+        .to_id = nodes[index + 1].id,
+    };
+    var topology_storage = graph_topology.StaticWorkspace(node_count, connections.len){};
+    var topology = graph_topology.Index.init(topology_storage.workspace());
+
+    _ = state.setSingleSelection(nodes[node_count - 1].id);
+    const result = state.selectConnectedNodesIndexedDetailed(&topology, &connections, connections.len, &nodes, nodes.len, .select_upstream_nodes);
+    try std.testing.expect(result.complete());
+    try std.testing.expect(result.changed);
+    try std.testing.expectEqual(node_count, state.boundedSelectionLen());
+    try std.testing.expectEqual(node_count, result.traversal.visited_node_count);
+    try std.testing.expectEqual(connections.len, result.traversal.edge_visit_count);
+    try std.testing.expectEqual(@as(?u32, nodes[node_count - 1].id), state.selected_node_id);
+
+    _ = state.setSingleSelection(nodes[0].id);
+    try std.testing.expect(state.selectConnectedNodesIndexed(&topology, &connections, connections.len, &nodes, nodes.len, .select_downstream_nodes));
+    try std.testing.expectEqual(node_count, state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(u64, 1), topology.summary().rebuild_count);
+    try std.testing.expectEqual(@as(u64, 1), topology.summary().cache_hit_count);
 }
 
 test "NodeEditor connection path cache reuses cubic controls" {
