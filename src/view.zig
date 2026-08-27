@@ -51,6 +51,11 @@ pub const NodeEditorViewOptions = struct {
     /// semantics; Zui core only tracks layer ids, bounds, and typed invalidation.
     canvas_layers: ?*zui.CanvasLayerCache = null,
     connection_path_cache: ?*node_editor.ConnectionPathCache = null,
+    /// Optional caller-owned broad-phase index shared by painting and hit tests.
+    viewport_index: ?*node_editor.ViewportIndex = null,
+    /// Optional application-owned geometry revision. When supplied, callers
+    /// must increment it after external node/group/link geometry changes.
+    geometry_revision: ?u64 = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -74,6 +79,8 @@ pub const NodeEditorViewOptions = struct {
     grid_spacing: f32 = 32.0,
     show_minimap: bool = true,
     minimap_size: zui.ui_base.Size = .{ .w = 150.0, .h = 96.0 },
+    minimap_max_node_marks: usize = 512,
+    minimap_max_group_marks: usize = 128,
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -83,6 +90,8 @@ const Binding = struct {
     canvas_state: ?*zui.CanvasState = null,
     canvas_layers: ?*zui.CanvasLayerCache = null,
     connection_path_cache: ?*node_editor.ConnectionPathCache = null,
+    viewport_index: ?*node_editor.ViewportIndex = null,
+    geometry_revision: ?u64 = null,
     state: *node_editor.State,
     nodes: []const node_editor.Node,
     connections: []const node_editor.Connection = &.{},
@@ -106,6 +115,8 @@ const Binding = struct {
     grid_spacing: f32 = 32.0,
     show_minimap: bool = true,
     minimap_size: zui.ui_base.Size = .{ .w = 150.0, .h = 96.0 },
+    minimap_max_node_marks: usize = 512,
+    minimap_max_group_marks: usize = 128,
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -134,8 +145,12 @@ const Binding = struct {
             .grid_spacing = self.grid_spacing,
             .show_minimap = self.show_minimap,
             .minimap_size = self.minimap_size,
+            .minimap_max_node_marks = self.minimap_max_node_marks,
+            .minimap_max_group_marks = self.minimap_max_group_marks,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
+            .viewport_index = self.viewport_index,
+            .geometry_revision = self.geometry_revision,
             .connection_policy = self.connection_policy,
         };
     }
@@ -147,6 +162,8 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .canvas_state = options.canvas_state,
         .canvas_layers = options.canvas_layers,
         .connection_path_cache = options.connection_path_cache,
+        .viewport_index = options.viewport_index,
+        .geometry_revision = options.geometry_revision,
         .state = options.state,
         .nodes = options.nodes,
         .connections = options.connections,
@@ -170,6 +187,8 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .grid_spacing = options.grid_spacing,
         .show_minimap = options.show_minimap,
         .minimap_size = options.minimap_size,
+        .minimap_max_node_marks = options.minimap_max_node_marks,
+        .minimap_max_group_marks = options.minimap_max_group_marks,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -209,20 +228,20 @@ fn nodeEditorViewEvent(node: *ElementNode, event: *ElementEvent, user_data: ?*an
 fn nodeEditorCanvasHitTest(node: *const ElementNode, point: [2]f32, user_data: ?*anyopaque) ?u64 {
     const binding: *const Binding = if (user_data) |ptr| @ptrCast(@alignCast(ptr)) else return null;
     const editor = binding.editor();
-    if (node_editor.inputPortAtPoint(node.rect, editor.state.*, editor.nodes, point)) |hit| {
+    const viewport_index = node_editor.prepareNodeEditorViewportIndex(node.rect, editor);
+    if (node_editor.inputPortAtEditorPoint(node.rect, editor, viewport_index, point)) |hit| {
         return packCanvasHitId(.input_port, editor.nodes[hit.node_index].id);
     }
-    if (node_editor.outputPortAtPoint(node.rect, editor.state.*, editor.nodes, point)) |hit| {
+    if (node_editor.outputPortAtEditorPoint(node.rect, editor, viewport_index, point)) |hit| {
         return packCanvasHitId(.output_port, editor.nodes[hit.node_index].id);
     }
-    if (node_editor.nodeAtPoint(node.rect, editor.state.*, editor.nodes, point)) |index| {
+    if (node_editor.nodeAtEditorPoint(node.rect, editor, viewport_index, point)) |index| {
         return packCanvasHitId(.node, editor.nodes[index].id);
     }
-    if (node_editor.groupAtPoint(node.rect, editor.state.*, editor.groups, point)) |index| {
+    if (node_editor.groupAtEditorPoint(node.rect, editor, viewport_index, point)) |index| {
         return packCanvasHitId(.group, editor.groups[index].id);
     }
-    const mutable_connection_len = if (editor.mutable_connection_len) |len| len.* else null;
-    if (node_editor.connectionAtPoint(node.rect, editor.state.*, editor.nodes, editor.mutable_connections, mutable_connection_len, editor.connections, point)) |connection| {
+    if (node_editor.connectionAtEditorPoint(node.rect, editor, viewport_index, point)) |connection| {
         return packCanvasHitId(.connection, connectionHash(connection));
     }
     return null;
@@ -256,6 +275,10 @@ const InteractionSnapshot = struct {
 
 fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, before: InteractionSnapshot, changed: bool) void {
     if (!changed) return;
+    const geometry_changed = before.structural_drag or binding.state.dragging_node_id != null or binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.reconnecting_connection != null;
+    if (geometry_changed) {
+        if (binding.viewport_index) |viewport_index| viewport_index.invalidate();
+    }
     const canvas_state = binding.canvas_state orelse return;
     if (before.transformChanged(binding.state)) {
         canvas_state.invalidate(.viewport_transform, null);
@@ -268,7 +291,7 @@ fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, be
         .mouse_down, .mouse_up => kinds = kinds.with(.hit_test),
         else => {},
     }
-    if (before.structural_drag or binding.state.dragging_node_id != null or binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.reconnecting_connection != null) {
+    if (geometry_changed) {
         kinds = kinds.with(.data).with(.hit_test);
     }
 
@@ -345,10 +368,12 @@ test "node editor view reports dirty canvas invalidation" {
         .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
         .{ .id = 2, .title = "Output", .pos = .{ 180, 80 } },
     };
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
     var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
     defer view.deinit();
     var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
-    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9412, .canvas_state = &canvas_state, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
+    const editor_node = try nodeEditorView(&ctx, .{ .tag = 9412, .canvas_state = &canvas_state, .viewport_index = &viewport_index, .geometry_revision = 1, .state = &state, .nodes = &nodes, .mutable_nodes = &nodes, .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } } });
     editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
 
     const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[1]);
@@ -364,6 +389,7 @@ test "node editor view reports dirty canvas invalidation" {
     try std.testing.expect(summary.invalidation.contains(.data));
     try std.testing.expect(summary.invalidation.contains(.hit_test));
     try std.testing.expectEqual(@as(?Rect, editor_node.rect), summary.dirty_bounds);
+    try std.testing.expect(!viewport_index.summary().valid);
 }
 
 test "node editor view invalidates shared canvas layer cache" {
@@ -414,6 +440,40 @@ test "node editor canvas hit test feeds generic canvas hover" {
     _ = editor_node.on_event.?(editor_node, &move);
     try std.testing.expectEqual(@as(?u64, packCanvasHitId(.node, 1)), canvas_state.hovered_id);
     try std.testing.expect(zui.summarizeCanvas(editor_node).has_hit_test_handler);
+}
+
+test "node editor canvas hit test reuses viewport candidates" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var canvas_state = zui.CanvasState{};
+    const nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "visible", .pos = .{ -40, -30 } },
+        .{ .id = 2, .title = "culled", .pos = .{ 4000, 3000 } },
+    };
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9415,
+        .canvas_state = &canvas_state,
+        .viewport_index = &viewport_index,
+        .geometry_revision = 1,
+        .state = &state,
+        .nodes = &nodes,
+        .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+
+    const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    const point = [2]f32{ node_rect.x + 20, node_rect.y + 20 };
+    try std.testing.expectEqual(packCanvasHitId(.node, 1), nodeEditorCanvasHitTest(editor_node, point, editor_node.paint_user_data).?);
+    try std.testing.expectEqual(packCanvasHitId(.node, 1), nodeEditorCanvasHitTest(editor_node, point, editor_node.paint_user_data).?);
+    const summary = viewport_index.summary();
+    try std.testing.expectEqual(@as(usize, 1), summary.visible_node_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.rebuild_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.viewport_reuse_count);
 }
 
 test "node editor view creates connections from output to input ports" {

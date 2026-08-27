@@ -28,6 +28,8 @@ pub const SummaryOptions = struct {
     minimap_size: zui.ui_base.Size = .{ .w = 150, .h = 96 },
     connection_path_cache: ?*const node_editor.ConnectionPathCache = null,
     topology_index: ?*graph_topology.Index = null,
+    viewport_index: ?*node_editor.ViewportIndex = null,
+    geometry_revision: ?u64 = null,
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -49,6 +51,7 @@ pub const Summary = struct {
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
     topology: graph_topology.Summary = .{},
+    viewport_index: node_editor.ViewportSummary = .{},
     history: node_editor.HistorySummary = .{},
     graph_validation: node_editor.GraphValidationReport = .{},
     graph_valid: bool = true,
@@ -77,9 +80,21 @@ pub const PanelOptions = struct {
 
 pub fn summarize(options: SummaryOptions) Summary {
     const state = options.state;
-    const minimap = node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size);
     const graph_report = node_editor.validateGraph(options.nodes, options.connections, options.connection_policy);
     if (options.topology_index) |topology| _ = topology.ensure(options.nodes, options.connections);
+    if (options.viewport_index) |viewport_index| {
+        _ = if (options.geometry_revision) |revision|
+            viewport_index.prepareVersioned(options.nodes, options.groups, options.connections, options.viewport, state.pan, state.zoom, revision)
+        else
+            viewport_index.prepare(options.nodes, options.groups, options.connections, options.viewport, state.pan, state.zoom);
+    }
+    const minimap = if (options.viewport_index) |viewport_index|
+        if (viewport_index.graphBounds()) |bounds|
+            node_editor.minimapSnapshotFromGraphBounds(options.viewport, state.*, node_editor.paddedBounds(bounds, 0.12), options.minimap_size)
+        else
+            node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size)
+    else
+        node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size);
     return .{
         .node_count = options.nodes.len,
         .connection_count = options.connections.len,
@@ -97,6 +112,7 @@ pub fn summarize(options: SummaryOptions) Summary {
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
         .topology = if (options.topology_index) |topology| topology.summary() else .{},
+        .viewport_index = if (options.viewport_index) |viewport_index| viewport_index.summary() else .{},
         .history = if (options.history) |history| history.summary() else .{},
         .graph_validation = graph_report,
         .graph_valid = graph_report.validFor(options.connection_policy),
@@ -162,6 +178,19 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.topology.cache_hit_count,
         options.summary.topology.valid,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const viewport_index = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "viewport nodes={d}/{d} groups={d}/{d} links={d}/{d} rebuilds={d} queries={d} geometry_reuse={d} viewport_reuse={d} valid={}", .{
+        options.summary.viewport_index.visible_node_count,
+        options.summary.viewport_index.node_count,
+        options.summary.viewport_index.visible_group_count,
+        options.summary.viewport_index.group_count,
+        options.summary.viewport_index.visible_connection_count,
+        options.summary.viewport_index.connection_count,
+        options.summary.viewport_index.rebuild_count,
+        options.summary.viewport_index.query_count,
+        options.summary.viewport_index.geometry_reuse_count,
+        options.summary.viewport_index.viewport_reuse_count,
+        options.summary.viewport_index.valid,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const history = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "history bound={} undo={d} redo={d} nodes={d} links={d} rejected={d} dropped={d}", .{
         options.summary.history.available,
         options.summary.history.undo_len,
@@ -171,7 +200,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, topology, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, topology, viewport_index, history, graph });
     return root;
 }
 
@@ -258,4 +287,39 @@ test "zui-nodes devtools exposes topology index reuse" {
     try std.testing.expectEqual(@as(u64, 2), summary.topology.cache_hit_count);
     try std.testing.expect(summary.history.available);
     try std.testing.expectEqual(@as(usize, 16), summary.history.node_capacity);
+}
+
+test "zui-nodes devtools exposes viewport culling and reuse" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "visible", .pos = .{ -40, -20 } },
+        .{ .id = 2, .title = "culled", .pos = .{ 1000, 0 } },
+    };
+    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    const viewport = Rect{ .x = 0, .y = 0, .w = 320, .h = 180 };
+
+    _ = summarize(.{
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .viewport = viewport,
+        .viewport_index = &viewport_index,
+        .geometry_revision = 4,
+    });
+    const summary = summarize(.{
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .viewport = viewport,
+        .viewport_index = &viewport_index,
+        .geometry_revision = 4,
+    });
+    try std.testing.expect(summary.viewport_index.valid);
+    try std.testing.expectEqual(@as(usize, 1), summary.viewport_index.visible_node_count);
+    try std.testing.expectEqual(@as(usize, 2), summary.viewport_index.node_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.viewport_index.rebuild_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.viewport_index.viewport_reuse_count);
 }

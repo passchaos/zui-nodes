@@ -52,4 +52,36 @@ pub fn build(b: *std.Build) void {
     } else {
         verify_topology_step.dependOn(&topology_bench.step);
     }
+
+    const viewport_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/viewport_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const viewport_bench = b.addExecutable(.{
+        .name = "zui-nodes-viewport-bench",
+        .root_module = viewport_bench_mod,
+    });
+    const run_viewport_bench = b.addRunArtifact(viewport_bench);
+    if (b.args) |args| run_viewport_bench.addArgs(args);
+    const viewport_bench_step = b.step("bench-viewport", "Benchmark 10k-node viewport indexing and hit candidates");
+    if (can_run_target) {
+        viewport_bench_step.dependOn(&run_viewport_bench.step);
+    } else {
+        viewport_bench_step.dependOn(&viewport_bench.step);
+    }
+
+    const verify_viewport_bench = b.addRunArtifact(viewport_bench);
+    verify_viewport_bench.addArgs(&.{
+        "--iterations=2000",
+        "--max-build-ns=50000000",
+        "--max-query-ns=100000",
+        "--max-cached-prepare-ns=1000",
+    });
+    const verify_viewport_step = b.step("verify-viewport-performance", "Verify 10k-node viewport culling, reuse, and zero-allocation queries");
+    if (can_run_target) {
+        verify_viewport_step.dependOn(&verify_viewport_bench.step);
+    } else {
+        verify_viewport_step.dependOn(&viewport_bench.step);
+    }
 }

@@ -8,6 +8,7 @@ const commands_mod = @import("commands.zig");
 const menu_mod = zui.ui_menu;
 const graph_validation = @import("graph_validation.zig");
 const graph_topology = @import("graph_topology.zig");
+const viewport_types = @import("node_viewport.zig").Types(Node, Group, Connection, Rect);
 
 const render = struct {
     pub const PathCommand = zui.RenderPathCommand;
@@ -54,6 +55,12 @@ pub const ConnectionPolicy = graph_validation.ConnectionPolicy;
 pub const ConnectionValidation = graph_validation.ConnectionValidation;
 pub const ConnectionValidationOptions = graph_validation.ConnectionValidationOptions;
 pub const GraphValidationReport = graph_validation.GraphValidationReport;
+pub const ViewportWorkspace = viewport_types.Workspace;
+pub const ViewportStorage = viewport_types.Storage;
+pub const StaticViewportWorkspace = viewport_types.StaticWorkspace;
+pub const ViewportPrepareResult = viewport_types.PrepareResult;
+pub const ViewportSummary = viewport_types.Summary;
+pub const ViewportIndex = viewport_types.Index;
 
 pub const ConnectedSelectionResult = struct {
     traversal: graph_topology.TraversalResult = .{},
@@ -348,8 +355,12 @@ pub fn Options(comptime StateType: type) type {
         mutable_nodes: ?[]Node = null,
         show_minimap: bool = true,
         minimap_size: Size = .{ .w = 150.0, .h = 96.0 },
+        minimap_max_node_marks: usize = 512,
+        minimap_max_group_marks: usize = 128,
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
+        viewport_index: ?*ViewportIndex = null,
+        geometry_revision: ?u64 = null,
         connection_policy: ConnectionPolicy = .default,
     };
 }
@@ -482,7 +493,11 @@ pub fn minimapViewportRect(minimap: Rect, bounds: Rect, viewport: Rect, state: a
 
 pub fn minimapSnapshot(viewport: Rect, state: anytype, nodes: []const Node, groups: []const Group, minimap_size: Size) MinimapSnapshot {
     if (viewport.w <= 0.0 or viewport.h <= 0.0 or nodes.len == 0 or minimap_size.w <= 0.0 or minimap_size.h <= 0.0) return .{};
-    const bounds = paddedBounds(graphBounds(nodes, groups), 0.12);
+    return minimapSnapshotFromGraphBounds(viewport, state, paddedBounds(graphBounds(nodes, groups), 0.12), minimap_size);
+}
+
+pub fn minimapSnapshotFromGraphBounds(viewport: Rect, state: anytype, bounds: Rect, minimap_size: Size) MinimapSnapshot {
+    if (viewport.w <= 0.0 or viewport.h <= 0.0 or minimap_size.w <= 0.0 or minimap_size.h <= 0.0) return .{};
     if (bounds.w <= 0.0 or bounds.h <= 0.0) return .{};
     const minimap = Rect{
         .x = viewport.x + viewport.w - minimap_size.w - 10.0,
@@ -497,6 +512,14 @@ pub fn minimapSnapshot(viewport: Rect, state: anytype, nodes: []const Node, grou
         .graph_bounds = bounds,
         .viewport_rect = minimapViewportRect(minimap, bounds, viewport, state),
     };
+}
+
+fn minimapSnapshotPrepared(viewport: Rect, editor: anytype, viewport_index: ?*ViewportIndex) MinimapSnapshot {
+    if (editor.nodes.len == 0) return .{};
+    if (viewport_index) |index| {
+        if (index.graphBounds()) |bounds| return minimapSnapshotFromGraphBounds(viewport, editor.state.*, paddedBounds(bounds, 0.12), editor.minimap_size);
+    }
+    return minimapSnapshot(viewport, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
 }
 
 pub fn rectIntersects(a: Rect, b: Rect) bool {
@@ -2801,90 +2824,66 @@ fn editorConnectionPathCache(editor: anytype) ?*ConnectionPathCache {
     return null;
 }
 
+fn editorViewportIndex(editor: anytype) ?*ViewportIndex {
+    const Editor = @TypeOf(editor);
+    if (@hasField(Editor, "viewport_index")) return editor.viewport_index;
+    return null;
+}
+
+fn editorGeometryRevision(editor: anytype) ?u64 {
+    const Editor = @TypeOf(editor);
+    if (@hasField(Editor, "geometry_revision")) return editor.geometry_revision;
+    return null;
+}
+
+pub fn prepareNodeEditorViewportIndex(rect: Rect, editor: anytype) ?*ViewportIndex {
+    const viewport_index = editorViewportIndex(editor) orelse return null;
+    const connections = editorActiveConnections(editor);
+    const prepared = if (editorGeometryRevision(editor)) |revision|
+        viewport_index.prepareVersioned(editor.nodes, editor.groups, connections, rect, editor.state.pan, editor.state.zoom, revision)
+    else
+        viewport_index.prepare(editor.nodes, editor.groups, connections, rect, editor.state.pan, editor.state.zoom);
+    return if (prepared.ready) viewport_index else null;
+}
+
 pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, layer: i32) !DrawCommandRange {
     if (rect.w <= 0.0 or rect.h <= 0.0) return .{};
     editor.state.clamp();
     try paint_primitives.appendFillRect(allocator, out, rect, editor.background, 0.0, layer);
     try out.append(allocator, .{ .clip_begin = rect });
     const connection_path_cache = editorConnectionPathCache(editor);
+    const viewport_index = prepareNodeEditorViewportIndex(rect, editor);
     try appendNodeEditorGrid(allocator, out, rect, editor, layer + 1);
-    for (editor.groups) |group| {
-        try appendNodeEditorGroup(allocator, out, rect, editor, group, layer + 2);
-    }
-    for (editor.connections) |connection| {
-        const from = nodeById(editor.nodes, connection.from_id) orelse continue;
-        const to = nodeById(editor.nodes, connection.to_id) orelse continue;
-        const a = outputPortPositionAt(rect, editor.state.*, from, connection.from_port);
-        const b = inputPortPositionAt(rect, editor.state.*, to, connection.to_port);
-        const selected = editor.state.isConnectionSelected(connection);
-        const hovered = editor.state.isConnectionHovered(connection);
-        const color = if (selected) editor.selected_color else if (hovered) connection.color.lighten(0.12) else connection.color;
-        try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer + 3);
-    }
-    if (editor.mutable_connections) |connections| {
-        const len = if (editor.mutable_connection_len) |value| @min(value.*, connections.len) else connections.len;
-        for (connections[0..len]) |connection| {
-            const from = nodeById(editor.nodes, connection.from_id) orelse continue;
-            const to = nodeById(editor.nodes, connection.to_id) orelse continue;
-            const a = outputPortPositionAt(rect, editor.state.*, from, connection.from_port);
-            const b = inputPortPositionAt(rect, editor.state.*, to, connection.to_port);
-            const selected = editor.state.isConnectionSelected(connection);
-            const hovered = editor.state.isConnectionHovered(connection);
-            const color = if (selected) editor.selected_color else if (hovered) connection.color.lighten(0.12) else connection.color;
-            try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer + 3);
+    if (viewport_index) |index| {
+        for (index.visibleGroupIndices()) |group_index| {
+            try appendNodeEditorGroup(allocator, out, rect, editor, editor.groups[group_index], layer + 2);
+        }
+    } else {
+        for (editor.groups) |group| {
+            try appendNodeEditorGroup(allocator, out, rect, editor, group, layer + 2);
         }
     }
-    for (editor.nodes) |node_item| {
-        const node_rect = nodeRectFromElement(rect, editor, node_item);
-        if (node_rect.x + node_rect.w < rect.x or node_rect.x > rect.x + rect.w or node_rect.y + node_rect.h < rect.y or node_rect.y > rect.y + rect.h) continue;
-        const selected = editor.state.isNodeSelected(node_item.id);
-        const hovered = editor.state.hover_node_id != null and editor.state.hover_node_id.? == node_item.id;
-        const bg = if (selected) node_item.color.lighten(0.08) else if (hovered) node_item.color.lighten(0.04) else node_item.color;
-        try paint_primitives.appendFillRect(allocator, out, node_rect, bg, 7.0, layer + 3);
-        try paint_primitives.appendBorder(allocator, out, node_rect, if (selected) editor.selected_color else editor.grid_color.withAlpha(0.8), if (selected) 2.0 else 1.0, 7.0, layer + 4);
-        try out.append(allocator, .{ .text = .{
-            .pos = .{ node_rect.x + 10.0, node_rect.y + 8.0 },
-            .size = editor.font_size,
-            .color = editor.node_text_color,
-            .text = node_item.title,
-            .layer = layer + 5,
-        } });
-        var input_port_index: u8 = 0;
-        while (input_port_index < inputPortCount(node_item)) : (input_port_index += 1) {
-            const in_port = inputPortPositionAt(rect, editor.state.*, node_item, input_port_index);
-            const input_hovered = editor.state.hover_input_node_id != null and editor.state.hover_input_node_id.? == node_item.id;
-            const input_color = if (input_hovered) editor.selected_color else editor.port_color;
-            try out.append(allocator, .{ .point = .{ .pos = in_port, .size = if (input_hovered) 7.0 else 5.0, .color = input_color, .layer = layer + 6 } });
-            if (inputPortLabel(node_item, input_port_index)) |port_label| {
-                try out.append(allocator, .{ .text = .{
-                    .pos = .{ in_port[0] + 8.0, in_port[1] - editor.font_size * 0.5 },
-                    .size = @max(8.0, editor.font_size - 2.0),
-                    .color = editor.node_text_color.withAlpha(0.78),
-                    .text = port_label,
-                    .layer = layer + 6,
-                } });
-            }
+    const connections = editorActiveConnections(editor);
+    if (viewport_index) |index| {
+        for (index.visibleConnectionIndices()) |connection_index| {
+            try appendNodeEditorConnectionItem(allocator, out, rect, editor, connection_path_cache, index, connections[connection_index], layer + 3);
         }
-        var output_port_index: u8 = 0;
-        while (output_port_index < outputPortCount(node_item)) : (output_port_index += 1) {
-            const out_port = outputPortPositionAt(rect, editor.state.*, node_item, output_port_index);
-            const output_hovered = editor.state.hover_output_node_id != null and editor.state.hover_output_node_id.? == node_item.id;
-            const output_color = if (output_hovered or (editor.state.dragging_connection_from_id != null and editor.state.dragging_connection_from_id.? == node_item.id)) editor.selected_color else editor.port_color;
-            try out.append(allocator, .{ .point = .{ .pos = out_port, .size = if (output_hovered) 7.0 else 5.0, .color = output_color, .layer = layer + 6 } });
-            if (outputPortLabel(node_item, output_port_index)) |port_label| {
-                const label_w = @as(f32, @floatFromInt(port_label.len)) * @max(8.0, editor.font_size - 2.0) * 0.54;
-                try out.append(allocator, .{ .text = .{
-                    .pos = .{ out_port[0] - label_w - 8.0, out_port[1] - editor.font_size * 0.5 },
-                    .size = @max(8.0, editor.font_size - 2.0),
-                    .color = editor.node_text_color.withAlpha(0.78),
-                    .text = port_label,
-                    .layer = layer + 6,
-                } });
-            }
+    } else {
+        for (connections) |connection| {
+            try appendNodeEditorConnectionItem(allocator, out, rect, editor, connection_path_cache, null, connection, layer + 3);
+        }
+    }
+    if (viewport_index) |index| {
+        for (index.visibleNodeIndices()) |node_index| {
+            try appendNodeEditorNode(allocator, out, rect, editor, editor.nodes[node_index], layer);
+        }
+    } else {
+        for (editor.nodes) |node_item| {
+            try appendNodeEditorNode(allocator, out, rect, editor, node_item, layer);
         }
     }
     const dynamic_start = out.items.len;
-    try appendNodeEditorConnectionOverlay(allocator, out, rect, editor, layer);
+    try appendNodeEditorConnectionOverlayPrepared(allocator, out, rect, editor, viewport_index, layer);
     const dynamic_end = out.items.len;
     if (editor.state.box_selecting) {
         const box = editor.state.boxSelectRect();
@@ -2893,9 +2892,49 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
             try paint_primitives.appendBorder(allocator, out, box, editor.selected_color.withAlpha(0.72), 1.0, 0.0, layer + 8);
         }
     }
-    if (editor.show_minimap) try appendNodeEditorMinimap(allocator, out, rect, editor, layer + 9);
+    if (editor.show_minimap) try appendNodeEditorMinimap(allocator, out, rect, editor, viewport_index, layer + 9);
     try out.append(allocator, .{ .clip_end = {} });
     return .{ .start = dynamic_start, .end = dynamic_end };
+}
+
+fn appendNodeEditorConnectionItem(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, connection_path_cache: ?*ConnectionPathCache, viewport_index: ?*ViewportIndex, connection: Connection, layer: i32) !void {
+    const from = if (viewport_index) |index| editor.nodes[index.nodeIndexForId(connection.from_id) orelse return] else nodeById(editor.nodes, connection.from_id) orelse return;
+    const to = if (viewport_index) |index| editor.nodes[index.nodeIndexForId(connection.to_id) orelse return] else nodeById(editor.nodes, connection.to_id) orelse return;
+    const a = outputPortPositionAt(rect, editor.state.*, from, connection.from_port);
+    const b = inputPortPositionAt(rect, editor.state.*, to, connection.to_port);
+    const selected = editor.state.isConnectionSelected(connection);
+    const hovered = editor.state.isConnectionHovered(connection);
+    const color = if (selected) editor.selected_color else if (hovered) connection.color.lighten(0.12) else connection.color;
+    try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer);
+}
+
+fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, node_item: Node, layer: i32) !void {
+    const node_rect = nodeRectFromElement(rect, editor, node_item);
+    if (!rectOverlapsOrTouches(node_rect, rect)) return;
+    const selected = editor.state.isNodeSelected(node_item.id);
+    const hovered = editor.state.hover_node_id != null and editor.state.hover_node_id.? == node_item.id;
+    const bg = if (selected) node_item.color.lighten(0.08) else if (hovered) node_item.color.lighten(0.04) else node_item.color;
+    try paint_primitives.appendFillRect(allocator, out, node_rect, bg, 7.0, layer + 3);
+    try paint_primitives.appendBorder(allocator, out, node_rect, if (selected) editor.selected_color else editor.grid_color.withAlpha(0.8), if (selected) 2.0 else 1.0, 7.0, layer + 4);
+    try out.append(allocator, .{ .text = .{ .pos = .{ node_rect.x + 10.0, node_rect.y + 8.0 }, .size = editor.font_size, .color = editor.node_text_color, .text = node_item.title, .layer = layer + 5 } });
+    var input_port_index: u8 = 0;
+    while (input_port_index < inputPortCount(node_item)) : (input_port_index += 1) {
+        const in_port = inputPortPositionAt(rect, editor.state.*, node_item, input_port_index);
+        const input_hovered = editor.state.hover_input_node_id != null and editor.state.hover_input_node_id.? == node_item.id;
+        try out.append(allocator, .{ .point = .{ .pos = in_port, .size = if (input_hovered) 7.0 else 5.0, .color = if (input_hovered) editor.selected_color else editor.port_color, .layer = layer + 6 } });
+        if (inputPortLabel(node_item, input_port_index)) |port_label| try out.append(allocator, .{ .text = .{ .pos = .{ in_port[0] + 8.0, in_port[1] - editor.font_size * 0.5 }, .size = @max(8.0, editor.font_size - 2.0), .color = editor.node_text_color.withAlpha(0.78), .text = port_label, .layer = layer + 6 } });
+    }
+    var output_port_index: u8 = 0;
+    while (output_port_index < outputPortCount(node_item)) : (output_port_index += 1) {
+        const out_port = outputPortPositionAt(rect, editor.state.*, node_item, output_port_index);
+        const output_hovered = editor.state.hover_output_node_id != null and editor.state.hover_output_node_id.? == node_item.id;
+        const output_dragging = editor.state.dragging_connection_from_id != null and editor.state.dragging_connection_from_id.? == node_item.id;
+        try out.append(allocator, .{ .point = .{ .pos = out_port, .size = if (output_hovered) 7.0 else 5.0, .color = if (output_hovered or output_dragging) editor.selected_color else editor.port_color, .layer = layer + 6 } });
+        if (outputPortLabel(node_item, output_port_index)) |port_label| {
+            const label_w = @as(f32, @floatFromInt(port_label.len)) * @max(8.0, editor.font_size - 2.0) * 0.54;
+            try out.append(allocator, .{ .text = .{ .pos = .{ out_port[0] - label_w - 8.0, out_port[1] - editor.font_size * 0.5 }, .size = @max(8.0, editor.font_size - 2.0), .color = editor.node_text_color.withAlpha(0.78), .text = port_label, .layer = layer + 6 } });
+        }
+    }
 }
 
 fn appendNodeEditorGrid(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, layer: i32) !void {
@@ -2919,25 +2958,35 @@ fn nodeEditorPreviewConnectionColor(editor: anytype) Color {
 }
 
 pub fn appendNodeEditorConnectionOverlay(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, layer: i32) !void {
+    return appendNodeEditorConnectionOverlayPrepared(allocator, out, rect, editor, prepareNodeEditorViewportIndex(rect, editor), layer);
+}
+
+fn appendNodeEditorConnectionOverlayPrepared(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, layer: i32) !void {
     try appendNodeEditorConnectionPreviewOverlay(allocator, out, rect, editor, layer + 3);
-    for (editor.nodes) |node_item| {
-        const node_rect = nodeRectFromElement(rect, editor, node_item);
-        if (node_rect.x + node_rect.w < rect.x or node_rect.x > rect.x + rect.w or node_rect.y + node_rect.h < rect.y or node_rect.y > rect.y + rect.h) continue;
-        var input_port_index: u8 = 0;
-        while (input_port_index < inputPortCount(node_item)) : (input_port_index += 1) {
-            const in_port = inputPortPositionAt(rect, editor.state.*, node_item, input_port_index);
-            const input_hovered = editor.state.hover_input_node_id != null and editor.state.hover_input_node_id.? == node_item.id;
-            const color = if (input_hovered) editor.selected_color else Color.transparent;
-            try out.append(allocator, .{ .point = .{ .pos = in_port, .size = if (input_hovered) 7.0 else 5.0, .color = color, .layer = layer + 6 } });
-        }
-        var output_port_index: u8 = 0;
-        while (output_port_index < outputPortCount(node_item)) : (output_port_index += 1) {
-            const out_port = outputPortPositionAt(rect, editor.state.*, node_item, output_port_index);
-            const output_hovered = editor.state.hover_output_node_id != null and editor.state.hover_output_node_id.? == node_item.id;
-            const output_dragging = editor.state.dragging_connection_from_id != null and editor.state.dragging_connection_from_id.? == node_item.id;
-            const active = output_hovered or output_dragging;
-            try out.append(allocator, .{ .point = .{ .pos = out_port, .size = if (output_hovered) 7.0 else 5.0, .color = if (active) editor.selected_color else Color.transparent, .layer = layer + 6 } });
-        }
+    if (viewport_index) |index| {
+        for (index.visibleNodeIndices()) |node_index| try appendNodeEditorPortOverlay(allocator, out, rect, editor, editor.nodes[node_index], layer);
+    } else {
+        for (editor.nodes) |node_item| try appendNodeEditorPortOverlay(allocator, out, rect, editor, node_item, layer);
+    }
+}
+
+fn appendNodeEditorPortOverlay(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, node_item: Node, layer: i32) !void {
+    const node_rect = nodeRectFromElement(rect, editor, node_item);
+    if (!rectOverlapsOrTouches(node_rect, rect)) return;
+    var input_port_index: u8 = 0;
+    while (input_port_index < inputPortCount(node_item)) : (input_port_index += 1) {
+        const in_port = inputPortPositionAt(rect, editor.state.*, node_item, input_port_index);
+        const input_hovered = editor.state.hover_input_node_id != null and editor.state.hover_input_node_id.? == node_item.id;
+        const color = if (input_hovered) editor.selected_color else Color.transparent;
+        try out.append(allocator, .{ .point = .{ .pos = in_port, .size = if (input_hovered) 7.0 else 5.0, .color = color, .layer = layer + 6 } });
+    }
+    var output_port_index: u8 = 0;
+    while (output_port_index < outputPortCount(node_item)) : (output_port_index += 1) {
+        const out_port = outputPortPositionAt(rect, editor.state.*, node_item, output_port_index);
+        const output_hovered = editor.state.hover_output_node_id != null and editor.state.hover_output_node_id.? == node_item.id;
+        const output_dragging = editor.state.dragging_connection_from_id != null and editor.state.dragging_connection_from_id.? == node_item.id;
+        const active = output_hovered or output_dragging;
+        try out.append(allocator, .{ .point = .{ .pos = out_port, .size = if (output_hovered) 7.0 else 5.0, .color = if (active) editor.selected_color else Color.transparent, .layer = layer + 6 } });
     }
 }
 
@@ -3013,24 +3062,37 @@ fn appendNodeEditorConnection(allocator: std.mem.Allocator, out: *std.ArrayList(
     } });
 }
 
-fn appendNodeEditorMinimap(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, layer: i32) !void {
-    const snapshot = minimapSnapshot(rect, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
+fn appendNodeEditorMinimap(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, layer: i32) !void {
+    const snapshot = minimapSnapshotPrepared(rect, editor, viewport_index);
     if (!snapshot.visible) return;
     const minimap = snapshot.minimap_rect;
     const bounds = snapshot.graph_bounds;
     try paint_primitives.appendFillRect(allocator, out, minimap, editor.background.lighten(0.08).withAlpha(0.84), 5.0, layer);
     try paint_primitives.appendBorder(allocator, out, minimap, editor.grid_color.withAlpha(0.9), 1.0, 5.0, layer + 1);
-    for (editor.groups) |group| {
+    const group_mark_count = @min(editor.groups.len, editor.minimap_max_group_marks);
+    for (0..group_mark_count) |mark_index| {
+        const group = editor.groups[sampledIndex(mark_index, group_mark_count, editor.groups.len)];
         const group_rect = minimapGroupRect(minimap, bounds, group);
         try paint_primitives.appendFillRect(allocator, out, group_rect, group.color.withAlpha(@max(group.color.a, 0.18)), 1.5, layer + 2);
         try paint_primitives.appendBorder(allocator, out, group_rect, group.border_color.withAlpha(@max(group.border_color.a, 0.36)), 0.75, 1.5, layer + 3);
     }
-    for (editor.nodes) |node_item| {
+    const node_mark_count = @min(editor.nodes.len, editor.minimap_max_node_marks);
+    for (0..node_mark_count) |mark_index| {
+        const node_item = editor.nodes[sampledIndex(mark_index, node_mark_count, editor.nodes.len)];
         const node_rect = minimapNodeRect(minimap, bounds, node_item);
         const selected = editor.state.isNodeSelected(node_item.id);
         try paint_primitives.appendFillRect(allocator, out, node_rect, if (selected) editor.selected_color else node_item.color.lighten(0.08), 1.5, layer + 4);
     }
     try paint_primitives.appendBorder(allocator, out, snapshot.viewport_rect, editor.selected_color.withAlpha(0.88), 1.0, 2.0, layer + 5);
+}
+
+fn sampledIndex(mark_index: usize, mark_count: usize, item_count: usize) usize {
+    if (mark_count >= item_count) return mark_index;
+    return mark_index * item_count / mark_count;
+}
+
+fn rectOverlapsOrTouches(a: Rect, b: Rect) bool {
+    return a.x <= b.x + b.w and a.x + a.w >= b.x and a.y <= b.y + b.h and a.y + a.h >= b.y;
 }
 
 fn dragNodeBy(editor: anytype, id: u32, delta_screen: [2]f32) bool {
@@ -3065,9 +3127,16 @@ fn beginEditorHistory(editor: anytype) ?EditorHistoryMutation {
     return .{ .history = history, .snapshot = snapshot };
 }
 
-fn finishEditorHistory(mutation: EditorHistoryMutation, changed: bool) bool {
+fn invalidateEditorViewportGeometry(editor: anytype) void {
+    if (editorViewportIndex(editor)) |viewport_index| viewport_index.invalidate();
+}
+
+fn finishEditorHistory(editor: anytype, mutation: EditorHistoryMutation, changed: bool) bool {
     if (!changed) return false;
-    if (mutation.history) |history| return history.commitBefore(mutation.snapshot);
+    invalidateEditorViewportGeometry(editor);
+    if (mutation.history) |history| {
+        if (!history.commitBefore(mutation.snapshot)) return false;
+    }
     return true;
 }
 
@@ -3079,8 +3148,10 @@ fn beginInteractionHistoryIfNeeded(editor: anytype) ?EditorHistoryMutation {
 fn finishInteractionHistory(editor: anytype, mutation: EditorHistoryMutation, changed: bool) bool {
     if (!changed) return false;
     if (!editor.state.interaction_history_pushed) {
-        if (!finishEditorHistory(mutation, true)) return false;
+        if (!finishEditorHistory(editor, mutation, true)) return false;
         editor.state.interaction_history_pushed = true;
+    } else {
+        invalidateEditorViewportGeometry(editor);
     }
     return true;
 }
@@ -3163,28 +3234,106 @@ fn reconnectPreviewCompatible(editor: anytype, input_hover: ?PortHit, output_hov
     });
 }
 
-fn inputPortAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?PortHit {
+pub fn inputPortAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?PortHit {
+    if (viewport_index) |index| {
+        // Port rows keep up to 17 px of screen-space inset even when a node is
+        // tiny, so widen the broad phase while retaining exact portHit checks.
+        for (index.nodeIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, 25.0)) |node_index| {
+            const node = editor.nodes[node_index];
+            var port_index: u8 = 0;
+            while (port_index < inputPortCount(node)) : (port_index += 1) {
+                if (portHit(inputPortPositionAt(rect, editor.state.*, node, port_index), point)) return .{ .node_index = node_index, .port_index = port_index };
+            }
+        }
+        return null;
+    }
     return inputPortAtPoint(rect, editor.state.*, editor.nodes, point);
 }
 
-fn outputPortAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?PortHit {
+pub fn outputPortAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?PortHit {
+    if (viewport_index) |index| {
+        for (index.nodeIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, 25.0)) |node_index| {
+            const node = editor.nodes[node_index];
+            var port_index: u8 = 0;
+            while (port_index < outputPortCount(node)) : (port_index += 1) {
+                if (portHit(outputPortPositionAt(rect, editor.state.*, node, port_index), point)) return .{ .node_index = node_index, .port_index = port_index };
+            }
+        }
+        return null;
+    }
     return outputPortAtPoint(rect, editor.state.*, editor.nodes, point);
 }
 
-fn connectionAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?Connection {
-    const mutable_len = if (editor.mutable_connection_len) |value| value.* else null;
-    return connectionAtPoint(rect, editor.state.*, editor.nodes, editor.mutable_connections, mutable_len, editor.connections, point);
+pub fn connectionAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?Connection {
+    const connections = editorActiveConnections(editor);
+    if (viewport_index) |index| {
+        const candidates = index.connectionIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, 7.0);
+        var i = candidates.len;
+        while (i > 0) {
+            i -= 1;
+            const connection = connections[candidates[i]];
+            const from_index = index.nodeIndexForId(connection.from_id) orelse continue;
+            const to_index = index.nodeIndexForId(connection.to_id) orelse continue;
+            const from = editor.nodes[from_index];
+            const to = editor.nodes[to_index];
+            const a = outputPortPositionAt(rect, editor.state.*, from, connection.from_port);
+            const b = inputPortPositionAt(rect, editor.state.*, to, connection.to_port);
+            const path = connectionPathForPoints(a, b);
+            if (cubicDistanceToPoint(path.start, path.c0, path.c1, path.end, point) <= 7.0) return connection;
+        }
+        return null;
+    }
+    return connectionAtPoint(rect, editor.state.*, editor.nodes, null, null, connections, point);
 }
 
-fn nodeAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?usize {
+pub fn nodeAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?usize {
+    if (viewport_index) |index| {
+        const candidates = index.nodeIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, 0.0);
+        var i = candidates.len;
+        while (i > 0) {
+            i -= 1;
+            const node_index = candidates[i];
+            if (nodeRectFromState(rect, editor.state.*, editor.nodes[node_index]).contains(point)) return node_index;
+        }
+        return null;
+    }
     return nodeAtPoint(rect, editor.state.*, editor.nodes, point);
 }
 
-fn groupAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?usize {
+pub fn groupAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?usize {
+    if (viewport_index) |index| {
+        const candidates = index.groupIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, 0.0);
+        var i = candidates.len;
+        while (i > 0) {
+            i -= 1;
+            const group_index = candidates[i];
+            if (groupRect(rect, editor.state.*, editor.groups[group_index]).contains(point)) return group_index;
+        }
+        return null;
+    }
     return groupAtPoint(rect, editor.state.*, editor.groups, point);
 }
 
-fn groupResizeAtElementPoint(rect: Rect, editor: anytype, point: [2]f32) ?GroupResizeHit {
+pub fn groupResizeAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?GroupResizeHit {
+    if (viewport_index) |index| {
+        const candidates = index.groupIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, editor.group_resize_margin);
+        var i = candidates.len;
+        while (i > 0) {
+            i -= 1;
+            const group_index = candidates[i];
+            const screen_rect = groupRect(rect, editor.state.*, editor.groups[group_index]);
+            if (!screen_rect.contains(point)) continue;
+            const margin = @max(0.0, editor.group_resize_margin);
+            const edges = GroupResizeEdges{
+                .left = point[0] <= screen_rect.x + margin,
+                .right = point[0] >= screen_rect.x + screen_rect.w - margin,
+                .top = point[1] <= screen_rect.y + margin,
+                .bottom = point[1] >= screen_rect.y + screen_rect.h - margin,
+            };
+            if (edges.any()) return .{ .group_index = group_index, .edges = edges };
+        }
+        return null;
+    }
     return groupResizeAtPoint(rect, editor.state.*, editor.groups, editor.group_resize_margin, point);
 }
 
@@ -3196,17 +3345,18 @@ pub const EventInputModifiers = struct {
 };
 
 pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype, event: anytype) bool {
+    const viewport_index = prepareNodeEditorViewportIndex(rect, editor);
     switch (event.*) {
         .mouse_move => |m| {
             if (editor.state.dragging_minimap) {
-                const snapshot = minimapSnapshot(rect, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
+                const snapshot = minimapSnapshotPrepared(rect, editor, viewport_index);
                 return editor.state.updateMinimapDrag(rect, snapshot, .{ m.x, m.y });
             }
             if (editor.state.box_selecting) return editor.state.updateBoxSelect(.{ m.x, m.y });
             if (editor.state.reconnecting_connection != null) {
                 const changed = editor.state.updateReconnectPreview(.{ m.x, m.y });
-                const input_hover = inputPortAtElementPoint(rect, editor, .{ m.x, m.y });
-                const output_hover = outputPortAtElementPoint(rect, editor, .{ m.x, m.y });
+                const input_hover = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const output_hover = outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
                 editor.state.hover_input_node_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
                 editor.state.hover_output_node_id = if (output_hover) |hit| editor.nodes[hit.node_index].id else null;
                 const valid = reconnectPreviewCompatible(editor, input_hover, output_hover);
@@ -3216,7 +3366,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             }
             if (editor.state.dragging_connection_from_id != null) {
                 editor.state.connection_preview = .{ m.x, m.y };
-                const input_hover = inputPortAtElementPoint(rect, editor, .{ m.x, m.y });
+                const input_hover = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
                 const input_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
                 editor.state.hover_input_node_id = input_id;
                 const valid = dragPreviewCompatible(editor, input_hover);
@@ -3240,15 +3390,15 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return finishInteractionHistory(editor, history_mutation, dragGroupBy(editor, id, .{ m.dx, m.dy }));
             }
             if (editor.state.dragging_canvas) return editor.state.panBy(.{ m.dx, m.dy });
-            const input_hover = inputPortAtElementPoint(rect, editor, .{ m.x, m.y });
-            const output_hover = outputPortAtElementPoint(rect, editor, .{ m.x, m.y });
+            const input_hover = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+            const output_hover = outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
             const input_id = if (input_hover) |hit| editor.nodes[hit.node_index].id else null;
             const output_id = if (output_hover) |hit| editor.nodes[hit.node_index].id else null;
-            const hit = nodeAtElementPoint(rect, editor, .{ m.x, m.y });
+            const hit = nodeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
             const hover_id = if (hit) |index| editor.nodes[index].id else null;
-            const group_hit = if (hit == null and input_hover == null and output_hover == null) groupAtElementPoint(rect, editor, .{ m.x, m.y }) else null;
+            const group_hit = if (hit == null and input_hover == null and output_hover == null) groupAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) else null;
             const group_hover_id = if (group_hit) |index| editor.groups[index].id else null;
-            const hover_connection = if (hit == null and group_hit == null and input_hover == null and output_hover == null) connectionAtElementPoint(rect, editor, .{ m.x, m.y }) else null;
+            const hover_connection = if (hit == null and group_hit == null and input_hover == null and output_hover == null) connectionAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) else null;
             const changed = editor.state.hover_node_id != hover_id or
                 editor.state.hover_group_id != group_hover_id or
                 editor.state.hover_input_node_id != input_id or
@@ -3272,21 +3422,21 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
         .mouse_down => |m| {
             if (m.button == .right) {
                 const point = [2]f32{ m.x, m.y };
-                if (inputPortAtElementPoint(rect, editor, point)) |hit| {
+                if (inputPortAtEditorPoint(rect, editor, viewport_index, point)) |hit| {
                     editor.state.context_menu.node_id = editor.nodes[hit.node_index].id;
                     editor.state.context_menu.port_index = hit.port_index;
                     editor.state.context_menu.group_id = null;
                     editor.state.context_menu.connection = null;
                     return editor.state.openContextMenu(.input_port, point);
                 }
-                if (outputPortAtElementPoint(rect, editor, point)) |hit| {
+                if (outputPortAtEditorPoint(rect, editor, viewport_index, point)) |hit| {
                     editor.state.context_menu.node_id = editor.nodes[hit.node_index].id;
                     editor.state.context_menu.port_index = hit.port_index;
                     editor.state.context_menu.group_id = null;
                     editor.state.context_menu.connection = null;
                     return editor.state.openContextMenu(.output_port, point);
                 }
-                if (nodeAtElementPoint(rect, editor, point)) |index| {
+                if (nodeAtEditorPoint(rect, editor, viewport_index, point)) |index| {
                     const id = editor.nodes[index].id;
                     if (!editor.state.isNodeSelected(id)) _ = editor.state.setSingleSelection(id);
                     editor.state.context_menu.node_id = id;
@@ -3294,14 +3444,14 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                     editor.state.context_menu.connection = null;
                     return editor.state.openContextMenu(.node, point);
                 }
-                if (connectionAtElementPoint(rect, editor, point)) |connection| {
+                if (connectionAtEditorPoint(rect, editor, viewport_index, point)) |connection| {
                     _ = editor.state.setConnectionSelection(connection);
                     editor.state.context_menu.connection = connection;
                     editor.state.context_menu.node_id = null;
                     editor.state.context_menu.group_id = null;
                     return editor.state.openContextMenu(.connection, point);
                 }
-                if (groupAtElementPoint(rect, editor, point)) |index| {
+                if (groupAtEditorPoint(rect, editor, viewport_index, point)) |index| {
                     const id = editor.groups[index].id;
                     _ = editor.state.setGroupSelection(id);
                     editor.state.context_menu.group_id = id;
@@ -3317,25 +3467,25 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             if (m.button != .left) return false;
             if (editor.show_minimap) {
                 const point = [2]f32{ m.x, m.y };
-                const snapshot = minimapSnapshot(rect, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
+                const snapshot = minimapSnapshotPrepared(rect, editor, viewport_index);
                 if (snapshot.contains(point)) {
                     _ = editor.state.closeContextMenu();
                     return editor.state.beginMinimapDrag(rect, snapshot, point);
                 }
             }
             if (editor.state.selected_connection) |selected_connection| {
-                if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
+                if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
                     if (editor.nodes[hit.node_index].id == selected_connection.from_id and hit.port_index == selected_connection.from_port) {
                         return editor.state.beginReconnectConnection(selected_connection, .from, .{ m.x, m.y });
                     }
                 }
-                if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
+                if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
                     if (editor.nodes[hit.node_index].id == selected_connection.to_id and hit.port_index == selected_connection.to_port) {
                         return editor.state.beginReconnectConnection(selected_connection, .to, .{ m.x, m.y });
                     }
                 }
             }
-            if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
+            if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
                 editor.state.dragging_connection_from_id = editor.nodes[hit.node_index].id;
                 editor.state.dragging_connection_from_port = hit.port_index;
                 editor.state.connection_preview = .{ m.x, m.y };
@@ -3344,18 +3494,18 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return true;
             }
             if (!input.shift_down) {
-                if (nodeAtElementPoint(rect, editor, .{ m.x, m.y })) |index| {
+                if (nodeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |index| {
                     const id = editor.nodes[index].id;
                     return editor.state.beginNodeDrag(id);
                 }
             }
-            if (groupResizeAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| {
+            if (groupResizeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
                 return editor.state.beginGroupResize(editor.groups[hit.group_index].id, hit.edges);
             }
-            if (connectionAtElementPoint(rect, editor, .{ m.x, m.y })) |connection| {
+            if (connectionAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |connection| {
                 return editor.state.setConnectionSelection(connection);
             }
-            if (groupAtElementPoint(rect, editor, .{ m.x, m.y })) |index| {
+            if (groupAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |index| {
                 return editor.state.beginGroupDrag(editor.groups[index].id);
             }
             if (input.shift_down) {
@@ -3390,12 +3540,12 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 if (editor.mutable_connections) |connections| {
                     if (editor.mutable_connection_len) |len| {
                         const target_id = switch (endpoint) {
-                            .from => if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
-                            .to => if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
+                            .from => if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
+                            .to => if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| editor.nodes[hit.node_index].id else null,
                         };
                         const target_port = switch (endpoint) {
-                            .from => if (outputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| hit.port_index else 0,
-                            .to => if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |hit| hit.port_index else 0,
+                            .from => if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| hit.port_index else 0,
+                            .to => if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| hit.port_index else 0,
                         };
                         if (target_id) |id| {
                             var replacement = connection;
@@ -3414,7 +3564,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                             })) {
                                 if (beginEditorHistory(editor)) |history_mutation| {
                                     changed = editor.state.reconnectConnectionPortWithPolicy(connections, len, connection, endpoint, id, target_port, editor.nodes, editorConnectionPolicy(editor));
-                                    _ = finishEditorHistory(history_mutation, changed);
+                                    _ = finishEditorHistory(editor, history_mutation, changed);
                                 }
                             }
                         }
@@ -3427,7 +3577,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return changed;
             }
             if (editor.state.dragging_connection_from_id) |from_id| {
-                if (inputPortAtElementPoint(rect, editor, .{ m.x, m.y })) |to_hit| {
+                if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |to_hit| {
                     const to_id = editor.nodes[to_hit.node_index].id;
                     if (from_id != to_id) {
                         const connection = Connection{ .from_id = from_id, .from_port = editor.state.dragging_connection_from_port, .to_id = to_id, .to_port = to_hit.port_index };
@@ -3444,7 +3594,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                                     if (history_capacity_ok) {
                                         if (beginEditorHistory(editor)) |history_mutation| {
                                             const changed = editor.state.appendConnectionWithPolicy(connections, len, connection, editor.nodes, editorConnectionPolicy(editor));
-                                            _ = finishEditorHistory(history_mutation, changed);
+                                            _ = finishEditorHistory(editor, history_mutation, changed);
                                         }
                                     }
                                 } else {
@@ -3552,6 +3702,232 @@ test "NodeEditor connection hit testing and port compatibility" {
     const mid = [2]f32{ (out[0] + in[0]) * 0.5, (out[1] + in[1]) * 0.5 };
     try std.testing.expect(connectionHit(viewport, state, &nodes, connection, mid));
     try std.testing.expectEqual(connection, connectionAtPoint(viewport, state, &nodes, null, null, &.{connection}, mid).?);
+}
+
+test "NodeEditor viewport index preserves full scan hit ordering across transforms" {
+    const viewport = Rect{ .x = 20, .y = 30, .w = 420, .h = 260 };
+    var selected: [8]u32 = .{0} ** 8;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "source back", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 }, .input_count = 2, .output_count = 2 },
+        .{ .id = 2, .title = "source front", .pos = .{ -140, -30 }, .size = .{ .w = 80, .h = 60 }, .input_count = 2, .output_count = 2 },
+        .{ .id = 3, .title = "sink back", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 }, .input_count = 2, .output_count = 2 },
+        .{ .id = 4, .title = "sink front", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 }, .input_count = 2, .output_count = 2 },
+    };
+    const groups = [_]Group{
+        .{ .id = 10, .title = "group back", .rect = .{ .x = -170, .y = -55, .w = 120, .h = 110 } },
+        .{ .id = 11, .title = "group front", .rect = .{ .x = -170, .y = -55, .w = 120, .h = 110 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .from_port = 0, .to_id = 3, .to_port = 0, .color = Color.rgb8(255, 0, 0) },
+        .{ .from_id = 2, .from_port = 0, .to_id = 4, .to_port = 0, .color = Color.rgb8(0, 255, 0) },
+        .{ .from_id = 999, .to_id = 4 },
+    };
+    var storage = StaticViewportWorkspace(nodes.len, groups.len, connections.len){};
+    var viewport_index = ViewportIndex.init(storage.workspace());
+    const editor = Options(State){
+        .state = &state,
+        .nodes = &nodes,
+        .groups = &groups,
+        .connections = &connections,
+        .viewport_index = &viewport_index,
+        .show_minimap = false,
+    };
+
+    for ([_]struct { pan: [2]f32, zoom: f32 }{
+        .{ .pan = .{ 0, 0 }, .zoom = 1 },
+        .{ .pan = .{ 17, -9 }, .zoom = 1.75 },
+        .{ .pan = .{ -22, 14 }, .zoom = 0.6 },
+    }) |transform| {
+        state.pan = transform.pan;
+        state.zoom = transform.zoom;
+        const prepared = prepareNodeEditorViewportIndex(viewport, editor) orelse return error.ViewportIndexUnavailable;
+        const source_rect = nodeRectFromState(viewport, state, nodes[0]);
+        const node_point = [2]f32{ source_rect.x + source_rect.w * 0.5, source_rect.y + source_rect.h * 0.5 };
+        try std.testing.expectEqual(nodeAtPoint(viewport, state, &nodes, node_point), nodeAtEditorPoint(viewport, editor, prepared, node_point));
+        try std.testing.expectEqual(groupAtPoint(viewport, state, &groups, node_point), groupAtEditorPoint(viewport, editor, prepared, node_point));
+
+        const input_point = inputPortPositionAt(viewport, state, nodes[0], 1);
+        const output_point = outputPortPositionAt(viewport, state, nodes[0], 1);
+        try std.testing.expectEqual(inputPortAtPoint(viewport, state, &nodes, input_point), inputPortAtEditorPoint(viewport, editor, prepared, input_point));
+        try std.testing.expectEqual(outputPortAtPoint(viewport, state, &nodes, output_point), outputPortAtEditorPoint(viewport, editor, prepared, output_point));
+
+        const group_screen = groupRect(viewport, state, groups[0]);
+        const resize_point = [2]f32{ group_screen.x + 2, group_screen.y + group_screen.h - 2 };
+        try std.testing.expectEqual(groupResizeAtPoint(viewport, state, &groups, editor.group_resize_margin, resize_point), groupResizeAtEditorPoint(viewport, editor, prepared, resize_point));
+
+        const a = outputPortPositionAt(viewport, state, nodes[0], 0);
+        const b = inputPortPositionAt(viewport, state, nodes[2], 0);
+        const connection_point = [2]f32{ (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 };
+        try std.testing.expectEqual(connectionAtPoint(viewport, state, &nodes, null, null, &connections, connection_point), connectionAtEditorPoint(viewport, editor, prepared, connection_point));
+        try std.testing.expectEqual(@as(usize, 1), viewport_index.summary().orphan_connection_count);
+    }
+}
+
+test "NodeEditor viewport index preserves tiny multi-port geometry at minimum zoom" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 320, .h = 180 };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected, .zoom = 0.2 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "source", .pos = .{ -300, -100 }, .size = .{ .w = 80, .h = 8 }, .input_count = 8, .output_count = 8 },
+        .{ .id = 2, .title = "sink", .pos = .{ 220, -100 }, .size = .{ .w = 80, .h = 8 }, .input_count = 8, .output_count = 8 },
+    };
+    const connections = [_]Connection{.{ .from_id = 1, .from_port = 7, .to_id = 2, .to_port = 7 }};
+    var storage = StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = ViewportIndex.init(storage.workspace());
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .connections = &connections, .viewport_index = &viewport_index, .show_minimap = false };
+    const prepared = prepareNodeEditorViewportIndex(viewport, editor) orelse return error.ViewportIndexUnavailable;
+
+    const output_point = outputPortPositionAt(viewport, state, nodes[0], 7);
+    const input_point = inputPortPositionAt(viewport, state, nodes[1], 7);
+    try std.testing.expectEqual(outputPortAtPoint(viewport, state, &nodes, output_point), outputPortAtEditorPoint(viewport, editor, prepared, output_point));
+    try std.testing.expectEqual(inputPortAtPoint(viewport, state, &nodes, input_point), inputPortAtEditorPoint(viewport, editor, prepared, input_point));
+    const midpoint = [2]f32{ (output_point[0] + input_point[0]) * 0.5, (output_point[1] + input_point[1]) * 0.5 };
+    try std.testing.expectEqual(connectionAtPoint(viewport, state, &nodes, null, null, &connections, midpoint), connectionAtEditorPoint(viewport, editor, prepared, midpoint));
+}
+
+test "NodeEditor viewport index safe invalidation and undersized fallback stay correct" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 320, .h = 180 };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    var nodes = [_]Node{
+        .{ .id = 1, .title = "moving", .pos = .{ 1000, 0 } },
+        .{ .id = 2, .title = "fixed", .pos = .{ -40, -30 } },
+    };
+    var storage = StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = ViewportIndex.init(storage.workspace());
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .viewport_index = &viewport_index, .show_minimap = false };
+    try std.testing.expect(prepareNodeEditorViewportIndex(viewport, editor) != null);
+    try std.testing.expectEqualSlices(usize, &.{1}, viewport_index.visibleNodeIndices());
+
+    nodes[0].pos = .{ -40, -30 };
+    try std.testing.expect(prepareNodeEditorViewportIndex(viewport, editor) != null);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, viewport_index.visibleNodeIndices());
+    try std.testing.expectEqual(@as(u64, 2), viewport_index.summary().rebuild_count);
+
+    var tiny_storage = StaticViewportWorkspace(1, 0, 0){};
+    var tiny_index = ViewportIndex.init(tiny_storage.workspace());
+    const fallback_editor = Options(State){ .state = &state, .nodes = &nodes, .viewport_index = &tiny_index, .show_minimap = false };
+    try std.testing.expect(prepareNodeEditorViewportIndex(viewport, fallback_editor) == null);
+    const point = graphToScreen(viewport, state, .{ 0, 0 });
+    try std.testing.expectEqual(nodeAtPoint(viewport, state, &nodes, point), nodeAtEditorPoint(viewport, fallback_editor, null, point));
+}
+
+test "NodeEditor mutable connections replace static connections in paint and hit paths" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 320, .h = 180 };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "source", .pos = .{ -120, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "sink", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const static_connections = [_]Connection{.{ .from_id = 2, .to_id = 1, .color = Color.rgb8(255, 0, 0) }};
+    var mutable_connections = [_]Connection{.{ .from_id = 1, .to_id = 2, .color = Color.rgb8(0, 255, 0) }};
+    var mutable_len: usize = 1;
+    var storage = StaticViewportWorkspace(nodes.len, 0, mutable_connections.len){};
+    var viewport_index = ViewportIndex.init(storage.workspace());
+    const editor = Options(State){
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &static_connections,
+        .mutable_connections = &mutable_connections,
+        .mutable_connection_len = &mutable_len,
+        .viewport_index = &viewport_index,
+        .show_minimap = false,
+        .grid_color = Color.transparent,
+    };
+    const prepared = prepareNodeEditorViewportIndex(viewport, editor) orelse return error.ViewportIndexUnavailable;
+    try std.testing.expectEqual(@as(usize, 1), prepared.visibleConnectionIndices().len);
+    const a = outputPortPositionAt(viewport, state, nodes[0], 0);
+    const b = inputPortPositionAt(viewport, state, nodes[1], 0);
+    const midpoint = [2]f32{ (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 };
+    try std.testing.expectEqual(mutable_connections[0], connectionAtEditorPoint(viewport, editor, prepared, midpoint).?);
+
+    var out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (out.items) |cmd| draw_cmd.freePayload(std.testing.allocator, cmd);
+        out.deinit(std.testing.allocator);
+    }
+    _ = try appendNodeEditor(std.testing.allocator, &out, viewport, editor, 0);
+    var stroke_count: usize = 0;
+    for (out.items) |command| switch (command) {
+        .stroke_path => stroke_count += 1,
+        else => {},
+    };
+    // One active connection plus the transparent overlay sentinel.
+    try std.testing.expectEqual(@as(usize, 2), stroke_count);
+}
+
+test "NodeEditor indexed minimap keeps large graph draw commands bounded" {
+    const node_count = 600;
+    const group_count = 20;
+    const connection_count = node_count - 1;
+    var nodes: [node_count]Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{
+        .id = @intCast(index + 1),
+        .title = "node",
+        .pos = .{ @floatFromInt((index % 30) * 180), @floatFromInt((index / 30) * 110) },
+    };
+    var groups: [group_count]Group = undefined;
+    for (&groups, 0..) |*group, index| group.* = .{
+        .id = @intCast(index + 1),
+        .title = "group",
+        .rect = .{ .x = @floatFromInt(index * 900), .y = -80, .w = 820, .h = 220 },
+    };
+    var connections: [connection_count]Connection = undefined;
+    for (&connections, 0..) |*connection, index| connection.* = .{ .from_id = nodes[index].id, .to_id = nodes[index + 1].id };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    var storage = StaticViewportWorkspace(node_count, group_count, connection_count){};
+    var viewport_index = ViewportIndex.init(storage.workspace());
+    const viewport = Rect{ .x = 0, .y = 0, .w = 640, .h = 360 };
+    const editor = Options(State){
+        .state = &state,
+        .nodes = &nodes,
+        .groups = &groups,
+        .connections = &connections,
+        .viewport_index = &viewport_index,
+        .minimap_max_node_marks = 32,
+        .minimap_max_group_marks = 0,
+    };
+    const prepared = prepareNodeEditorViewportIndex(viewport, editor) orelse return error.ViewportIndexUnavailable;
+    const indexed_bounds = prepared.graphBounds() orelse return error.MissingGraphBounds;
+    try std.testing.expectEqual(graphBounds(&nodes, &groups), indexed_bounds);
+    try std.testing.expect(prepared.visibleNodeIndices().len < node_count / 10);
+    try std.testing.expect(prepared.visibleGroupIndices().len < group_count);
+    try std.testing.expect(prepared.visibleConnectionIndices().len < connection_count / 10);
+
+    var main_out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (main_out.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        main_out.deinit(std.testing.allocator);
+    }
+    var main_editor = editor;
+    main_editor.show_minimap = false;
+    _ = try appendNodeEditor(std.testing.allocator, &main_out, viewport, main_editor, 0);
+    var title_count: usize = 0;
+    var stroke_count: usize = 0;
+    for (main_out.items) |command| switch (command) {
+        .text => title_count += 1,
+        .stroke_path => stroke_count += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(prepared.visibleNodeIndices().len + prepared.visibleGroupIndices().len, title_count);
+    try std.testing.expectEqual(prepared.visibleConnectionIndices().len + 1, stroke_count);
+
+    var out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (out.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        out.deinit(std.testing.allocator);
+    }
+    try appendNodeEditorMinimap(std.testing.allocator, &out, viewport, editor, prepared, 0);
+    var fill_count: usize = 0;
+    for (out.items) |command| switch (command) {
+        .rect, .paint_quad => fill_count += 1,
+        else => {},
+    };
+    // Background fill + border, one mark per sample, and viewport border.
+    try std.testing.expectEqual(@as(usize, 35), fill_count);
 }
 
 test "NodeEditor strict dataflow policy rejects cyclic link mutation" {
