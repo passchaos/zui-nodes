@@ -3529,6 +3529,7 @@ pub const State = struct {
         flow_direction: graph_layout.LayeredLayoutDirection,
         extend: bool,
     ) bool {
+        if (!topology.summary().valid) return false;
         const topology_direction = topologyDirectionForNavigation(flow_direction, direction) orelse return false;
         const target_id = self.topologyNavigationTarget(nodes, topology, direction, topology_direction) orelse return false;
         return self.applyNodeNavigationTarget(target_id, extend);

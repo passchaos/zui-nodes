@@ -137,6 +137,8 @@ pub const Index = struct {
 
     /// Returns unique direct neighbor node indices in stable node-storage order.
     /// The result borrows traversal scratch until the next traversal or direct query.
+    /// Calling this invalidates the visited set left by `traverse`; callers must
+    /// finish consuming traversal results before asking for direct neighbors.
     pub fn directNeighborIndices(self: *Index, direction: Direction, node_id: u32) []const usize {
         if (!self.valid) return &.{};
         const node_index = self.nodeIndex(node_id) orelse return &.{};
@@ -151,17 +153,9 @@ pub const Index = struct {
         const output = self.workspace.queue[0..self.node_count];
         var output_len: usize = 0;
         for (neighbors[offsets[node_index]..offsets[node_index + 1]]) |neighbor| {
+            if (output_len > 0 and neighbor == output[output_len - 1]) continue;
             output[output_len] = neighbor;
             output_len += 1;
-        }
-        if (output_len > 1) {
-            var write: usize = 1;
-            for (output[1..output_len]) |neighbor| {
-                if (neighbor == output[write - 1]) continue;
-                output[write] = neighbor;
-                write += 1;
-            }
-            output_len = write;
         }
         self.direct_neighbor_query_count +%= 1;
         return output[0..output_len];
