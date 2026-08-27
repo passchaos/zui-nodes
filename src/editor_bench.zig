@@ -1,0 +1,230 @@
+const std = @import("std");
+const zui = @import("zui");
+const node_editor = @import("node_editor.zig");
+
+const columns: usize = 100;
+const rows: usize = 100;
+const node_count: usize = columns * rows;
+const horizontal_connection_count: usize = rows * (columns - 1);
+const vertical_connection_count: usize = columns * (rows - 1);
+const connection_count: usize = horizontal_connection_count + vertical_connection_count;
+const default_iterations: usize = 1000;
+const draw_command_capacity: usize = 8192;
+
+const Options = struct {
+    iterations: usize = default_iterations,
+    max_paint_ns: ?f64 = null,
+};
+
+const Report = struct {
+    node_count: usize,
+    connection_count: usize,
+    iterations: usize,
+    paint_ns_per_frame: f64,
+    owning_paint_ns_per_frame: f64,
+    paint_speedup: f64,
+    max_visible_nodes: usize,
+    max_visible_connections: usize,
+    max_draw_commands: usize,
+    hot_path_allocations: usize,
+    owned_payload_count: usize,
+    owning_payload_count: usize,
+    checksum: u64,
+    quality_passed: bool,
+    performance_passed: bool,
+    passed: bool,
+};
+
+pub fn main(init: std.process.Init) !void {
+    const options = try parseOptions(init);
+    const report = try run(init, options);
+    try printReport(init.io, report);
+    if (!report.quality_passed) return error.EditorPaintBenchQualityFailed;
+    if (!report.performance_passed) return error.EditorPaintBenchPerformanceFailed;
+}
+
+fn run(init: std.process.Init, options: Options) !Report {
+    const allocator = init.gpa;
+    const nodes = try allocator.alloc(node_editor.Node, node_count);
+    defer allocator.free(nodes);
+    const connections = try allocator.alloc(node_editor.Connection, connection_count);
+    defer allocator.free(connections);
+    for (nodes, 0..) |*node, index| {
+        const column = index % columns;
+        const row = index / columns;
+        node.* = .{
+            .id = @intCast(index + 1),
+            .title = "node",
+            .pos = .{
+                (@as(f32, @floatFromInt(column)) - @as(f32, @floatFromInt(columns)) * 0.5) * 184.0,
+                (@as(f32, @floatFromInt(row)) - @as(f32, @floatFromInt(rows)) * 0.5) * 112.0,
+            },
+            .size = .{ .w = 144, .h = 72 },
+            .input_count = 2,
+            .output_count = 2,
+        };
+    }
+    var connection_index: usize = 0;
+    for (0..rows) |row| {
+        for (0..columns - 1) |column| {
+            const from = row * columns + column;
+            connections[connection_index] = .{ .from_id = nodes[from].id, .to_id = nodes[from + 1].id, .from_port = @intCast(column & 1), .to_port = @intCast(column & 1) };
+            connection_index += 1;
+        }
+    }
+    for (0..rows - 1) |row| {
+        for (0..columns) |column| {
+            const from = row * columns + column;
+            connections[connection_index] = .{ .from_id = nodes[from].id, .to_id = nodes[from + columns].id, .from_port = @intCast(row & 1), .to_port = @intCast(row & 1) };
+            connection_index += 1;
+        }
+    }
+
+    var viewport_storage = try node_editor.ViewportStorage.init(allocator, node_count, 0, connection_count);
+    defer viewport_storage.deinit();
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var draw_storage = try node_editor.ConnectionDrawStorage.init(allocator, connection_count);
+    defer draw_storage.deinit();
+    var draw_workspace = draw_storage.workspace();
+    var selected_ids: [64]u32 = .{0} ** 64;
+    var state = node_editor.State{ .selected_node_ids = &selected_ids };
+    const viewport = zui.Rect{ .x = 0, .y = 0, .w = 1280, .h = 720 };
+    var out = try std.ArrayList(zui.DrawCmd).initCapacity(allocator, draw_command_capacity);
+    defer out.deinit(allocator);
+    var no_memory: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&no_memory);
+    const no_alloc = fixed.allocator();
+
+    var checksum: u64 = 0xcbf2_9ce4_8422_2325;
+    var max_visible_nodes: usize = 0;
+    var max_visible_connections: usize = 0;
+    var max_draw_commands: usize = 0;
+    var owned_payload_count: usize = 0;
+    const started = std.Io.Clock.awake.now(init.io);
+    for (0..options.iterations) |iteration| {
+        const target_index = (iteration * 7919) % node_count;
+        const target = nodes[target_index];
+        state.zoom = switch (iteration % 3) {
+            0 => 0.55,
+            1 => 1.0,
+            else => 1.75,
+        };
+        state.pan = .{ -target.pos[0] * state.zoom, -target.pos[1] * state.zoom };
+        out.clearRetainingCapacity();
+        _ = try node_editor.appendNodeEditor(no_alloc, &out, viewport, node_editor.Options(node_editor.State){
+            .state = &state,
+            .nodes = nodes,
+            .connections = connections,
+            .connection_draw_workspace = &draw_workspace,
+            .viewport_index = &viewport_index,
+            .geometry_revision = 1,
+            .show_minimap = false,
+            .grid_color = zui.Color.transparent,
+        }, 0);
+        const summary = viewport_index.summary();
+        max_visible_nodes = @max(max_visible_nodes, summary.visible_node_count);
+        max_visible_connections = @max(max_visible_connections, summary.visible_connection_count);
+        max_draw_commands = @max(max_draw_commands, out.items.len);
+        var stroke_count: usize = 0;
+        for (out.items) |command| {
+            if (zui.ui_draw_cmd.ownsPayload(command)) owned_payload_count += 1;
+            if (command == .stroke_path) stroke_count += 1;
+        }
+        checksum = (checksum ^ @as(u64, @intCast(out.items.len))) *% 0x0000_0100_0000_01b3;
+        checksum = (checksum ^ @as(u64, @intCast(stroke_count))) *% 0x0000_0100_0000_01b3;
+        if (stroke_count != summary.visible_connection_count) return error.EditorPaintConnectionCountMismatch;
+    }
+    const elapsed_ns: u64 = @intCast(started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+    const paint_ns_per_frame = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+
+    var owning_out = try std.ArrayList(zui.DrawCmd).initCapacity(allocator, draw_command_capacity);
+    defer owning_out.deinit(allocator);
+    var owning_payload_count: usize = 0;
+    const owning_started = std.Io.Clock.awake.now(init.io);
+    for (0..options.iterations) |iteration| {
+        const target_index = (iteration * 7919) % node_count;
+        const target = nodes[target_index];
+        state.zoom = switch (iteration % 3) {
+            0 => 0.55,
+            1 => 1.0,
+            else => 1.75,
+        };
+        state.pan = .{ -target.pos[0] * state.zoom, -target.pos[1] * state.zoom };
+        owning_out.clearRetainingCapacity();
+        _ = try node_editor.appendNodeEditor(allocator, &owning_out, viewport, node_editor.Options(node_editor.State){
+            .state = &state,
+            .nodes = nodes,
+            .connections = connections,
+            .viewport_index = &viewport_index,
+            .geometry_revision = 1,
+            .show_minimap = false,
+            .grid_color = zui.Color.transparent,
+        }, 0);
+        for (owning_out.items) |command| {
+            if (zui.ui_draw_cmd.ownsPayload(command)) owning_payload_count += 1;
+            zui.ui_draw_cmd.freePayload(allocator, command);
+        }
+    }
+    const owning_elapsed_ns: u64 = @intCast(owning_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+    const owning_paint_ns_per_frame = @as(f64, @floatFromInt(owning_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+    const paint_speedup = owning_paint_ns_per_frame / paint_ns_per_frame;
+    const summary = viewport_index.summary();
+    const draw_summary = draw_workspace.summary();
+    const quality_passed = connection_index == connection_count and summary.valid and summary.rebuild_count == 1 and
+        max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
+        max_visible_connections > 0 and max_visible_connections < connection_count / 10 and
+        max_draw_commands < draw_command_capacity and owned_payload_count == 0 and fixed.end_index == 0 and
+        draw_summary.frame_count == options.iterations and draw_summary.borrowed_connection_count == summary.visible_connection_count and
+        draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and checksum != 0;
+    const performance_passed = options.max_paint_ns == null or paint_ns_per_frame <= options.max_paint_ns.?;
+    return .{
+        .node_count = node_count,
+        .connection_count = connection_count,
+        .iterations = options.iterations,
+        .paint_ns_per_frame = paint_ns_per_frame,
+        .owning_paint_ns_per_frame = owning_paint_ns_per_frame,
+        .paint_speedup = paint_speedup,
+        .max_visible_nodes = max_visible_nodes,
+        .max_visible_connections = max_visible_connections,
+        .max_draw_commands = max_draw_commands,
+        .hot_path_allocations = 0,
+        .owned_payload_count = owned_payload_count,
+        .owning_payload_count = owning_payload_count,
+        .checksum = checksum,
+        .quality_passed = quality_passed,
+        .performance_passed = performance_passed,
+        .passed = quality_passed and performance_passed,
+    };
+}
+
+fn parseOptions(init: std.process.Init) !Options {
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer args.deinit();
+    var options = Options{};
+    _ = args.next();
+    while (args.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--iterations="))
+            options.iterations = try std.fmt.parseInt(usize, arg["--iterations=".len..], 10)
+        else if (std.mem.startsWith(u8, arg, "--max-paint-ns="))
+            options.max_paint_ns = try std.fmt.parseFloat(f64, arg["--max-paint-ns=".len..])
+        else
+            return error.InvalidArgument;
+    }
+    if (options.iterations == 0) return error.InvalidArgument;
+    return options;
+}
+
+fn printReport(io: std.Io, report: Report) !void {
+    var buffer: [1536]u8 = undefined;
+    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
+    const stdout = &stdout_file_writer.interface;
+    try stdout.print(
+        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+    );
+    try stdout.flush();
+}
+
+test "editor paint benchmark options compile" {
+    _ = Options{};
+}

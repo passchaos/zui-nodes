@@ -51,6 +51,10 @@ pub const NodeEditorViewOptions = struct {
     /// semantics; Zui core only tracks layer ids, bounds, and typed invalidation.
     canvas_layers: ?*zui.CanvasLayerCache = null,
     connection_path_cache: ?*node_editor.ConnectionPathCache = null,
+    /// Optional persistent path-command slots, one per active connection. The
+    /// workspace must outlive this view's retained draw list. Undersized
+    /// workspaces safely fall back to owned path payloads.
+    connection_draw_workspace: ?*node_editor.ConnectionDrawWorkspace = null,
     /// Optional caller-owned broad-phase index shared by painting and hit tests.
     viewport_index: ?*node_editor.ViewportIndex = null,
     /// Optional application-owned geometry revision. When supplied, callers
@@ -90,6 +94,7 @@ const Binding = struct {
     canvas_state: ?*zui.CanvasState = null,
     canvas_layers: ?*zui.CanvasLayerCache = null,
     connection_path_cache: ?*node_editor.ConnectionPathCache = null,
+    connection_draw_workspace: ?*node_editor.ConnectionDrawWorkspace = null,
     viewport_index: ?*node_editor.ViewportIndex = null,
     geometry_revision: ?u64 = null,
     state: *node_editor.State,
@@ -149,6 +154,7 @@ const Binding = struct {
             .minimap_max_group_marks = self.minimap_max_group_marks,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
+            .connection_draw_workspace = self.connection_draw_workspace,
             .viewport_index = self.viewport_index,
             .geometry_revision = self.geometry_revision,
             .connection_policy = self.connection_policy,
@@ -162,6 +168,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .canvas_state = options.canvas_state,
         .canvas_layers = options.canvas_layers,
         .connection_path_cache = options.connection_path_cache,
+        .connection_draw_workspace = options.connection_draw_workspace,
         .viewport_index = options.viewport_index,
         .geometry_revision = options.geometry_revision,
         .state = options.state,
@@ -501,6 +508,60 @@ test "node editor view creates connections from output to input ports" {
     try std.testing.expectEqual(@as(usize, 1), connection_len);
     try std.testing.expectEqual(node_editor.Connection{ .from_id = 1, .to_id = 2 }, connections[0]);
     try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
+}
+
+test "node editor view retains borrowed connection commands across rebuilds" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Input", .pos = .{ -120, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "Output", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 2 }};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var draw_storage = node_editor.StaticConnectionDrawWorkspace(connections.len){};
+    var draw_workspace = draw_storage.workspace();
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9416,
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .viewport_index = &viewport_index,
+        .connection_draw_workspace = &draw_workspace,
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+
+    var first = std.ArrayList(DrawCmd).empty;
+    defer first.deinit(std.testing.allocator);
+    try paintNodeEditor(std.testing.allocator, &first, editor_node.rect, 0, editor_node.paint_user_data);
+    const first_stroke = for (first.items) |command| {
+        if (command == .stroke_path) break command.stroke_path;
+    } else return error.MissingConnectionStroke;
+    try std.testing.expect(!first_stroke.owns_commands);
+    const first_start = first_stroke.commands[0].move_to;
+    for (first.items) |command| zui.ui_draw_cmd.freePayload(std.testing.allocator, command);
+
+    nodes[0].pos[0] += 40;
+    viewport_index.invalidate();
+    var second = std.ArrayList(DrawCmd).empty;
+    defer second.deinit(std.testing.allocator);
+    try paintNodeEditor(std.testing.allocator, &second, editor_node.rect, 0, editor_node.paint_user_data);
+    const second_command = for (second.items) |command| {
+        if (command == .stroke_path) break command;
+    } else return error.MissingConnectionStroke;
+    const second_stroke = second_command.stroke_path;
+    try std.testing.expect(!second_stroke.owns_commands);
+    try std.testing.expect(second_stroke.commands.ptr == first_stroke.commands.ptr);
+    try std.testing.expect(second_stroke.commands[0].move_to[0] > first_start[0]);
+    const render_stroke = zui.ui_draw_cmd.toRenderCmd(second_command).stroke_path;
+    try std.testing.expectEqualSlices(zui.RenderPathCommand, second_stroke.commands, render_stroke.path.commands);
+    for (second.items) |command| zui.ui_draw_cmd.freePayload(std.testing.allocator, command);
 }
 
 test "node editor view rejects strict dataflow cycle gestures" {

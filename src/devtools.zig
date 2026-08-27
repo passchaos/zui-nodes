@@ -27,6 +27,7 @@ pub const SummaryOptions = struct {
     viewport: Rect = .zero,
     minimap_size: zui.ui_base.Size = .{ .w = 150, .h = 96 },
     connection_path_cache: ?*const node_editor.ConnectionPathCache = null,
+    connection_draw_workspace: ?*const node_editor.ConnectionDrawWorkspace = null,
     topology_index: ?*graph_topology.Index = null,
     viewport_index: ?*node_editor.ViewportIndex = null,
     geometry_revision: ?u64 = null,
@@ -50,6 +51,7 @@ pub const Summary = struct {
     pan: [2]f32 = .{ 0, 0 },
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
+    connection_draw: node_editor.ConnectionDrawSummary = .{},
     topology: graph_topology.Summary = .{},
     viewport_index: node_editor.ViewportSummary = .{},
     history: node_editor.HistorySummary = .{},
@@ -111,6 +113,7 @@ pub fn summarize(options: SummaryOptions) Summary {
         .pan = state.pan,
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
+        .connection_draw = if (options.connection_draw_workspace) |workspace| workspace.summary() else .{},
         .topology = if (options.topology_index) |topology| topology.summary() else .{},
         .viewport_index = if (options.viewport_index) |viewport_index| viewport_index.summary() else .{},
         .history = if (options.history) |history| history.summary() else .{},
@@ -161,6 +164,12 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.connection_path_cache.miss_count,
         options.summary.connection_path_cache.rebuild_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const connection_draw = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "connection draw capacity={d} borrowed={d} fallback={d} frames={d}", .{
+        options.summary.connection_draw.capacity,
+        options.summary.connection_draw.borrowed_connection_count,
+        options.summary.connection_draw.fallback_connection_count,
+        options.summary.connection_draw.frame_count,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const graph = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "graph valid={} issues={d} dup={d} fanin={d} orphan={d} port={d} type={d} cycle={d}", .{
         options.summary.graph_valid,
         options.summary.graph_issue_count,
@@ -200,7 +209,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, topology, viewport_index, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, path_cache, connection_draw, topology, viewport_index, history, graph });
     return root;
 }
 
@@ -299,6 +308,8 @@ test "zui-nodes devtools exposes viewport culling and reuse" {
     const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
     var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
     var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var draw_storage = node_editor.StaticConnectionDrawWorkspace(connections.len){};
+    var draw_workspace = draw_storage.workspace();
     const viewport = Rect{ .x = 0, .y = 0, .w = 320, .h = 180 };
 
     _ = summarize(.{
@@ -307,6 +318,7 @@ test "zui-nodes devtools exposes viewport culling and reuse" {
         .connections = &connections,
         .viewport = viewport,
         .viewport_index = &viewport_index,
+        .connection_draw_workspace = &draw_workspace,
         .geometry_revision = 4,
     });
     const summary = summarize(.{
@@ -315,6 +327,7 @@ test "zui-nodes devtools exposes viewport culling and reuse" {
         .connections = &connections,
         .viewport = viewport,
         .viewport_index = &viewport_index,
+        .connection_draw_workspace = &draw_workspace,
         .geometry_revision = 4,
     });
     try std.testing.expect(summary.viewport_index.valid);
@@ -322,4 +335,6 @@ test "zui-nodes devtools exposes viewport culling and reuse" {
     try std.testing.expectEqual(@as(usize, 2), summary.viewport_index.node_count);
     try std.testing.expectEqual(@as(u64, 1), summary.viewport_index.rebuild_count);
     try std.testing.expectEqual(@as(u64, 1), summary.viewport_index.viewport_reuse_count);
+    try std.testing.expectEqual(connections.len, summary.connection_draw.capacity);
+    try std.testing.expect(summary.connection_draw.allocationFree());
 }

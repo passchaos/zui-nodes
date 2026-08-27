@@ -359,6 +359,7 @@ pub fn Options(comptime StateType: type) type {
         minimap_max_group_marks: usize = 128,
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
+        connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
         viewport_index: ?*ViewportIndex = null,
         geometry_revision: ?u64 = null,
         connection_policy: ConnectionPolicy = .default,
@@ -1016,6 +1017,76 @@ pub const ConnectionPathCache = struct {
         return oldest_index;
     }
 };
+
+/// Persistent command slots for allocation-free connection painting. The
+/// workspace must outlive every retained draw list that borrows from it.
+pub const ConnectionDrawWorkspace = struct {
+    path_commands: [][2]render.PathCommand,
+    frame_count: u64 = 0,
+    borrowed_connection_count: usize = 0,
+    fallback_connection_count: usize = 0,
+
+    pub fn capacity(self: ConnectionDrawWorkspace) usize {
+        return self.path_commands.len;
+    }
+
+    pub fn summary(self: ConnectionDrawWorkspace) ConnectionDrawSummary {
+        return .{
+            .capacity = self.path_commands.len,
+            .frame_count = self.frame_count,
+            .borrowed_connection_count = self.borrowed_connection_count,
+            .fallback_connection_count = self.fallback_connection_count,
+        };
+    }
+
+    fn beginPaint(self: *ConnectionDrawWorkspace) void {
+        self.frame_count +%= 1;
+        self.borrowed_connection_count = 0;
+        self.fallback_connection_count = 0;
+    }
+};
+
+pub const ConnectionDrawSummary = struct {
+    capacity: usize = 0,
+    frame_count: u64 = 0,
+    borrowed_connection_count: usize = 0,
+    fallback_connection_count: usize = 0,
+
+    pub fn allocationFree(self: ConnectionDrawSummary) bool {
+        return self.fallback_connection_count == 0;
+    }
+};
+
+pub const ConnectionDrawStorage = struct {
+    allocator: std.mem.Allocator,
+    path_commands: [][2]render.PathCommand,
+
+    pub fn init(allocator: std.mem.Allocator, connection_capacity: usize) !ConnectionDrawStorage {
+        return .{
+            .allocator = allocator,
+            .path_commands = try allocator.alloc([2]render.PathCommand, connection_capacity),
+        };
+    }
+
+    pub fn deinit(self: *ConnectionDrawStorage) void {
+        self.allocator.free(self.path_commands);
+        self.* = undefined;
+    }
+
+    pub fn workspace(self: *ConnectionDrawStorage) ConnectionDrawWorkspace {
+        return .{ .path_commands = self.path_commands };
+    }
+};
+
+pub fn StaticConnectionDrawWorkspace(comptime connection_capacity: usize) type {
+    return struct {
+        path_commands: [connection_capacity][2]render.PathCommand = undefined,
+
+        pub fn workspace(self: *@This()) ConnectionDrawWorkspace {
+            return .{ .path_commands = &self.path_commands };
+        }
+    };
+}
 
 fn pointsEqual(a: [2]f32, b: [2]f32) bool {
     return a[0] == b[0] and a[1] == b[1];
@@ -2841,6 +2912,12 @@ fn editorConnectionPathCache(editor: anytype) ?*ConnectionPathCache {
     return null;
 }
 
+fn editorConnectionDrawWorkspace(editor: anytype) ?*ConnectionDrawWorkspace {
+    const Editor = @TypeOf(editor);
+    if (@hasField(Editor, "connection_draw_workspace")) return editor.connection_draw_workspace;
+    return null;
+}
+
 fn editorViewportIndex(editor: anytype) ?*ViewportIndex {
     const Editor = @TypeOf(editor);
     if (@hasField(Editor, "viewport_index")) return editor.viewport_index;
@@ -2869,6 +2946,8 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     try paint_primitives.appendFillRect(allocator, out, rect, editor.background, 0.0, layer);
     try out.append(allocator, .{ .clip_begin = rect });
     const connection_path_cache = editorConnectionPathCache(editor);
+    const connection_draw_workspace = editorConnectionDrawWorkspace(editor);
+    if (connection_draw_workspace) |workspace| workspace.beginPaint();
     const viewport_index = prepareNodeEditorViewportIndex(rect, editor);
     try appendNodeEditorGrid(allocator, out, rect, editor, layer + 1);
     if (viewport_index) |index| {
@@ -2883,11 +2962,11 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     const connections = editorActiveConnections(editor);
     if (viewport_index) |index| {
         for (index.visibleConnectionIndices()) |connection_index| {
-            try appendNodeEditorConnectionItem(allocator, out, rect, editor, connection_path_cache, index, connections[connection_index], layer + 3);
+            try appendNodeEditorConnectionItem(allocator, out, rect, editor, connection_path_cache, connection_draw_workspace, index, connection_index, connections[connection_index], layer + 3);
         }
     } else {
-        for (connections) |connection| {
-            try appendNodeEditorConnectionItem(allocator, out, rect, editor, connection_path_cache, null, connection, layer + 3);
+        for (connections, 0..) |connection, connection_index| {
+            try appendNodeEditorConnectionItem(allocator, out, rect, editor, connection_path_cache, connection_draw_workspace, null, connection_index, connection, layer + 3);
         }
     }
     if (viewport_index) |index| {
@@ -2914,7 +2993,7 @@ pub fn appendNodeEditor(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     return .{ .start = dynamic_start, .end = dynamic_end };
 }
 
-fn appendNodeEditorConnectionItem(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, connection_path_cache: ?*ConnectionPathCache, viewport_index: ?*ViewportIndex, connection: Connection, layer: i32) !void {
+fn appendNodeEditorConnectionItem(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, connection_path_cache: ?*ConnectionPathCache, connection_draw_workspace: ?*ConnectionDrawWorkspace, viewport_index: ?*ViewportIndex, connection_index: usize, connection: Connection, layer: i32) !void {
     const from = if (viewport_index) |index| editor.nodes[index.nodeIndexForId(connection.from_id) orelse return] else nodeById(editor.nodes, connection.from_id) orelse return;
     const to = if (viewport_index) |index| editor.nodes[index.nodeIndexForId(connection.to_id) orelse return] else nodeById(editor.nodes, connection.to_id) orelse return;
     const a = outputPortPositionAt(rect, editor.state.*, from, connection.from_port);
@@ -2922,7 +3001,28 @@ fn appendNodeEditorConnectionItem(allocator: std.mem.Allocator, out: *std.ArrayL
     const selected = editor.state.isConnectionSelected(connection);
     const hovered = editor.state.isConnectionHovered(connection);
     const color = if (selected) editor.selected_color else if (hovered) connection.color.lighten(0.12) else connection.color;
-    try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, if (selected) 3.25 else if (hovered) 2.7 else 2.0, layer);
+    const width: f32 = if (selected) 3.25 else if (hovered) 2.7 else 2.0;
+    if (connection_draw_workspace) |workspace| {
+        if (connection_index < workspace.path_commands.len) {
+            workspace.borrowed_connection_count += 1;
+            return appendNodeEditorConnectionBorrowed(allocator, out, connection_path_cache, &workspace.path_commands[connection_index], a, b, color, width, layer);
+        }
+        workspace.fallback_connection_count += 1;
+    }
+    try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, width, layer);
+}
+
+fn appendNodeEditorConnectionBorrowed(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), cache: ?*ConnectionPathCache, commands: *[2]render.PathCommand, a: [2]f32, b: [2]f32, color: Color, width: f32, layer: i32) !void {
+    const path = if (cache) |connection_cache| connection_cache.pathFor(a, b) else connectionPathForPoints(a, b);
+    commands[0] = .{ .move_to = path.start };
+    commands[1] = .{ .cubic_to = .{ .c0 = path.c0, .c1 = path.c1, .end = path.end } };
+    try out.append(allocator, .{ .stroke_path = .{
+        .commands = commands,
+        .style = .{ .width = width, .cap = .round, .join = .round },
+        .color = color,
+        .layer = layer,
+        .owns_commands = false,
+    } });
 }
 
 fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, node_item: Node, layer: i32) !void {
@@ -3027,7 +3127,13 @@ fn appendNodeEditorConnectionPreviewOverlay(allocator: std.mem.Allocator, out: *
             }
         }
     }
-    try appendNodeEditorConnection(allocator, out, editorConnectionPathCache(editor), .{ rect.x, rect.y }, .{ rect.x + 0.001, rect.y }, Color.transparent, 1.0, layer);
+    try out.append(allocator, .{ .line = .{
+        .a = .{ rect.x, rect.y },
+        .b = .{ rect.x + 0.001, rect.y },
+        .thickness = 1.0,
+        .color = Color.transparent,
+        .layer = layer,
+    } });
 }
 
 fn appendNodeEditorGroup(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, group: Group, layer: i32) !void {
@@ -3876,8 +3982,148 @@ test "NodeEditor mutable connections replace static connections in paint and hit
         .stroke_path => stroke_count += 1,
         else => {},
     };
-    // One active connection plus the transparent overlay sentinel.
-    try std.testing.expectEqual(@as(usize, 2), stroke_count);
+    try std.testing.expectEqual(@as(usize, 1), stroke_count);
+}
+
+test "NodeEditor connection draw workspace eliminates path payload allocations" {
+    const node_count = 64;
+    const connection_count = node_count - 1;
+    var nodes: [node_count]Node = undefined;
+    var connections: [connection_count]Connection = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{
+        .id = @intCast(index + 1),
+        .title = "node",
+        .pos = .{ @floatFromInt(index * 18), @floatFromInt((index % 4) * 12) },
+        .size = .{ .w = 16, .h = 12 },
+    };
+    for (&connections, 0..) |*connection, index| connection.* = .{
+        .from_id = nodes[index].id,
+        .to_id = nodes[index + 1].id,
+        .color = if (index & 1 == 0) Color.rgba8(59, 130, 246, 190) else Color.rgba8(16, 185, 129, 170),
+    };
+    var selected_ids: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected_ids };
+    var viewport_storage = StaticViewportWorkspace(node_count, 0, connection_count){};
+    var viewport_index = ViewportIndex.init(viewport_storage.workspace());
+    var draw_storage = StaticConnectionDrawWorkspace(connection_count){};
+    var draw_workspace = draw_storage.workspace();
+    const viewport = Rect{ .x = 0, .y = 0, .w = 3000, .h = 400 };
+    const editor = Options(State){
+        .state = &state,
+        .nodes = &nodes,
+        .connections = &connections,
+        .connection_draw_workspace = &draw_workspace,
+        .viewport_index = &viewport_index,
+        .show_minimap = false,
+    };
+    const prepared = prepareNodeEditorViewportIndex(viewport, editor) orelse return error.ViewportIndexUnavailable;
+    const visible = prepared.visibleConnectionIndices();
+    try std.testing.expectEqual(connection_count, visible.len);
+
+    var out = try std.ArrayList(DrawCmd).initCapacity(std.testing.allocator, visible.len);
+    defer out.deinit(std.testing.allocator);
+    for (visible) |connection_index| {
+        try appendNodeEditorConnectionItem(std.testing.failing_allocator, &out, viewport, editor, null, &draw_workspace, prepared, connection_index, connections[connection_index], 7);
+    }
+    try std.testing.expectEqual(visible.len, out.items.len);
+    for (out.items, visible) |command, connection_index| {
+        const stroke = command.stroke_path;
+        try std.testing.expect(!stroke.owns_commands);
+        try std.testing.expectEqual(connections[connection_index].color, stroke.color);
+        try std.testing.expectEqual(@as(f32, 2.0), stroke.style.width);
+        try std.testing.expectEqual(@as(i32, 7), stroke.layer);
+        const expected = connectionPathForPoints(
+            outputPortPositionAt(viewport, state, nodes[connection_index], 0),
+            inputPortPositionAt(viewport, state, nodes[connection_index + 1], 0),
+        );
+        try std.testing.expectEqual(render.PathCommand{ .move_to = expected.start }, stroke.commands[0]);
+        try std.testing.expectEqual(render.PathCommand{ .cubic_to = .{ .c0 = expected.c0, .c1 = expected.c1, .end = expected.end } }, stroke.commands[1]);
+        const render_command = draw_cmd.toRenderCmd(command).stroke_path;
+        try std.testing.expectEqualSlices(render.PathCommand, stroke.commands, render_command.path.commands);
+        try std.testing.expectEqual(stroke.style, render_command.style);
+        try std.testing.expectEqual(stroke.color.toArr4(), render_command.color);
+        try std.testing.expectEqual(stroke.layer, render_command.layer);
+        draw_cmd.freePayload(std.testing.failing_allocator, command);
+    }
+    const summary = draw_workspace.summary();
+    try std.testing.expectEqual(@as(u64, 0), summary.frame_count);
+    try std.testing.expectEqual(visible.len, summary.borrowed_connection_count);
+    try std.testing.expect(summary.allocationFree());
+}
+
+test "NodeEditor borrowed connection payload clones into independent ownership" {
+    var storage = StaticConnectionDrawWorkspace(1){};
+    var workspace = storage.workspace();
+    workspace.path_commands[0] = .{
+        .{ .move_to = .{ 1, 2 } },
+        .{ .cubic_to = .{ .c0 = .{ 3, 4 }, .c1 = .{ 5, 6 }, .end = .{ 7, 8 } } },
+    };
+    const borrowed = DrawCmd{ .stroke_path = .{
+        .commands = &workspace.path_commands[0],
+        .style = .{ .width = 2, .cap = .round, .join = .round },
+        .color = Color.rgba8(59, 130, 246, 190),
+        .layer = 7,
+        .owns_commands = false,
+    } };
+    try std.testing.expect(!draw_cmd.ownsPayload(borrowed));
+    draw_cmd.freePayload(std.testing.failing_allocator, borrowed);
+    const cloned = try draw_cmd.clonePayload(std.testing.allocator, borrowed);
+    defer draw_cmd.freePayload(std.testing.allocator, cloned);
+    try std.testing.expect(draw_cmd.ownsPayload(cloned));
+    try std.testing.expect(cloned.stroke_path.commands.ptr != borrowed.stroke_path.commands.ptr);
+    try std.testing.expectEqualSlices(render.PathCommand, borrowed.stroke_path.commands, cloned.stroke_path.commands);
+    const render_stroke = draw_cmd.toRenderCmd(borrowed).stroke_path;
+    try std.testing.expectEqualSlices(render.PathCommand, borrowed.stroke_path.commands, render_stroke.path.commands);
+    try std.testing.expectEqual(borrowed.stroke_path.style, render_stroke.style);
+    try std.testing.expectEqual(borrowed.stroke_path.color.toArr4(), render_stroke.color);
+}
+
+test "NodeEditor connection draw storage supports runtime capacity" {
+    var storage = try ConnectionDrawStorage.init(std.testing.allocator, 17);
+    defer storage.deinit();
+    var workspace = storage.workspace();
+    try std.testing.expectEqual(@as(usize, 17), workspace.capacity());
+}
+
+test "NodeEditor connection draw workspace reports bounded fallback" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 800, .h = 300 };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "a", .pos = .{ -250, -30 } },
+        .{ .id = 2, .title = "b", .pos = .{ 0, -30 } },
+        .{ .id = 3, .title = "c", .pos = .{ 250, -30 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+    };
+    var draw_storage = StaticConnectionDrawWorkspace(1){};
+    var draw_workspace = draw_storage.workspace();
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .connections = &connections, .connection_draw_workspace = &draw_workspace, .show_minimap = false };
+    var out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (out.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        out.deinit(std.testing.allocator);
+    }
+    _ = try appendNodeEditor(std.testing.allocator, &out, viewport, editor, 0);
+    const summary = draw_workspace.summary();
+    try std.testing.expectEqual(@as(u64, 1), summary.frame_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.borrowed_connection_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.fallback_connection_count);
+    try std.testing.expect(!summary.allocationFree());
+    var borrowed_count: usize = 0;
+    var owned_count: usize = 0;
+    for (out.items) |command| switch (command) {
+        .stroke_path => |stroke| if (stroke.owns_commands) {
+            owned_count += 1;
+        } else {
+            borrowed_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), borrowed_count);
+    try std.testing.expectEqual(@as(usize, 1), owned_count);
 }
 
 test "NodeEditor indexed minimap keeps large graph draw commands bounded" {
@@ -3935,7 +4181,7 @@ test "NodeEditor indexed minimap keeps large graph draw commands bounded" {
         else => {},
     };
     try std.testing.expectEqual(prepared.visibleNodeIndices().len + prepared.visibleGroupIndices().len, title_count);
-    try std.testing.expectEqual(prepared.visibleConnectionIndices().len + 1, stroke_count);
+    try std.testing.expectEqual(prepared.visibleConnectionIndices().len, stroke_count);
 
     var out = std.ArrayList(DrawCmd).empty;
     defer {

@@ -84,4 +84,35 @@ pub fn build(b: *std.Build) void {
     } else {
         verify_viewport_step.dependOn(&viewport_bench.step);
     }
+
+    const editor_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/editor_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "zui", .module = zui_dep.module("zui") }},
+    });
+    const editor_bench = b.addExecutable(.{
+        .name = "zui-nodes-editor-bench",
+        .root_module = editor_bench_mod,
+    });
+    const run_editor_bench = b.addRunArtifact(editor_bench);
+    if (b.args) |args| run_editor_bench.addArgs(args);
+    const editor_bench_step = b.step("bench-editor-frame", "Benchmark 10k-node visible editor paint command generation");
+    if (can_run_target) {
+        editor_bench_step.dependOn(&run_editor_bench.step);
+    } else {
+        editor_bench_step.dependOn(&editor_bench.step);
+    }
+
+    const verify_editor_bench = b.addRunArtifact(editor_bench);
+    verify_editor_bench.addArgs(&.{
+        "--iterations=1000",
+        "--max-paint-ns=1000000",
+    });
+    const verify_editor_step = b.step("verify-editor-performance", "Verify 10k-node indexed paint throughput and zero payload allocation");
+    if (can_run_target) {
+        verify_editor_step.dependOn(&verify_editor_bench.step);
+    } else {
+        verify_editor_step.dependOn(&editor_bench.step);
+    }
 }
