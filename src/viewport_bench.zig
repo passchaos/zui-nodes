@@ -39,6 +39,8 @@ const Report = struct {
     max_visible_nodes: usize,
     max_visible_connections: usize,
     target_candidate_miss_count: usize,
+    box_candidate_miss_count: usize,
+    max_box_candidates: usize,
     rebuild_count: u64,
     query_count: u64,
     geometry_reuse_count: u64,
@@ -102,6 +104,8 @@ fn run(io: std.Io, options: Options) Report {
     var max_visible_nodes: usize = 0;
     var max_visible_connections: usize = 0;
     var target_candidate_miss_count: usize = 0;
+    var box_candidate_miss_count: usize = 0;
+    var max_box_candidates: usize = 0;
     var last_pan: [2]f32 = .{ 0, 0 };
     var last_zoom: f32 = 1;
     const query_started = std.Io.Clock.awake.now(io);
@@ -127,6 +131,17 @@ fn run(io: std.Io, options: Options) Report {
             }
         }
         if (!found_target) target_candidate_miss_count += 1;
+        const box_rect = Rect{ .x = viewport.w * 0.5 - 240, .y = viewport.h * 0.5 - 160, .w = 480, .h = 320 };
+        const box_candidates = viewport_index.nodeIndicesInScreenRect(viewport, last_pan, last_zoom, box_rect);
+        max_box_candidates = @max(max_box_candidates, box_candidates.len);
+        var target_in_box = false;
+        for (box_candidates) |candidate| {
+            if (candidate == target_index) {
+                target_in_box = true;
+                break;
+            }
+        }
+        if (!target_in_box) box_candidate_miss_count += 1;
         checksum = (checksum ^ @as(u64, @intCast(prepared.visible_node_count))) *% 0x0000_0100_0000_01b3;
         checksum = (checksum ^ @as(u64, @intCast(prepared.visible_connection_count))) *% 0x0000_0100_0000_01b3;
         checksum = (checksum ^ @as(u64, @intCast(candidates.len))) *% 0x0000_0100_0000_01b3;
@@ -148,7 +163,7 @@ fn run(io: std.Io, options: Options) Report {
         summary.geometry_reuse_count == options.iterations * 2 and summary.viewport_reuse_count == options.iterations and
         max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
         max_visible_connections > 0 and max_visible_connections < connection_count / 10 and checksum != 0;
-    const candidate_quality_passed = target_candidate_miss_count == 0;
+    const candidate_quality_passed = target_candidate_miss_count == 0 and box_candidate_miss_count == 0 and max_box_candidates < node_count / 20;
     const performance_passed = (options.max_build_ns == null or build_ns <= options.max_build_ns.?) and
         (options.max_query_ns == null or query_ns_per_iteration <= options.max_query_ns.?) and
         (options.max_cached_prepare_ns == null or cached_prepare_ns_per_iteration <= options.max_cached_prepare_ns.?);
@@ -162,6 +177,8 @@ fn run(io: std.Io, options: Options) Report {
         .max_visible_nodes = max_visible_nodes,
         .max_visible_connections = max_visible_connections,
         .target_candidate_miss_count = target_candidate_miss_count,
+        .box_candidate_miss_count = box_candidate_miss_count,
+        .max_box_candidates = max_box_candidates,
         .rebuild_count = summary.rebuild_count,
         .query_count = summary.query_count,
         .geometry_reuse_count = summary.geometry_reuse_count,
@@ -200,8 +217,8 @@ fn printReport(io: std.Io, report: Report) !void {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
     try stdout.print(
-        "zui-nodes viewport bench: nodes={d} connections={d} iterations={d} build_ns={d} query_ns_per_iteration={d:.3} cached_prepare_ns_per_iteration={d:.3} max_visible_nodes={d} max_visible_connections={d} candidate_misses={d} rebuilds={d} queries={d} geometry_reuse={d} viewport_reuse={d} allocations={d} checksum={d} passed={}\n",
-        .{ report.node_count, report.connection_count, report.iterations, report.build_ns, report.query_ns_per_iteration, report.cached_prepare_ns_per_iteration, report.max_visible_nodes, report.max_visible_connections, report.target_candidate_miss_count, report.rebuild_count, report.query_count, report.geometry_reuse_count, report.viewport_reuse_count, report.hot_path_allocations, report.checksum, report.passed },
+        "zui-nodes viewport bench: nodes={d} connections={d} iterations={d} build_ns={d} query_ns_per_iteration={d:.3} cached_prepare_ns_per_iteration={d:.3} max_visible_nodes={d} max_visible_connections={d} point_misses={d} box_misses={d} max_box_candidates={d} rebuilds={d} queries={d} geometry_reuse={d} viewport_reuse={d} allocations={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.connection_count, report.iterations, report.build_ns, report.query_ns_per_iteration, report.cached_prepare_ns_per_iteration, report.max_visible_nodes, report.max_visible_connections, report.target_candidate_miss_count, report.box_candidate_miss_count, report.max_box_candidates, report.rebuild_count, report.query_count, report.geometry_reuse_count, report.viewport_reuse_count, report.hot_path_allocations, report.checksum, report.passed },
     );
     try stdout.flush();
 }

@@ -2629,6 +2629,14 @@ pub const State = struct {
     }
 
     pub fn applyBoxSelection(self: *State, nodes: []const Node, rect: Rect, editor_rect: Rect, zoom: f32, pan: [2]f32) bool {
+        return self.applyBoxSelectionIndexed(nodes, null, rect, editor_rect, zoom, pan);
+    }
+
+    pub fn applyBoxSelectionCandidates(self: *State, nodes: []const Node, node_indices: []const usize, rect: Rect, editor_rect: Rect, zoom: f32, pan: [2]f32) bool {
+        return self.applyBoxSelectionIndexed(nodes, node_indices, rect, editor_rect, zoom, pan);
+    }
+
+    fn applyBoxSelectionIndexed(self: *State, nodes: []const Node, node_indices: ?[]const usize, rect: Rect, editor_rect: Rect, zoom: f32, pan: [2]f32) bool {
         const before_len = self.selected_node_len;
         const before_id = self.selected_node_id;
         var before_hash: u64 = 0;
@@ -2637,17 +2645,13 @@ pub const State = struct {
         var temp_state = self.*;
         temp_state.zoom = zoom;
         temp_state.pan = pan;
-        for (nodes) |node| {
-            const node_rect = nodeRectFromState(editor_rect, temp_state, node);
-            if (!rectIntersects(node_rect, rect)) continue;
-            switch (self.box_select_mode) {
-                .replace, .add => self.addNodeToSelection(node.id),
-                .subtract => self.removeNodeFromSelection(node.id),
-                .toggle => if (self.isNodeSelected(node.id))
-                    self.removeNodeFromSelection(node.id)
-                else
-                    self.addNodeToSelection(node.id),
+        if (node_indices) |indices| {
+            for (indices) |node_index| {
+                if (node_index >= nodes.len) continue;
+                self.applyBoxSelectionNode(nodes[node_index], rect, editor_rect, temp_state);
             }
+        } else {
+            for (nodes) |node| self.applyBoxSelectionNode(node, rect, editor_rect, temp_state);
         }
         self.selected_node_id = if (self.selected_node_len > 0) self.selected_node_ids[self.selected_node_len - 1] else null;
         self.box_selecting = false;
@@ -2655,6 +2659,19 @@ pub const State = struct {
         var after_hash: u64 = 0;
         for (self.selected_node_ids[0..self.boundedSelectionLen()]) |id| after_hash = after_hash *% 16777619 +% id;
         return before_len != self.selected_node_len or before_id != self.selected_node_id or before_hash != after_hash;
+    }
+
+    fn applyBoxSelectionNode(self: *State, node: Node, rect: Rect, editor_rect: Rect, temp_state: State) void {
+        const node_rect = nodeRectFromState(editor_rect, temp_state, node);
+        if (!rectIntersects(node_rect, rect)) return;
+        switch (self.box_select_mode) {
+            .replace, .add => self.addNodeToSelection(node.id),
+            .subtract => self.removeNodeFromSelection(node.id),
+            .toggle => if (self.isNodeSelected(node.id))
+                self.removeNodeFromSelection(node.id)
+            else
+                self.addNodeToSelection(node.id),
+        }
     }
 
     pub fn takePendingConnection(self: *State) ?Connection {
@@ -3532,7 +3549,12 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             }
             if (editor.state.box_selecting) {
                 editor.state.box_select_end = .{ m.x, m.y };
-                return editor.state.applyBoxSelection(editor.nodes, editor.state.boxSelectRect(), rect, editor.state.zoom, editor.state.pan);
+                const box = editor.state.boxSelectRect();
+                if (viewport_index) |index| {
+                    const candidates = index.nodeIndicesInScreenRect(rect, editor.state.pan, editor.state.zoom, box);
+                    return editor.state.applyBoxSelectionCandidates(editor.nodes, candidates, box, rect, editor.state.zoom, editor.state.pan);
+                }
+                return editor.state.applyBoxSelection(editor.nodes, box, rect, editor.state.zoom, editor.state.pan);
             }
             if (editor.state.reconnecting_connection) |connection| {
                 const endpoint = editor.state.reconnecting_connection_end;
@@ -3928,6 +3950,44 @@ test "NodeEditor indexed minimap keeps large graph draw commands bounded" {
     };
     // Background fill + border, one mark per sample, and viewport border.
     try std.testing.expectEqual(@as(usize, 35), fill_count);
+}
+
+test "NodeEditor indexed box selection matches full scan in every mode" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 420, .h = 240 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "outside left", .pos = .{ -600, -30 } },
+        .{ .id = 2, .title = "inside back", .pos = .{ -120, -30 } },
+        .{ .id = 3, .title = "inside front", .pos = .{ 60, -30 } },
+        .{ .id = 4, .title = "outside right", .pos = .{ 700, -30 } },
+    };
+    const groups = [_]Group{};
+    const connections = [_]Connection{};
+    var viewport_storage = StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = ViewportIndex.init(viewport_storage.workspace());
+    const box = Rect{ .x = 80, .y = 70, .w = 340, .h = 130 };
+    try std.testing.expect(viewport_index.prepare(&nodes, &groups, &connections, viewport, .{ 0, 0 }, 1).ready);
+    const candidates = viewport_index.nodeIndicesInScreenRect(viewport, .{ 0, 0 }, 1, box);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, candidates);
+
+    for ([_]BoxSelectMode{ .replace, .add, .subtract, .toggle }) |mode| {
+        var full_ids: [8]u32 = .{0} ** 8;
+        var indexed_ids: [8]u32 = .{0} ** 8;
+        var full = State{ .selected_node_ids = &full_ids };
+        var indexed = State{ .selected_node_ids = &indexed_ids };
+        _ = full.setSingleSelection(1);
+        _ = indexed.setSingleSelection(1);
+        full.box_selecting = true;
+        indexed.box_selecting = true;
+        full.box_select_mode = mode;
+        indexed.box_select_mode = mode;
+
+        const full_changed = full.applyBoxSelection(&nodes, box, viewport, 1, .{ 0, 0 });
+        const indexed_changed = indexed.applyBoxSelectionCandidates(&nodes, candidates, box, viewport, 1, .{ 0, 0 });
+        try std.testing.expectEqual(full_changed, indexed_changed);
+        try std.testing.expectEqual(full.selected_node_id, indexed.selected_node_id);
+        try std.testing.expectEqual(full.boundedSelectionLen(), indexed.boundedSelectionLen());
+        try std.testing.expectEqualSlices(u32, full.selected_node_ids[0..full.boundedSelectionLen()], indexed.selected_node_ids[0..indexed.boundedSelectionLen()]);
+    }
 }
 
 test "NodeEditor strict dataflow policy rejects cyclic link mutation" {

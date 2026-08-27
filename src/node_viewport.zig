@@ -288,6 +288,14 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 return self.workspace.node_hit_indices[0..count];
             }
 
+            pub fn nodeIndicesInScreenRect(self: *Index, viewport: Rect, pan: [2]f32, zoom_value: f32, screen_rect: Rect) []const usize {
+                if (!self.valid) return &.{};
+                const query_rect = graphScreenRect(viewport, pan, @max(0.001, zoom_value), screen_rect);
+                const count = queryIntervals(self.workspace.node_bounds[0..self.node_count], self.workspace.node_order[0..self.node_count], self.workspace.node_prefix_max_x[0..self.node_count], query_rect, self.workspace.node_hit_indices);
+                std.sort.pdq(usize, self.workspace.node_hit_indices[0..count], {}, std.sort.asc(usize));
+                return self.workspace.node_hit_indices[0..count];
+            }
+
             pub fn groupIndicesNearPoint(self: *Index, viewport: Rect, pan: [2]f32, zoom_value: f32, point: [2]f32, radius_pixels: f32) []const usize {
                 if (!self.valid) return &.{};
                 const query_rect = graphPointRect(viewport, pan, @max(0.001, zoom_value), point, radius_pixels);
@@ -561,6 +569,17 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             return .{ .x = graph_x - radius, .y = graph_y - radius, .w = radius * 2.0, .h = radius * 2.0 };
         }
 
+        fn graphScreenRect(viewport: Rect, pan: [2]f32, zoom: f32, screen_rect: Rect) Rect {
+            const center_x = viewport.x + viewport.w * 0.5 + pan[0];
+            const center_y = viewport.y + viewport.h * 0.5 + pan[1];
+            return .{
+                .x = (screen_rect.x - center_x) / zoom,
+                .y = (screen_rect.y - center_y) / zoom,
+                .w = @max(0.0, screen_rect.w) / zoom,
+                .h = @max(0.0, screen_rect.h) / zoom,
+            };
+        }
+
         fn expandRect(rect: Rect, amount_x: f32, amount_y: f32) Rect {
             return .{ .x = rect.x - amount_x, .y = rect.y - amount_y, .w = rect.w + amount_x * 2.0, .h = rect.h + amount_y * 2.0 };
         }
@@ -693,6 +712,7 @@ test "viewport index culls nodes groups and connections in storage order" {
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, index.visibleConnectionIndices());
     const point = [2]f32{ viewport.w * 0.5 + 80, viewport.h * 0.5 + 40 };
     try std.testing.expectEqualSlices(usize, &.{1}, index.nodeIndicesNearPoint(viewport, .{ 0, 0 }, 1, point, 1));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, index.nodeIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 100, .y = 70, .w = 240, .h = 100 }));
     try std.testing.expectEqualSlices(usize, &.{0}, index.connectionIndicesNearPoint(viewport, .{ 0, 0 }, 1, point, 8));
 
     const repeated = index.prepare(&nodes, &groups, &connections, viewport, .{ 0, 0 }, 1);
