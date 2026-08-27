@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const graph_validation = @import("graph_validation.zig");
+const node_geometry = @import("node_geometry.zig");
 
 pub const LayeredLayoutDirection = enum(u8) {
     left_to_right,
@@ -195,9 +196,10 @@ fn nodeHasIncidentConnection(id: u32, connections: anytype) bool {
 
 fn crossSize(node: anytype, direction: LayeredLayoutDirection) f32 {
     if (!@hasField(@TypeOf(node), "size")) return 1.0;
+    const size = node_geometry.effectiveSize(node);
     return switch (direction) {
-        .left_to_right, .right_to_left => @max(1.0, node.size.h),
-        .top_to_bottom, .bottom_to_top => @max(1.0, node.size.w),
+        .left_to_right, .right_to_left => @max(1.0, size.h),
+        .top_to_bottom, .bottom_to_top => @max(1.0, size.w),
     };
 }
 
@@ -207,6 +209,8 @@ const TestNode = struct {
     size: struct { w: f32 = 80.0, h: f32 = 40.0 } = .{},
     input_count: u8 = 1,
     output_count: u8 = 1,
+    collapsed: bool = false,
+    collapsed_height: f32 = 32.0,
 };
 
 const TestConnection = struct {
@@ -250,4 +254,18 @@ test "layered layout strict policy refuses cyclic graph mutation" {
     try std.testing.expect(result.invalid_graph);
     try std.testing.expect(result.cycle_detected);
     try std.testing.expectEqual(before, nodes);
+}
+
+test "horizontal layered layout spaces collapsed nodes by effective height" {
+    inline for (.{ LayeredLayoutDirection.left_to_right, LayeredLayoutDirection.right_to_left }) |direction| {
+        var nodes = [_]TestNode{
+            .{ .id = 1, .size = .{ .w = 80, .h = 120 }, .collapsed = true, .collapsed_height = 28 },
+            .{ .id = 2, .size = .{ .w = 80, .h = 120 } },
+        };
+        var storage = StaticLayeredLayoutWorkspace(2, 2){};
+        const result = layoutLayered(&nodes, nodes.len, &.{}, storage.workspace(), .{ .direction = direction, .node_gap = 12 });
+        try std.testing.expect(result.ok());
+        try std.testing.expectEqual(@as(f32, 0), nodes[0].pos[1]);
+        try std.testing.expectEqual(@as(f32, 40), nodes[1].pos[1]);
+    }
 }

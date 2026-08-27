@@ -31,6 +31,8 @@ pub fn nodeFrom(value: anytype) NodeEditorNode {
         .output_labels = value.output_labels,
         .input_types = compatiblePortTypes(value.input_types),
         .output_types = compatiblePortTypes(value.output_types),
+        .collapsed = if (@hasField(@TypeOf(value), "collapsed")) value.collapsed else false,
+        .collapsed_height = if (@hasField(@TypeOf(value), "collapsed_height")) value.collapsed_height else 32.0,
     };
 }
 
@@ -68,6 +70,8 @@ pub fn templateFrom(value: anytype) NodeEditorNodeTemplate {
         .output_labels = value.output_labels,
         .input_types = compatiblePortTypes(value.input_types),
         .output_types = compatiblePortTypes(value.output_types),
+        .collapsed = if (@hasField(@TypeOf(value), "collapsed")) value.collapsed else false,
+        .collapsed_height = if (@hasField(@TypeOf(value), "collapsed_height")) value.collapsed_height else 32.0,
     };
 }
 
@@ -108,7 +112,7 @@ pub fn copyGroupsFrom(comptime SourceGroup: type, source: []const SourceGroup, o
 
 test "zui-nodes adapters copy native node editor model values" {
     const source_nodes = [_]NodeEditorNode{
-        .{ .id = 1, .title = "A", .pos = .{ 0, 0 }, .output_types = &.{.image} },
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 }, .output_types = &.{.image}, .collapsed = true, .collapsed_height = 24 },
         .{ .id = 2, .title = "B", .pos = .{ 100, 0 }, .input_types = &.{.image} },
     };
     const source_connections = [_]NodeEditorConnection{
@@ -125,11 +129,31 @@ test "zui-nodes adapters copy native node editor model values" {
     try @import("std").testing.expectEqual(@as(usize, 1), copyConnectionsFrom(NodeEditorConnection, &source_connections, &connections));
     try @import("std").testing.expectEqual(@as(usize, 1), copyGroupsFrom(NodeEditorGroup, &source_groups, &groups));
     try @import("std").testing.expectEqual(@as(u32, 1), nodes[0].id);
+    try @import("std").testing.expect(nodes[0].collapsed);
+    try @import("std").testing.expectEqual(@as(f32, 24), nodes[0].collapsed_height);
     try @import("std").testing.expectEqual(NodeEditorPortType.image, portTypeFrom(source_nodes[0].output_types[0]));
     try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
 }
 
+test "zui-nodes adapters default legacy collapse fields" {
+    const LegacyNode = struct {
+        id: u32,
+        title: []const u8,
+        pos: [2]f32,
+        size: Size = .{ .w = 120, .h = 80 },
+        color: zui.Color = zui.Color.rgb8(51, 65, 85),
+        input_count: u8 = 1,
+        output_count: u8 = 1,
+        input_labels: []const []const u8 = &.{},
+        output_labels: []const []const u8 = &.{},
+        input_types: []const NodeEditorPortType = &.{},
+        output_types: []const NodeEditorPortType = &.{},
+    };
+    const adapted = nodeFrom(LegacyNode{ .id = 9, .title = "legacy", .pos = .{ 1, 2 } });
+    try @import("std").testing.expect(!adapted.collapsed);
+    try @import("std").testing.expectEqual(@as(f32, 32), adapted.collapsed_height);
+}
 
 pub fn Helpers(comptime NodeEditorElement: type) type {
     return struct {

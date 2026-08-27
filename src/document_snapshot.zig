@@ -505,6 +505,38 @@ test "zui-nodes document snapshot parses legacy single-connection selection" {
     try std.testing.expectEqual(@as(usize, 1), summarizeDocumentSnapshot(parsed.value).selected_connection_count);
 }
 
+test "zui-nodes document snapshot preserves collapsed nodes and defaults legacy nodes expanded" {
+    const nodes = [_]Node{.{ .id = 1, .title = "compact", .pos = .{ 0, 0 }, .collapsed = true, .collapsed_height = 26 }};
+    const snapshot = DocumentSnapshot{ .nodes = &nodes };
+    const json = try snapshot.toJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    var parsed = try parseDocumentSnapshotJson(std.testing.allocator, json);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.nodes[0].collapsed);
+    try std.testing.expectEqual(@as(f32, 26), parsed.value.nodes[0].collapsed_height);
+    var restored_state = State{};
+    var restored_nodes: [1]Node = undefined;
+    var restored_node_len: usize = 0;
+    var restored_connections: [1]Connection = undefined;
+    var restored_connection_len: usize = 0;
+    _ = try applyDocumentSnapshot(.{
+        .snapshot = parsed.value,
+        .state = &restored_state,
+        .nodes = &restored_nodes,
+        .node_len = &restored_node_len,
+        .connections = &restored_connections,
+        .connection_len = &restored_connection_len,
+    });
+    try std.testing.expect(restored_nodes[0].collapsed);
+    try std.testing.expectEqual(@as(f32, 26), restored_nodes[0].collapsed_height);
+
+    const legacy_json = "{\"version\":1,\"nodes\":[{\"id\":2,\"title\":\"legacy\",\"pos\":[0,0]}]}";
+    var legacy = try parseDocumentSnapshotJson(std.testing.allocator, legacy_json);
+    defer legacy.deinit();
+    try std.testing.expect(!legacy.value.nodes[0].collapsed);
+    try std.testing.expectEqual(@as(f32, 32), legacy.value.nodes[0].collapsed_height);
+}
+
 test "zui-nodes document validation reports duplicate and orphan graph data" {
     const nodes = [_]Node{
         .{ .id = 1, .title = "A", .pos = .{ 0.0, 0.0 } },

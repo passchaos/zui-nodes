@@ -28,7 +28,7 @@ pub const node_editor_command_category = "node editor";
 pub const node_editor_selection_category = "node editor selection";
 pub const node_editor_history_category = "node editor history";
 pub const node_editor_selection_command_count: usize = @intFromEnum(SelectionCommand.focus) + 1;
-pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.auto_layout_layered) + 1;
+pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.expand_selected_nodes) + 1;
 pub const node_editor_history_command_count: usize = @intFromEnum(HistoryCommand.redo) + 1;
 pub const node_editor_all_command_count: usize = node_editor_selection_command_count + node_editor_command_count + node_editor_history_command_count;
 pub const node_editor_context_menu_capacity: usize = 40;
@@ -76,6 +76,9 @@ pub const node_editor_commands = [_]Command{
     .{ .id = NodeEditorCommand.disconnect_context_port_links.commandId(), .title = "Disconnect Context Port Links", .description = "Remove links attached to the port targeted by the context menu", .category = node_editor_command_category, .panel_role = .viewport, .destructive = true },
     .{ .id = NodeEditorCommand.select_context_port_peers.commandId(), .title = "Select Context Port Peers", .description = "Select nodes connected to the port targeted by the context menu", .category = node_editor_command_category, .panel_role = .viewport },
     .{ .id = NodeEditorCommand.auto_layout_layered.commandId(), .title = "Auto Layout Node Graph", .description = "Arrange nodes into deterministic dependency layers", .category = node_editor_command_category, .panel_role = .viewport, .default_shortcut = "Shift+Home", .pinned = true },
+    .{ .id = NodeEditorCommand.toggle_selected_nodes_collapsed.commandId(), .title = "Toggle Selected Nodes Collapsed", .description = "Collapse a mixed or expanded selection, or expand a fully collapsed selection", .category = node_editor_command_category, .panel_role = .viewport },
+    .{ .id = NodeEditorCommand.collapse_selected_nodes.commandId(), .title = "Collapse Selected Nodes", .description = "Collapse all expanded nodes in the selection", .category = node_editor_command_category, .panel_role = .viewport },
+    .{ .id = NodeEditorCommand.expand_selected_nodes.commandId(), .title = "Expand Selected Nodes", .description = "Expand all collapsed nodes in the selection", .category = node_editor_command_category, .panel_role = .viewport },
 };
 
 pub const node_editor_history_commands = [_]Command{
@@ -150,6 +153,9 @@ pub const NodeEditorContextMenuCapabilities = struct {
     can_reconnect_to_previous: bool = false,
     can_reconnect_to_next: bool = false,
     can_auto_layout_layered: bool = false,
+    can_toggle_selected_nodes_collapsed: bool = false,
+    can_collapse_selected_nodes: bool = false,
+    can_expand_selected_nodes: bool = false,
 };
 
 pub fn nodeEditorCommandRegistry() CommandRegistry {
@@ -264,6 +270,9 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
                 builder.appendSelection(.duplicate);
                 builder.appendSelection(.delete);
                 builder.appendSelection(.rename);
+                builder.appendCommand(.toggle_selected_nodes_collapsed);
+                builder.appendCommand(.collapse_selected_nodes);
+                builder.appendCommand(.expand_selected_nodes);
                 builder.appendSeparator();
                 builder.appendCommand(.clear_selection);
                 builder.appendCommand(.focus_selection);
@@ -384,6 +393,9 @@ pub fn nodeEditorContextMenuModelForCapabilities(capabilities: NodeEditorContext
                 builder.appendSelection(.duplicate, capabilities.can_duplicate);
                 builder.appendSelection(.delete, capabilities.can_delete);
                 builder.appendSelection(.rename, capabilities.has_selection);
+                builder.appendCommand(.toggle_selected_nodes_collapsed, capabilities.can_toggle_selected_nodes_collapsed);
+                builder.appendCommand(.collapse_selected_nodes, capabilities.can_collapse_selected_nodes);
+                builder.appendCommand(.expand_selected_nodes, capabilities.can_expand_selected_nodes);
                 builder.appendSeparator();
                 builder.appendCommand(.clear_selection, capabilities.has_selection);
                 builder.appendCommand(.focus_selection, capabilities.can_focus_selection);
@@ -478,6 +490,7 @@ pub fn summarizeNodeEditorContextMenu(model: MenuModel, registry: CommandRegistr
 fn nodeEditorCommandChecked(context: *const CommandContext, command: NodeEditorCommand) bool {
     return switch (command) {
         .open_context_menu, .close_context_menu => context.state.context_menu.open,
+        .toggle_selected_nodes_collapsed => context.state.selectedNodesAllCollapsed(context.nodes, context.node_len.*),
         else => false,
     };
 }
@@ -682,6 +695,12 @@ test "zui-nodes context menu model resolves through command registry" {
     try std.testing.expect(menuContainsSelectionCommand(model, .delete));
     try std.testing.expect(menuContainsCommand(model, .select_all));
     try std.testing.expect(menuContainsCommand(model, .insert_processing_node));
+    _ = state.setSingleSelection(1);
+    var node_items: [node_editor_context_menu_capacity]MenuItem = undefined;
+    const node_model = nodeEditorContextMenuModel(&context, .{ .target = .node }, &node_items);
+    try std.testing.expect(menuContainsCommand(node_model, .toggle_selected_nodes_collapsed));
+    try std.testing.expect(menuContainsCommand(node_model, .collapse_selected_nodes));
+    try std.testing.expect(menuContainsCommand(node_model, .expand_selected_nodes));
     for (model.items, 0..) |item, index| {
         if (item.command_id != null and item.command_id.? == NodeEditorCommand.select_all.commandId()) {
             try std.testing.expectEqualStrings("Select All Nodes", model.itemAt(index, registry).?.title);

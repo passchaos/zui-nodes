@@ -24,6 +24,7 @@ const Options = struct {
 const Report = struct {
     node_count: usize,
     connection_count: usize,
+    collapsed_node_count: usize,
     iterations: usize,
     paint_ns_per_frame: f64,
     owning_paint_ns_per_frame: f64,
@@ -86,6 +87,8 @@ fn run(init: std.process.Init, options: Options) !Report {
             .output_count = 2,
             .input_labels = &input_labels,
             .output_labels = &output_labels,
+            .collapsed = index % 3 == 0,
+            .collapsed_height = 28,
         };
     }
     var connection_index: usize = 0;
@@ -152,6 +155,7 @@ fn run(init: std.process.Init, options: Options) !Report {
             .connection_draw_workspace = &draw_workspace,
             .viewport_index = &viewport_index,
             .geometry_revision = 1,
+            .node_collapse = .{ .enabled = true },
             .show_minimap = false,
             .grid_color = zui.Color.transparent,
         }, 0);
@@ -177,6 +181,7 @@ fn run(init: std.process.Init, options: Options) !Report {
             .connections = connections,
             .viewport_index = &owning_viewport_index,
             .geometry_revision = 1,
+            .node_collapse = .{ .enabled = true },
             .show_minimap = false,
             .grid_color = zui.Color.transparent,
         }, 0);
@@ -493,6 +498,7 @@ fn run(init: std.process.Init, options: Options) !Report {
         navigation_state.navigation_spatial_fallback_count == 0 and max_topology_navigation_candidates == 2 and
         navigation_topology.summary().rebuild_count == 1;
     const quality_passed = connection_index == connection_count and paint_summary.valid and paint_summary.rebuild_count == 1 and
+        paint_summary.node_count == node_count and
         max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
         max_visible_connections > 0 and max_visible_connections < connection_count / 10 and
         max_draw_commands < draw_command_capacity and owned_payload_count == 0 and fixed.end_index == 0 and
@@ -510,6 +516,7 @@ fn run(init: std.process.Init, options: Options) !Report {
     return .{
         .node_count = node_count,
         .connection_count = connection_count,
+        .collapsed_node_count = (node_count + 2) / 3,
         .iterations = options.iterations,
         .paint_ns_per_frame = paint_ns_per_frame,
         .owning_paint_ns_per_frame = owning_paint_ns_per_frame,
@@ -572,8 +579,8 @@ fn printReport(io: std.Io, report: Report) !void {
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), io, &buffer);
     const stdout = &stdout_file_writer.interface;
     try stdout.print(
-        "zui-nodes editor paint bench: nodes={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x multi_drag={d}@{d:.3}ns alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns box_connections={d:.3}ns candidates={d} misses={d} navigation={d:.3}ns candidates={d} topology_navigation={d:.3}ns candidates={d} max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
-        .{ report.node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.box_connection_ns_per_iteration, report.max_box_connection_candidates, report.box_connection_candidate_misses, report.navigation_ns_per_iteration, report.max_navigation_candidates, report.topology_navigation_ns_per_iteration, report.max_topology_navigation_candidates, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+        "zui-nodes editor paint bench: nodes={d} collapsed={d} connections={d} iterations={d} paint_ns_per_frame={d:.3} owning_paint_ns_per_frame={d:.3} speedup={d:.3}x multi_drag={d}@{d:.3}ns alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns box_connections={d:.3}ns candidates={d} misses={d} navigation={d:.3}ns candidates={d} topology_navigation={d:.3}ns candidates={d} max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.node_count, report.collapsed_node_count, report.connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.box_connection_ns_per_iteration, report.max_box_connection_candidates, report.box_connection_candidate_misses, report.navigation_ns_per_iteration, report.max_navigation_candidates, report.topology_navigation_ns_per_iteration, report.max_topology_navigation_candidates, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
     );
     try stdout.flush();
 }

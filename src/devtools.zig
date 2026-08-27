@@ -39,6 +39,7 @@ pub const SummaryOptions = struct {
     distribution_snap: node_editor.DistributionSnapOptions = .{},
     box_select_scope: node_editor.BoxSelectScope = .nodes_only,
     spatial_navigation: node_editor.SpatialNavigationOptions = .{},
+    node_collapse: node_editor.NodeCollapseOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -47,6 +48,8 @@ pub const Summary = struct {
     node_count: usize = 0,
     connection_count: usize = 0,
     group_count: usize = 0,
+    collapsed_node_count: usize = 0,
+    selected_collapsed_node_count: usize = 0,
     selected_node_count: usize = 0,
     selected_connection_count: usize = 0,
     selected_node_id: ?u32 = null,
@@ -77,6 +80,8 @@ pub const Summary = struct {
     navigation_rejected_count: u64 = 0,
     navigation_topology_hit_count: u64 = 0,
     navigation_spatial_fallback_count: u64 = 0,
+    node_collapse_enabled: bool = false,
+    node_collapse_mutation_count: u64 = 0,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -133,10 +138,19 @@ pub fn summarize(options: SummaryOptions) Summary {
             node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size)
     else
         node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size);
+    var collapsed_node_count: usize = 0;
+    var selected_collapsed_node_count: usize = 0;
+    for (options.nodes) |node| {
+        if (!node.collapsed) continue;
+        collapsed_node_count += 1;
+        if (state.isNodeSelected(node.id)) selected_collapsed_node_count += 1;
+    }
     return .{
         .node_count = options.nodes.len,
         .connection_count = options.connections.len,
         .group_count = options.groups.len,
+        .collapsed_node_count = collapsed_node_count,
+        .selected_collapsed_node_count = selected_collapsed_node_count,
         .selected_node_count = state.boundedSelectionLen(),
         .selected_connection_count = state.boundedConnectionSelectionLen(),
         .selected_node_id = state.selected_node_id,
@@ -169,6 +183,8 @@ pub fn summarize(options: SummaryOptions) Summary {
         .navigation_rejected_count = state.navigation_rejected_count,
         .navigation_topology_hit_count = state.navigation_topology_hit_count,
         .navigation_spatial_fallback_count = state.navigation_spatial_fallback_count,
+        .node_collapse_enabled = options.node_collapse.enabled,
+        .node_collapse_mutation_count = state.node_collapse_mutation_count,
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -201,14 +217,16 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         .height = .{ .px = options.row_height },
         .line_height = options.row_height,
     });
-    const counts = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "nodes={d} links={d} groups={d} status={s}", .{
+    const counts = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "nodes={d} collapsed={d} links={d} groups={d} status={s}", .{
         options.summary.node_count,
+        options.summary.collapsed_node_count,
         options.summary.connection_count,
         options.summary.group_count,
         options.summary.statusText(),
     }), .{ .font_size = 10, .color = ctx.theme().text_muted, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    const selection = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "selection nodes={d} links={d} node={?d} group={?d} conn={}", .{
+    const selection = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "selection nodes={d} collapsed={d} links={d} node={?d} group={?d} conn={}", .{
         options.summary.selected_node_count,
+        options.summary.selected_collapsed_node_count,
         options.summary.selected_connection_count,
         options.summary.selected_node_id,
         options.summary.selected_group_id,
@@ -318,7 +336,7 @@ test "zui-nodes devtools summarize node editor state" {
     var state = State{ .selected_node_ids = &selected, .zoom = 1.25, .pan = .{ 12, -4 } };
     const nodes = [_]Node{
         .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
-        .{ .id = 2, .title = "B", .pos = .{ 160, 64 } },
+        .{ .id = 2, .title = "B", .pos = .{ 160, 64 }, .collapsed = true },
     };
     const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
     var path_cache = node_editor.ConnectionPathCache{};
@@ -331,8 +349,12 @@ test "zui-nodes devtools summarize node editor state" {
         .connections = &connections,
         .viewport = .{ .x = 0, .y = 0, .w = 360, .h = 220 },
         .connection_path_cache = &path_cache,
+        .node_collapse = .{ .enabled = true },
     });
     try std.testing.expectEqual(@as(usize, 2), summary.node_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.collapsed_node_count);
+    try std.testing.expectEqual(@as(usize, 1), summary.selected_collapsed_node_count);
+    try std.testing.expect(summary.node_collapse_enabled);
     try std.testing.expectEqual(@as(usize, 1), summary.connection_count);
     try std.testing.expect(summary.hasSelection());
     try std.testing.expect(summary.minimap.visible);

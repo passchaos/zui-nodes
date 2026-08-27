@@ -7,6 +7,7 @@
 //! avoids that scan and requires the caller to advance its geometry revision.
 
 const std = @import("std");
+const node_geometry = @import("node_geometry.zig");
 
 pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: type, comptime Rect: type) type {
     return struct {
@@ -522,11 +523,14 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
         };
 
         fn nodeRect(node: Node) Rect {
-            return .{ .x = node.pos[0], .y = node.pos[1], .w = node.size.w, .h = node.size.h };
+            const size = node_geometry.effectiveSize(node);
+            return .{ .x = node.pos[0], .y = node.pos[1], .w = size.w, .h = size.h };
         }
 
         fn connectionBounds(from: Node, to: Node) Rect {
-            const a_x = from.pos[0] + from.size.w;
+            const from_size = node_geometry.effectiveSize(from);
+            const to_size = node_geometry.effectiveSize(to);
+            const a_x = from.pos[0] + from_size.w;
             const b_x = to.pos[0];
             const dx = @abs(b_x - a_x) * 0.5;
             const min_x = @min(@min(a_x, b_x), @min(a_x + dx, b_x - dx));
@@ -534,7 +538,7 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             // The query expands by the screen-space port inset, so this
             // zoom-invariant node hull conservatively contains every curve.
             const min_y = @min(from.pos[1], to.pos[1]);
-            const max_y = @max(from.pos[1] + from.size.h, to.pos[1] + to.size.h);
+            const max_y = @max(from.pos[1] + from_size.h, to.pos[1] + to_size.h);
             return .{ .x = min_x, .y = min_y, .w = max_x - min_x, .h = max_y - min_y };
         }
 
@@ -653,6 +657,10 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 mixFloat(&hash, node.pos[1]);
                 mixFloat(&hash, node.size.w);
                 mixFloat(&hash, node.size.h);
+                if (comptime @hasField(Node, "collapsed")) {
+                    mix(&hash, @intFromBool(node.collapsed));
+                    if (node.collapsed and comptime @hasField(Node, "collapsed_height")) mixFloat(&hash, node.collapsed_height);
+                }
                 mix(&hash, node.input_count);
                 mix(&hash, node.output_count);
             }
@@ -700,6 +708,8 @@ const TestNode = struct {
     size: TestSize = .{ .w = 80, .h = 40 },
     input_count: u8 = 1,
     output_count: u8 = 1,
+    collapsed: bool = false,
+    collapsed_height: f32 = 32,
 };
 
 const TestGroup = struct {
@@ -800,6 +810,20 @@ test "viewport index versioned mode rebuilds only on geometry revision" {
     index.invalidate();
     try std.testing.expectEqual(@as(?usize, null), index.nodeIndexForId(2));
     try std.testing.expectEqual(@as(?[]const usize, null), index.retainedNodeIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 100, .y = 70, .w = 240, .h = 100 }));
+}
+
+test "viewport index fingerprints collapsed geometry and culls compact bounds" {
+    var nodes = [_]TestNode{.{ .id = 1, .pos = .{ 0, -120 }, .size = .{ .w = 80, .h = 160 } }};
+    var storage = TestIndexTypes.StaticWorkspace(nodes.len, 0, 0){};
+    var index = TestIndexTypes.Index.init(storage.workspace());
+    const viewport = TestRect{ .x = 0, .y = 0, .w = 240, .h = 120 };
+
+    try std.testing.expect(index.prepare(&nodes, &.{}, &.{}, viewport, .{ 0, 0 }, 1).ready);
+    try std.testing.expectEqualSlices(usize, &.{0}, index.visibleNodeIndices());
+    nodes[0].collapsed = true;
+    try std.testing.expect(index.prepare(&nodes, &.{}, &.{}, viewport, .{ 0, 0 }, 1).ready);
+    try std.testing.expectEqual(@as(usize, 0), index.visibleNodeIndices().len);
+    try std.testing.expectEqual(@as(u64, 2), index.summary().rebuild_count);
 }
 
 test "viewport index reports invalid graph and workspace capacity" {

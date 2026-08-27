@@ -97,6 +97,8 @@ pub const NodeEditorViewOptions = struct {
     box_select_scope: node_editor.BoxSelectScope = .nodes_only,
     /// Opt-in arrow-key navigation. Shift extends the current node selection.
     spatial_navigation: node_editor.SpatialNavigationOptions = .{},
+    /// Opt-in title double-click interaction and disclosure indicators.
+    node_collapse: node_editor.NodeCollapseOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -143,6 +145,7 @@ const Binding = struct {
     distribution_snap: node_editor.DistributionSnapOptions = .{},
     box_select_scope: node_editor.BoxSelectScope = .nodes_only,
     spatial_navigation: node_editor.SpatialNavigationOptions = .{},
+    node_collapse: node_editor.NodeCollapseOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -180,6 +183,7 @@ const Binding = struct {
             .distribution_snap = self.distribution_snap,
             .box_select_scope = self.box_select_scope,
             .spatial_navigation = self.spatial_navigation,
+            .node_collapse = self.node_collapse,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -235,6 +239,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .distribution_snap = options.distribution_snap,
         .box_select_scope = options.box_select_scope,
         .spatial_navigation = options.spatial_navigation,
+        .node_collapse = options.node_collapse,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -297,6 +302,7 @@ const InteractionSnapshot = struct {
     pan: [2]f32 = .{ 0.0, 0.0 },
     zoom: f32 = 1.0,
     node_drag_applied_delta: [2]f32 = .{ 0.0, 0.0 },
+    node_collapse_mutation_count: u64 = 0,
     non_node_structural_drag: bool = false,
 
     fn capture(state: *const node_editor.State) InteractionSnapshot {
@@ -304,6 +310,7 @@ const InteractionSnapshot = struct {
             .pan = state.pan,
             .zoom = state.zoom,
             .node_drag_applied_delta = state.node_drag_applied_delta,
+            .node_collapse_mutation_count = state.node_collapse_mutation_count,
             .non_node_structural_drag = state.dragging_group_id != null or
                 state.resizing_group_id != null or
                 state.resizing_group_edges.any() or
@@ -320,7 +327,8 @@ const InteractionSnapshot = struct {
 
     fn nodeGeometryChanged(self: InteractionSnapshot, state: *const node_editor.State) bool {
         return @abs(self.node_drag_applied_delta[0] - state.node_drag_applied_delta[0]) > 0.001 or
-            @abs(self.node_drag_applied_delta[1] - state.node_drag_applied_delta[1]) > 0.001;
+            @abs(self.node_drag_applied_delta[1] - state.node_drag_applied_delta[1]) > 0.001 or
+            self.node_collapse_mutation_count != state.node_collapse_mutation_count;
     }
 };
 
@@ -376,6 +384,50 @@ test "node editor view builds on zui custom paint primitives" {
     var event = ElementEvent{ .mouse_down = .{ .button = .left, .x = click[0], .y = click[1] } };
     try std.testing.expect(nodeEditorViewEvent(node, &event, node.paint_user_data));
     try std.testing.expectEqual(@as(?u32, 1), state.selected_node_id);
+}
+
+test "node editor view double-clicks titles to collapse with one undo" {
+    var selected = [_]u32{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes = [_]node_editor.Node{.{ .id = 1, .title = "Fold me", .pos = .{ -60, -50 }, .size = .{ .w = 120, .h = 100 }, .input_count = 2, .output_count = 2 }};
+    var node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = undefined;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var canvas_state = zui.CanvasState{};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 320, .h = 200 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 320, .h = 200 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9432,
+        .canvas_state = &canvas_state,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .history = &history,
+        .viewport_index = &viewport_index,
+        .node_collapse = .{ .enabled = true },
+        .show_minimap = false,
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 320, .h = 200 };
+    try std.testing.expect(node_editor.prepareNodeEditorViewportIndex(editor_node.rect, node_editor.Options(node_editor.State){ .state = &state, .nodes = &nodes, .viewport_index = &viewport_index, .show_minimap = false }) != null);
+    const title = node_editor.nodeTitleRectFromState(editor_node.rect, state, nodes[0]);
+    var double_click = ElementEvent{ .mouse_down = .{ .button = .left, .x = title.x + 20, .y = title.y + 12, .click_count = 2 } };
+
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &double_click, editor_node.paint_user_data));
+    try std.testing.expect(nodes[0].collapsed);
+    try std.testing.expectEqual(@as(?u32, null), state.dragging_node_id);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(!viewport_index.summary().valid);
+    try std.testing.expect(canvas_state.dirtySummary().invalidation.contains(.data));
+
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expect(!nodes[0].collapsed);
 }
 
 test "node editor view drags mutable nodes" {

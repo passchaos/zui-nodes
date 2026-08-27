@@ -9,6 +9,7 @@ const menu_mod = zui.ui_menu;
 const graph_layout = @import("graph_layout.zig");
 const graph_validation = @import("graph_validation.zig");
 const graph_topology = @import("graph_topology.zig");
+const node_geometry = @import("node_geometry.zig");
 const node_navigation = @import("node_navigation.zig");
 const viewport_types = @import("node_viewport.zig").Types(Node, Group, Connection, Rect);
 
@@ -297,6 +298,11 @@ pub const SpatialNavigationOptions = struct {
     viewport_padding: f32 = 16.0,
 };
 
+pub const NodeCollapseOptions = struct {
+    enabled: bool = false,
+    show_indicator: bool = true,
+};
+
 pub const Node = struct {
     id: u32,
     title: []const u8,
@@ -309,6 +315,10 @@ pub const Node = struct {
     output_labels: []const []const u8 = &.{},
     input_types: []const PortType = &.{},
     output_types: []const PortType = &.{},
+    /// Collapsing preserves `size` and uses `collapsed_height` as the compact
+    /// graph geometry so expanding restores the exact authored dimensions.
+    collapsed: bool = false,
+    collapsed_height: f32 = 32.0,
 };
 
 pub const NodeTemplate = struct {
@@ -321,6 +331,8 @@ pub const NodeTemplate = struct {
     output_labels: []const []const u8 = &.{},
     input_types: []const PortType = &.{},
     output_types: []const PortType = &.{},
+    collapsed: bool = false,
+    collapsed_height: f32 = 32.0,
 };
 
 pub const ChainTemplate = struct {
@@ -486,6 +498,7 @@ pub fn Options(comptime StateType: type) type {
         distribution_snap: DistributionSnapOptions = .{},
         box_select_scope: BoxSelectScope = .nodes_only,
         spatial_navigation: SpatialNavigationOptions = .{},
+        node_collapse: NodeCollapseOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -549,8 +562,13 @@ pub fn screenToGraph(rect: Rect, state: anytype, point: [2]f32) [2]f32 {
     };
 }
 
+pub fn nodeEffectiveSize(node: Node) Size {
+    return node_geometry.effectiveSize(node);
+}
+
 pub fn nodeGraphRect(node: Node) Rect {
-    return .{ .x = node.pos[0], .y = node.pos[1], .w = node.size.w, .h = node.size.h };
+    const size = nodeEffectiveSize(node);
+    return .{ .x = node.pos[0], .y = node.pos[1], .w = size.w, .h = size.h };
 }
 
 pub fn defaultInsertPosition(nodes: []const Node) [2]f32 {
@@ -599,8 +617,9 @@ pub fn graphPointFromMinimap(minimap: Rect, bounds: Rect, point: [2]f32) [2]f32 
 }
 
 pub fn minimapNodeRect(minimap: Rect, bounds: Rect, node: Node) Rect {
+    const size = nodeEffectiveSize(node);
     const p0 = minimapPoint(minimap, bounds, node.pos);
-    const p1 = minimapPoint(minimap, bounds, .{ node.pos[0] + node.size.w, node.pos[1] + node.size.h });
+    const p1 = minimapPoint(minimap, bounds, .{ node.pos[0] + size.w, node.pos[1] + size.h });
     return .{ .x = p0[0], .y = p0[1], .w = @max(1.5, p1[0] - p0[0]), .h = @max(1.5, p1[1] - p0[1]) };
 }
 
@@ -681,12 +700,19 @@ pub fn resizeGroupRect(origin: Rect, edges: GroupResizeEdges, delta: [2]f32, min
 
 pub fn nodeRectFromState(rect: Rect, state: anytype, node: Node) Rect {
     const top_left = graphToScreen(rect, state, node.pos);
+    const size = nodeEffectiveSize(node);
     return .{
         .x = top_left[0],
         .y = top_left[1],
-        .w = node.size.w * state.zoom,
-        .h = node.size.h * state.zoom,
+        .w = size.w * state.zoom,
+        .h = size.h * state.zoom,
     };
+}
+
+pub fn nodeTitleRectFromState(rect: Rect, state: anytype, node: Node) Rect {
+    const node_rect = nodeRectFromState(rect, state, node);
+    const title_height = if (std.math.isFinite(node.collapsed_height)) @max(1.0, node.collapsed_height) else 32.0;
+    return .{ .x = node_rect.x, .y = node_rect.y, .w = node_rect.w, .h = @min(node_rect.h, title_height * state.zoom) };
 }
 
 pub fn groupRect(rect: Rect, state: anytype, group: Group) Rect {
@@ -705,7 +731,7 @@ pub fn inputPortPosition(rect: Rect, state: anytype, node: Node) [2]f32 {
 
 pub fn inputPortPositionAt(rect: Rect, state: anytype, node: Node, port_index: u8) [2]f32 {
     const node_rect = nodeRectFromState(rect, state, node);
-    return .{ node_rect.x, portY(node_rect, inputPortCount(node), port_index) };
+    return .{ node_rect.x, if (node.collapsed) node_rect.y + node_rect.h * 0.5 else portY(node_rect, inputPortCount(node), port_index) };
 }
 
 pub fn outputPortPosition(rect: Rect, state: anytype, node: Node) [2]f32 {
@@ -714,7 +740,7 @@ pub fn outputPortPosition(rect: Rect, state: anytype, node: Node) [2]f32 {
 
 pub fn outputPortPositionAt(rect: Rect, state: anytype, node: Node, port_index: u8) [2]f32 {
     const node_rect = nodeRectFromState(rect, state, node);
-    return .{ node_rect.x + node_rect.w, portY(node_rect, outputPortCount(node), port_index) };
+    return .{ node_rect.x + node_rect.w, if (node.collapsed) node_rect.y + node_rect.h * 0.5 else portY(node_rect, outputPortCount(node), port_index) };
 }
 
 pub fn inputPortCount(node: Node) u8 {
@@ -877,6 +903,8 @@ pub fn nodeFromTemplate(template: NodeTemplate, id: u32, pos: [2]f32) Node {
         .output_labels = template.output_labels,
         .input_types = template.input_types,
         .output_types = template.output_types,
+        .collapsed = template.collapsed,
+        .collapsed_height = template.collapsed_height,
     };
 }
 
@@ -928,6 +956,7 @@ pub fn portHit(pos: [2]f32, point: [2]f32) bool {
 
 pub fn inputPortAtPoint(rect: Rect, state: anytype, nodes: []const Node, point: [2]f32) ?PortHit {
     for (nodes, 0..) |node, index| {
+        if (node.collapsed) continue;
         var port_index: u8 = 0;
         while (port_index < inputPortCount(node)) : (port_index += 1) {
             if (portHit(inputPortPositionAt(rect, state, node, port_index), point)) return .{ .node_index = index, .port_index = port_index };
@@ -938,6 +967,7 @@ pub fn inputPortAtPoint(rect: Rect, state: anytype, nodes: []const Node, point: 
 
 pub fn outputPortAtPoint(rect: Rect, state: anytype, nodes: []const Node, point: [2]f32) ?PortHit {
     for (nodes, 0..) |node, index| {
+        if (node.collapsed) continue;
         var port_index: u8 = 0;
         while (port_index < outputPortCount(node)) : (port_index += 1) {
             if (portHit(outputPortPositionAt(rect, state, node, port_index), point)) return .{ .node_index = index, .port_index = port_index };
@@ -1213,9 +1243,7 @@ pub fn groupResizeAtPoint(rect: Rect, state: anytype, groups: []const Group, mar
 }
 
 pub fn nodeInsideGraphRect(node: Node, rect: Rect) bool {
-    return node.pos[0] >= rect.x and node.pos[1] >= rect.y and
-        node.pos[0] + node.size.w <= rect.x + rect.w and
-        node.pos[1] + node.size.h <= rect.y + rect.h;
+    return rectContainsRect(rect, nodeGraphRect(node));
 }
 
 pub const ConnectionPath = struct {
@@ -1417,8 +1445,10 @@ const DistributeSortContext = struct {
 fn distributeLessThan(context: DistributeSortContext, a_index: usize, b_index: usize) bool {
     const a = context.nodes[a_index];
     const b = context.nodes[b_index];
-    const a_center = if (context.horizontal) a.pos[0] + a.size.w * 0.5 else a.pos[1] + a.size.h * 0.5;
-    const b_center = if (context.horizontal) b.pos[0] + b.size.w * 0.5 else b.pos[1] + b.size.h * 0.5;
+    const a_size = nodeEffectiveSize(a);
+    const b_size = nodeEffectiveSize(b);
+    const a_center = if (context.horizontal) a.pos[0] + a_size.w * 0.5 else a.pos[1] + a_size.h * 0.5;
+    const b_center = if (context.horizontal) b.pos[0] + b_size.w * 0.5 else b.pos[1] + b_size.h * 0.5;
     if (@abs(a_center - b_center) > 0.001) return a_center < b_center;
     return a.id < b.id;
 }
@@ -1488,6 +1518,7 @@ pub const State = struct {
     navigation_rejected_count: u64 = 0,
     navigation_topology_hit_count: u64 = 0,
     navigation_spatial_fallback_count: u64 = 0,
+    node_collapse_mutation_count: u64 = 0,
     dragging_minimap: bool = false,
     minimap_drag_offset: [2]f32 = .{ 0.0, 0.0 },
     context_menu: ContextMenuState = .{},
@@ -1999,6 +2030,55 @@ pub const State = struct {
             => self.distributeSelectedNodes(nodes[0..count], command),
             else => false,
         };
+    }
+
+    pub fn canSetSelectedNodesCollapsed(self: *const State, nodes: []const Node, node_len: usize, collapsed: bool) bool {
+        for (nodes[0..@min(node_len, nodes.len)]) |node| {
+            if (self.isNodeSelected(node.id) and node.collapsed != collapsed) return true;
+        }
+        return false;
+    }
+
+    pub fn canToggleSelectedNodesCollapsed(self: *const State, nodes: []const Node, node_len: usize) bool {
+        return self.selectedNodeStorageCount(nodes, node_len) > 0;
+    }
+
+    pub fn selectedNodesAllCollapsed(self: *const State, nodes: []const Node, node_len: usize) bool {
+        var found = false;
+        for (nodes[0..@min(node_len, nodes.len)]) |node| {
+            if (!self.isNodeSelected(node.id)) continue;
+            found = true;
+            if (!node.collapsed) return false;
+        }
+        return found;
+    }
+
+    pub fn setSelectedNodesCollapsed(self: *State, nodes: []Node, node_len: usize, collapsed: bool) bool {
+        var changed = false;
+        for (nodes[0..@min(node_len, nodes.len)]) |*node| {
+            if (!self.isNodeSelected(node.id) or node.collapsed == collapsed) continue;
+            node.collapsed = collapsed;
+            changed = true;
+        }
+        if (changed) self.node_collapse_mutation_count +%= 1;
+        return changed;
+    }
+
+    /// Mixed selections collapse together; an already fully-collapsed
+    /// selection expands together. This keeps one toggle deterministic.
+    pub fn toggleSelectedNodesCollapsed(self: *State, nodes: []Node, node_len: usize) bool {
+        if (!self.canToggleSelectedNodesCollapsed(nodes, node_len)) return false;
+        return self.setSelectedNodesCollapsed(nodes, node_len, !self.selectedNodesAllCollapsed(nodes, node_len));
+    }
+
+    pub fn toggleNodeCollapsed(self: *State, nodes: []Node, node_len: usize, id: u32) bool {
+        for (nodes[0..@min(node_len, nodes.len)]) |*node| {
+            if (node.id != id) continue;
+            node.collapsed = !node.collapsed;
+            self.node_collapse_mutation_count +%= 1;
+            return true;
+        }
+        return false;
     }
 
     pub fn canInsertNodeTemplate(_: *const State, nodes: []const Node, node_len: usize) bool {
@@ -2988,13 +3068,14 @@ pub const State = struct {
         var target: f32 = 0.0;
         for (nodes) |node| {
             if (!self.isNodeSelected(node.id)) continue;
+            const size = nodeEffectiveSize(node);
             const value = switch (command) {
                 .align_left => node.pos[0],
-                .align_center_x => node.pos[0] + node.size.w * 0.5,
-                .align_right => node.pos[0] + node.size.w,
+                .align_center_x => node.pos[0] + size.w * 0.5,
+                .align_right => node.pos[0] + size.w,
                 .align_top => node.pos[1],
-                .align_center_y => node.pos[1] + node.size.h * 0.5,
-                .align_bottom => node.pos[1] + node.size.h,
+                .align_center_y => node.pos[1] + size.h * 0.5,
+                .align_bottom => node.pos[1] + size.h,
                 else => return false,
             };
             if (!initialized) {
@@ -3017,13 +3098,14 @@ pub const State = struct {
         for (nodes) |*node| {
             if (!self.isNodeSelected(node.id)) continue;
             const before = node.pos;
+            const size = nodeEffectiveSize(node.*);
             switch (command) {
                 .align_left => node.pos[0] = target,
-                .align_center_x => node.pos[0] = target - node.size.w * 0.5,
-                .align_right => node.pos[0] = target - node.size.w,
+                .align_center_x => node.pos[0] = target - size.w * 0.5,
+                .align_right => node.pos[0] = target - size.w,
                 .align_top => node.pos[1] = target,
-                .align_center_y => node.pos[1] = target - node.size.h * 0.5,
-                .align_bottom => node.pos[1] = target - node.size.h,
+                .align_center_y => node.pos[1] = target - size.h * 0.5,
+                .align_bottom => node.pos[1] = target - size.h,
                 else => return false,
             }
             changed = changed or @abs(before[0] - node.pos[0]) > 0.001 or @abs(before[1] - node.pos[1]) > 0.001;
@@ -3048,8 +3130,10 @@ pub const State = struct {
         std.mem.sort(usize, order[0..order_len], DistributeSortContext{ .nodes = nodes, .horizontal = horizontal }, distributeLessThan);
         const first = nodes[order[0]];
         const last = nodes[order[order_len - 1]];
-        const first_center = if (horizontal) first.pos[0] + first.size.w * 0.5 else first.pos[1] + first.size.h * 0.5;
-        const last_center = if (horizontal) last.pos[0] + last.size.w * 0.5 else last.pos[1] + last.size.h * 0.5;
+        const first_size = nodeEffectiveSize(first);
+        const last_size = nodeEffectiveSize(last);
+        const first_center = if (horizontal) first.pos[0] + first_size.w * 0.5 else first.pos[1] + first_size.h * 0.5;
+        const last_center = if (horizontal) last.pos[0] + last_size.w * 0.5 else last.pos[1] + last_size.h * 0.5;
         const step = (last_center - first_center) / @as(f32, @floatFromInt(order_len - 1));
         var changed = false;
         for (order[0..order_len], 0..) |node_index, rank| {
@@ -3057,10 +3141,11 @@ pub const State = struct {
             const target_center = first_center + step * @as(f32, @floatFromInt(rank));
             const node = &nodes[node_index];
             const before = node.pos;
+            const size = nodeEffectiveSize(node.*);
             if (horizontal) {
-                node.pos[0] = target_center - node.size.w * 0.5;
+                node.pos[0] = target_center - size.w * 0.5;
             } else {
-                node.pos[1] = target_center - node.size.h * 0.5;
+                node.pos[1] = target_center - size.h * 0.5;
             }
             changed = changed or @abs(before[0] - node.pos[0]) > 0.001 or @abs(before[1] - node.pos[1]) > 0.001;
         }
@@ -3956,6 +4041,11 @@ fn editorSpatialNavigationOptions(editor: anytype) SpatialNavigationOptions {
     return if (@hasField(Editor, "spatial_navigation")) editor.spatial_navigation else .{};
 }
 
+fn editorNodeCollapseOptions(editor: anytype) NodeCollapseOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "node_collapse")) editor.node_collapse else .{};
+}
+
 fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: anytype, viewport_index: ?*ViewportIndex, direction: NodeNavigationDirection) bool {
     const options = editorSpatialNavigationOptions(editor);
     if (!options.enabled or input.control_down or input.super_down or input.alt_down) return false;
@@ -4182,6 +4272,19 @@ fn appendNodeEditorNode(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCm
     try paint_primitives.appendBorder(allocator, out, node_rect, if (selected) editor.selected_color else editor.grid_color.withAlpha(0.8), if (selected) 2.0 else 1.0, 7.0, layer + 4);
     if (detail_level == .overview) return;
     try out.append(allocator, .{ .text = .{ .pos = .{ node_rect.x + 10.0, node_rect.y + 8.0 }, .size = editor.font_size, .color = editor.node_text_color, .text = node_item.title, .layer = layer + 5 } });
+    const collapse_options = editorNodeCollapseOptions(editor);
+    if ((node_item.collapsed or collapse_options.enabled) and collapse_options.show_indicator) {
+        const center = [2]f32{ node_rect.x + node_rect.w - 13.0, node_rect.y + @min(node_rect.h, node_item.collapsed_height * editor.state.zoom) * 0.5 };
+        const extent = @max(2.5, @min(4.0, 4.0 * editor.state.zoom));
+        if (node_item.collapsed) {
+            try out.append(allocator, .{ .line = .{ .a = .{ center[0] - extent * 0.5, center[1] - extent }, .b = .{ center[0] + extent * 0.5, center[1] }, .thickness = 1.5, .color = editor.node_text_color.withAlpha(0.8), .layer = layer + 6 } });
+            try out.append(allocator, .{ .line = .{ .a = .{ center[0] + extent * 0.5, center[1] }, .b = .{ center[0] - extent * 0.5, center[1] + extent }, .thickness = 1.5, .color = editor.node_text_color.withAlpha(0.8), .layer = layer + 6 } });
+        } else {
+            try out.append(allocator, .{ .line = .{ .a = .{ center[0] - extent, center[1] - extent * 0.5 }, .b = .{ center[0], center[1] + extent * 0.5 }, .thickness = 1.5, .color = editor.node_text_color.withAlpha(0.8), .layer = layer + 6 } });
+            try out.append(allocator, .{ .line = .{ .a = .{ center[0], center[1] + extent * 0.5 }, .b = .{ center[0] + extent, center[1] - extent * 0.5 }, .thickness = 1.5, .color = editor.node_text_color.withAlpha(0.8), .layer = layer + 6 } });
+        }
+    }
+    if (node_item.collapsed) return;
     var input_port_index: u8 = 0;
     while (input_port_index < inputPortCount(node_item)) : (input_port_index += 1) {
         const in_port = inputPortPositionAt(rect, editor.state.*, node_item, input_port_index);
@@ -4289,6 +4392,7 @@ fn appendSpacingGuide(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd)
 }
 
 fn appendNodeEditorPortOverlay(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, node_item: Node, layer: i32) !void {
+    if (node_item.collapsed) return;
     const node_rect = nodeRectFromElement(rect, editor, node_item);
     if (!rectOverlapsOrTouches(node_rect, rect)) return;
     var input_port_index: u8 = 0;
@@ -5279,6 +5383,20 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                     return editor.state.beginMinimapDrag(rect, snapshot, point);
                 }
             }
+            if (m.click_count == 2 and editorNodeCollapseOptions(editor).enabled) {
+                const point = [2]f32{ m.x, m.y };
+                if (nodeAtEditorPoint(rect, editor, viewport_index, point)) |index| {
+                    const node = editor.nodes[index];
+                    if (nodeTitleRectFromState(rect, editor.state.*, node).contains(point)) {
+                        const nodes = editor.mutable_nodes orelse return false;
+                        const node_len = if (editor.mutable_node_len) |len| @min(len.*, nodes.len) else @min(editor.nodes.len, nodes.len);
+                        _ = editor.state.endDrag();
+                        const mutation = beginEditorHistory(editor) orelse return false;
+                        _ = editor.state.setSingleSelection(node.id);
+                        return finishEditorHistory(editor, mutation, editor.state.toggleNodeCollapsed(nodes, node_len, node.id));
+                    }
+                }
+            }
             if (editor.state.selected_connection) |selected_connection| {
                 if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
                     const connection = editor.state.selectedConnectionAtEndpoint(.from, editor.nodes[hit.node_index].id, hit.port_index) orelse selected_connection;
@@ -5962,6 +6080,55 @@ test "NodeEditor viewport index safe invalidation and undersized fallback stay c
     try std.testing.expect(prepareNodeEditorViewportIndex(viewport, fallback_editor) == null);
     const point = graphToScreen(viewport, state, .{ 0, 0 });
     try std.testing.expectEqual(nodeAtPoint(viewport, state, &nodes, point), nodeAtEditorPoint(viewport, fallback_editor, null, point));
+}
+
+test "collapsed nodes use compact bounds and shared connection anchors" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 500, .h = 300 };
+    const state = State{};
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "source", .pos = .{ -160, -60 }, .size = .{ .w = 120, .h = 140 }, .output_count = 3, .collapsed = true, .collapsed_height = 30 },
+        .{ .id = 2, .title = "sink", .pos = .{ 80, -40 }, .size = .{ .w = 100, .h = 100 }, .input_count = 3 },
+    };
+    const compact = nodeGraphRect(nodes[0]);
+    try std.testing.expectEqual(@as(f32, 30), compact.h);
+    const out0 = outputPortPositionAt(viewport, state, nodes[0], 0);
+    const out2 = outputPortPositionAt(viewport, state, nodes[0], 2);
+    try std.testing.expectEqual(out0, out2);
+    try std.testing.expectEqual(@as(?PortHit, null), outputPortAtPoint(viewport, state, &nodes, out0));
+    const in0 = inputPortPositionAt(viewport, state, nodes[1], 0);
+    const in2 = inputPortPositionAt(viewport, state, nodes[1], 2);
+    try std.testing.expect(in0[1] != in2[1]);
+    try std.testing.expectEqual(@as(?PortHit, .{ .node_index = 1, .port_index = 2 }), inputPortAtPoint(viewport, state, &nodes, in2));
+}
+
+test "collapsed node paint omits ambiguous ports and keeps disclosure indicator" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 320, .h = 200 };
+    var state = State{};
+    const nodes = [_]Node{.{
+        .id = 1,
+        .title = "compact",
+        .pos = .{ -60, -40 },
+        .size = .{ .w = 120, .h = 100 },
+        .input_count = 3,
+        .output_count = 2,
+        .collapsed = true,
+    }};
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .node_collapse = .{ .enabled = true }, .show_minimap = false, .grid_color = Color.transparent };
+    var out = std.ArrayList(DrawCmd).empty;
+    defer {
+        for (out.items) |command| draw_cmd.freePayload(std.testing.allocator, command);
+        out.deinit(std.testing.allocator);
+    }
+    _ = try appendNodeEditor(std.testing.allocator, &out, viewport, editor, 0);
+    var point_count: usize = 0;
+    var line_count: usize = 0;
+    for (out.items) |command| switch (command) {
+        .point => point_count += 1,
+        .line => line_count += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 0), point_count);
+    try std.testing.expect(line_count >= 2);
 }
 
 test "NodeEditor mutable connections replace static connections in paint and hit paths" {

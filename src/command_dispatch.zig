@@ -36,6 +36,7 @@ pub const CommandContext = struct {
     duplicate_offset: [2]f32 = .{ 32.0, 24.0 },
     connection_policy: node_editor.ConnectionPolicy = .default,
     topology_index: ?*graph_topology.Index = null,
+    viewport_index: ?*node_editor.ViewportIndex = null,
     layout_workspace: ?graph_layout.LayeredLayoutWorkspace = null,
     layout_options: graph_layout.LayeredLayoutOptions = .{},
 };
@@ -43,7 +44,7 @@ pub const CommandContext = struct {
 pub fn commandFromId(command_id: CommandId) ?NodeEditorCommand {
     if (command_id < commands.node_editor_command_id_base) return null;
     const raw = command_id - commands.node_editor_command_id_base;
-    if (raw > @intFromEnum(NodeEditorCommand.auto_layout_layered)) return null;
+    if (raw > @intFromEnum(NodeEditorCommand.expand_selected_nodes)) return null;
     return @enumFromInt(raw);
 }
 
@@ -115,6 +116,9 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .reconnect_to_previous => context.connection_len != null and context.state.canReconnectSelectedConnectionToPreviousNodeWithPolicy(context.connections, connection_count, context.nodes, node_count, context.connection_policy),
         .reconnect_to_next => context.connection_len != null and context.state.canReconnectSelectedConnectionToNextNodeWithPolicy(context.connections, connection_count, context.nodes, node_count, context.connection_policy),
         .auto_layout_layered => context.layout_workspace != null and graph_layout.canLayoutLayered(context.nodes, node_count, context.connections[0..connection_count], context.layout_workspace.?, layoutOptions(context)),
+        .toggle_selected_nodes_collapsed => context.state.canToggleSelectedNodesCollapsed(context.nodes, node_count),
+        .collapse_selected_nodes => context.state.canSetSelectedNodesCollapsed(context.nodes, node_count, true),
+        .expand_selected_nodes => context.state.canSetSelectedNodesCollapsed(context.nodes, node_count, false),
     };
 }
 
@@ -156,6 +160,9 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .reconnect_to_previous => reconnectPrevious(context),
         .reconnect_to_next => reconnectNext(context),
         .auto_layout_layered => autoLayoutLayered(context),
+        .toggle_selected_nodes_collapsed => setSelectedNodesCollapsed(context, null),
+        .collapse_selected_nodes => setSelectedNodesCollapsed(context, true),
+        .expand_selected_nodes => setSelectedNodesCollapsed(context, false),
     };
 }
 
@@ -185,6 +192,7 @@ pub fn dispatchHistory(context: *CommandContext, command: HistoryCommand) bool {
     };
     if (changed) {
         if (context.topology_index) |topology| topology.invalidate();
+        if (context.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
     }
     return changed;
 }
@@ -276,6 +284,9 @@ pub fn canRecordNodeEditorCommand(context: *const CommandContext, command: NodeE
         .reconnect_to_previous,
         .reconnect_to_next,
         .auto_layout_layered,
+        .toggle_selected_nodes_collapsed,
+        .collapse_selected_nodes,
+        .expand_selected_nodes,
         => canRecordHistory(context),
         else => true,
     };
@@ -424,6 +435,17 @@ fn autoLayoutLayered(context: *CommandContext) bool {
     const history_mutation = beginHistoryMutation(context) orelse return false;
     const result = graph_layout.layoutLayered(context.nodes, activeNodeCount(context), context.connections[0..activeConnectionCount(context)], workspace, layoutOptions(context));
     return finishHistoryMutation(history_mutation, result.changed());
+}
+
+fn setSelectedNodesCollapsed(context: *CommandContext, collapsed: ?bool) bool {
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    const changed = if (collapsed) |value|
+        context.state.setSelectedNodesCollapsed(context.nodes, activeNodeCount(context), value)
+    else
+        context.state.toggleSelectedNodesCollapsed(context.nodes, activeNodeCount(context));
+    const committed = finishHistoryMutation(history_mutation, changed);
+    if (committed) if (context.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
+    return committed;
 }
 
 fn finishHistoryMutation(mutation: HistoryMutation, changed: bool) bool {
@@ -991,4 +1013,58 @@ test "zui-nodes selection dispatch duplicates, deletes, and records history" {
     try std.testing.expect(dispatchSelectionId(&ctx, SelectionCommand.delete.commandId()));
     try std.testing.expectEqual(@as(usize, 2), node_len);
     try std.testing.expectEqual(@as(usize, 0), connection_len);
+}
+
+test "zui-nodes collapse commands batch one undo and invalidate geometry only" {
+    var selected = [_]u32{ 1, 2, 0, 0 };
+    var state = node_editor.State{ .selected_node_ids = &selected, .selected_node_len = 2, .selected_node_id = 2 };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 }, .size = .{ .w = 120, .h = 96 } },
+        .{ .id = 2, .title = "B", .pos = .{ 180, 0 }, .size = .{ .w = 120, .h = 96 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = undefined;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    try std.testing.expect(viewport_index.prepare(&nodes, &.{}, connections[0..0], .{ .x = 0, .y = 0, .w = 640, .h = 360 }, .{ 0, 0 }, 1).ready);
+    var context = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .history = &history,
+        .viewport_index = &viewport_index,
+    };
+
+    try std.testing.expect(dispatch(&context, .collapse_selected_nodes));
+    try std.testing.expect(nodes[0].collapsed and nodes[1].collapsed);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(!viewport_index.summary().valid);
+    try std.testing.expect(!canDispatch(&context, .collapse_selected_nodes));
+    try std.testing.expect(canDispatch(&context, .expand_selected_nodes));
+
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expect(!nodes[0].collapsed and !nodes[1].collapsed);
+    try std.testing.expect(!viewport_index.summary().valid);
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expect(nodes[0].collapsed and nodes[1].collapsed);
+}
+
+test "zui-nodes collapse command rejects insufficient history atomically" {
+    var selected = [_]u32{0} ** 24;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [17]node_editor.Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{ .id = @intCast(index + 1), .title = "node", .pos = .{ @floatFromInt(index), 0 } };
+    var node_len: usize = nodes.len;
+    var history = node_editor.History{};
+    _ = state.selectAllNodes(&nodes, node_len);
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .history = &history };
+
+    try std.testing.expect(!canDispatch(&context, .collapse_selected_nodes));
+    try std.testing.expect(!dispatch(&context, .collapse_selected_nodes));
+    for (nodes) |node| try std.testing.expect(!node.collapsed);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
 }
