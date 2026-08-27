@@ -87,6 +87,7 @@ pub const NodeEditorViewOptions = struct {
     minimap_max_group_marks: usize = 128,
     semantic_zoom: node_editor.SemanticZoomOptions = .{},
     drag_auto_pan: node_editor.DragAutoPanOptions = .{},
+    drag_snap: node_editor.DragSnapOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -126,6 +127,7 @@ const Binding = struct {
     minimap_max_group_marks: usize = 128,
     semantic_zoom: node_editor.SemanticZoomOptions = .{},
     drag_auto_pan: node_editor.DragAutoPanOptions = .{},
+    drag_snap: node_editor.DragSnapOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -158,6 +160,7 @@ const Binding = struct {
             .minimap_max_group_marks = self.minimap_max_group_marks,
             .semantic_zoom = self.semantic_zoom,
             .drag_auto_pan = self.drag_auto_pan,
+            .drag_snap = self.drag_snap,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -204,6 +207,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .minimap_max_group_marks = options.minimap_max_group_marks,
         .semantic_zoom = options.semantic_zoom,
         .drag_auto_pan = options.drag_auto_pan,
+        .drag_snap = options.drag_snap,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -265,14 +269,15 @@ fn nodeEditorCanvasHitTest(node: *const ElementNode, point: [2]f32, user_data: ?
 const InteractionSnapshot = struct {
     pan: [2]f32 = .{ 0.0, 0.0 },
     zoom: f32 = 1.0,
-    structural_drag: bool = false,
+    node_drag_applied_delta: [2]f32 = .{ 0.0, 0.0 },
+    non_node_structural_drag: bool = false,
 
     fn capture(state: *const node_editor.State) InteractionSnapshot {
         return .{
             .pan = state.pan,
             .zoom = state.zoom,
-            .structural_drag = state.dragging_node_id != null or
-                state.dragging_group_id != null or
+            .node_drag_applied_delta = state.node_drag_applied_delta,
+            .non_node_structural_drag = state.dragging_group_id != null or
                 state.resizing_group_id != null or
                 state.resizing_group_edges.any() or
                 state.dragging_connection_from_id != null or
@@ -286,11 +291,17 @@ const InteractionSnapshot = struct {
             @abs(self.pan[1] - state.pan[1]) > 0.001 or
             @abs(self.zoom - state.zoom) > 0.0001;
     }
+
+    fn nodeGeometryChanged(self: InteractionSnapshot, state: *const node_editor.State) bool {
+        return @abs(self.node_drag_applied_delta[0] - state.node_drag_applied_delta[0]) > 0.001 or
+            @abs(self.node_drag_applied_delta[1] - state.node_drag_applied_delta[1]) > 0.001;
+    }
 };
 
 fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, before: InteractionSnapshot, changed: bool) void {
     if (!changed) return;
-    const geometry_changed = before.structural_drag or binding.state.dragging_node_id != null or binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.reconnecting_connection != null;
+    const geometry_changed = before.nodeGeometryChanged(binding.state) or before.non_node_structural_drag or
+        binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.reconnecting_connection != null;
     if (geometry_changed) {
         if (binding.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
     }
@@ -455,6 +466,165 @@ test "node editor view shift-selects and drags multi-selection as one undo trans
     try std.testing.expect(nodeEditorViewEvent(editor_node, &third_toggle, editor_node.paint_user_data));
     try std.testing.expectEqual(@as(usize, 0), state.boundedSelectionLen());
     try std.testing.expectEqual(@as(?u32, null), state.dragging_node_id);
+}
+
+test "node editor view snaps multi-drag at zoom and Alt bypasses without splitting undo" {
+    var selected = [_]u32{ 1, 2, 0, 0 };
+    var state = node_editor.State{
+        .selected_node_ids = &selected,
+        .selected_node_len = 2,
+        .selected_node_id = 1,
+        .zoom = 2,
+    };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ 1, 1 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 101, 51 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    const before = nodes;
+    const relative_before = [2]f32{ before[1].pos[0] - before[0].pos[0], before[1].pos[1] - before[0].pos[1] };
+    var node_len: usize = nodes.len;
+    var connections: [0]node_editor.Connection = .{};
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 500, .h = 260 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 500, .h = 260 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9420,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .history = &history,
+        .viewport_index = &viewport_index,
+        .drag_auto_pan = .{ .enabled = false },
+        .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 6 },
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 500 }, .height = .{ .px = 260 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 500, .h = 260 };
+    const anchor = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    const start = [2]f32{ anchor.x + 20, anchor.y + 20 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+
+    var snap_move = ElementEvent{ .mouse_move = .{ .x = start[0] + 4, .y = start[1] + 4, .dx = 4, .dy = 4 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &snap_move, editor_node.paint_user_data));
+    try std.testing.expectEqual([2]f32{ 0, 0 }, nodes[0].pos);
+    try std.testing.expectEqual([2]f32{ 100, 50 }, nodes[1].pos);
+    try std.testing.expectEqual(@as(?f32, 0), state.snap_guide_x);
+    try std.testing.expectEqual(@as(?f32, 0), state.snap_guide_y);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+
+    editor_node.input_alt_down = true;
+    var bypass = ElementEvent{ .mouse_move = .{ .x = start[0] + 4, .y = start[1] + 4, .dx = 0, .dy = 0 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &bypass, editor_node.paint_user_data));
+    try std.testing.expectEqual([2]f32{ 3, 3 }, nodes[0].pos);
+    try std.testing.expectEqual(@as(?f32, null), state.snap_guide_x);
+    try std.testing.expectEqual(@as(?f32, null), state.snap_guide_y);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+
+    editor_node.input_alt_down = false;
+    var restore_snap = ElementEvent{ .mouse_move = .{ .x = start[0] + 4, .y = start[1] + 4, .dx = 0, .dy = 0 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &restore_snap, editor_node.paint_user_data));
+    try std.testing.expectEqual([2]f32{ 0, 0 }, nodes[0].pos);
+    try std.testing.expectEqual(relative_before, [2]f32{ nodes[1].pos[0] - nodes[0].pos[0], nodes[1].pos[1] - nodes[0].pos[1] });
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = start[0] + 4, .y = start[1] + 4 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?f32, null), state.snap_guide_x);
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expectEqual(before, nodes);
+}
+
+test "node editor snap guides repaint without invalidating geometry" {
+    var selected = [_]u32{ 1, 0, 0, 0 };
+    var state = node_editor.State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+    var nodes = [_]node_editor.Node{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }};
+    var history = node_editor.History{};
+    var canvas_state = zui.CanvasState{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, 0){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 360, .h = 220 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 360, .h = 220 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9421,
+        .canvas_state = &canvas_state,
+        .viewport_index = &viewport_index,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .history = &history,
+        .drag_auto_pan = .{ .enabled = false },
+        .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 6 },
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 340 }, .height = .{ .px = 200 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 340, .h = 200 };
+    const anchor = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    const start = [2]f32{ anchor.x + 20, anchor.y + 20 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    try std.testing.expect(viewport_index.summary().valid);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+    canvas_state.clearInvalidation();
+
+    var guide_move = ElementEvent{ .mouse_move = .{ .x = start[0] + 2, .y = start[1] + 2, .dx = 2, .dy = 2 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &guide_move, editor_node.paint_user_data));
+    try std.testing.expectEqual([2]f32{ 0, 0 }, nodes[0].pos);
+    try std.testing.expectEqual(@as(?f32, 0), state.snap_guide_x);
+    try std.testing.expect(viewport_index.summary().valid);
+    const dirty = canvas_state.dirtySummary();
+    try std.testing.expect(dirty.invalidation.contains(.paint));
+    try std.testing.expect(dirty.invalidation.contains(.overlay));
+    try std.testing.expect(!dirty.invalidation.contains(.data));
+    try std.testing.expect(!dirty.invalidation.contains(.hit_test));
+}
+
+test "node editor snap composes with auto pan in one undo transaction" {
+    var selected = [_]u32{ 1, 0, 0, 0 };
+    var state = node_editor.State{ .selected_node_ids = &selected, .selected_node_len = 1, .selected_node_id = 1 };
+    var nodes = [_]node_editor.Node{.{ .id = 1, .title = "A", .pos = .{ 17, 0 }, .size = .{ .w = 80, .h = 60 } }};
+    const before = nodes;
+    var node_len: usize = nodes.len;
+    var connections: [0]node_editor.Connection = .{};
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 400, .h = 240 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 400, .h = 240 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9422,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .history = &history,
+        .drag_auto_pan = .{ .edge_margin = 40, .max_step = 16 },
+        .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 6 },
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = 400 }, .height = .{ .px = 240 } },
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 400, .h = 240 };
+    const anchor = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
+    const start = [2]f32{ anchor.x + 20, anchor.y + 20 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var pan_move = ElementEvent{ .mouse_move = .{ .x = 399, .y = start[1], .dx = 0, .dy = 0 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &pan_move, editor_node.paint_user_data));
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &pan_move, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(f32, 48), nodes[0].pos[0]);
+    try std.testing.expectEqual(@as(?f32, 48), state.snap_guide_x);
+    try std.testing.expect(state.pan[0] < -30);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = 399, .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expectEqual(before, nodes);
 }
 
 test "node editor multi-drag is atomic when history capacity is insufficient" {

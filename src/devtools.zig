@@ -33,6 +33,7 @@ pub const SummaryOptions = struct {
     geometry_revision: ?u64 = null,
     semantic_zoom: node_editor.SemanticZoomOptions = .{},
     drag_auto_pan: node_editor.DragAutoPanOptions = .{},
+    drag_snap: node_editor.DragSnapOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -53,6 +54,10 @@ pub const Summary = struct {
     detail_level: node_editor.DetailLevel = .full,
     drag_auto_pan_enabled: bool = false,
     drag_auto_pan_active: bool = false,
+    drag_snap_enabled: bool = false,
+    drag_snap_active: bool = false,
+    snap_guide_x: ?f32 = null,
+    snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
     minimap: MinimapSnapshot = .{},
     connection_path_cache: node_editor.ConnectionPathCacheSummary = .{},
@@ -118,6 +123,10 @@ pub fn summarize(options: SummaryOptions) Summary {
         .detail_level = node_editor.semanticDetailLevel(state.*, options.semantic_zoom),
         .drag_auto_pan_enabled = options.drag_auto_pan.enabled,
         .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.box_selecting,
+        .drag_snap_enabled = options.drag_snap.enabled,
+        .drag_snap_active = state.dragging_node_id != null and (state.snap_guide_x != null or state.snap_guide_y != null),
+        .snap_guide_x = state.snap_guide_x,
+        .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
         .minimap = minimap,
         .connection_path_cache = if (options.connection_path_cache) |cache| cache.summary() else .{},
@@ -171,6 +180,12 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.drag_auto_pan_enabled,
         options.summary.drag_auto_pan_active,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const drag_snap = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "snap enabled={} active={} guides={?d:.1},{?d:.1}", .{
+        options.summary.drag_snap_enabled,
+        options.summary.drag_snap_active,
+        options.summary.snap_guide_x,
+        options.summary.snap_guide_y,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const path_cache = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "paths={d} hits={d} misses={d} rebuilds={d}", .{
         options.summary.connection_path_cache.entry_count,
         options.summary.connection_path_cache.hit_count,
@@ -222,7 +237,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, path_cache, connection_draw, topology, viewport_index, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, drag_snap, path_cache, connection_draw, topology, viewport_index, history, graph });
     return root;
 }
 
@@ -259,6 +274,26 @@ test "zui-nodes devtools summarize node editor state" {
     try std.testing.expectEqual(@as(u64, 1), summary.connection_path_cache.hit_count);
     try std.testing.expectEqual(node_editor.DetailLevel.full, summary.detail_level);
     try std.testing.expectEqualStrings("selected", summary.statusText());
+}
+
+test "zui-nodes devtools exposes active drag snap guides" {
+    var selected = [_]u32{ 1, 0, 0, 0 };
+    var state = State{
+        .selected_node_ids = &selected,
+        .selected_node_len = 1,
+        .selected_node_id = 1,
+        .dragging_node_id = 1,
+        .snap_guide_x = 32,
+    };
+    const summary = summarize(.{
+        .state = &state,
+        .nodes = &.{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }},
+        .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 5 },
+    });
+    try std.testing.expect(summary.drag_snap_enabled);
+    try std.testing.expect(summary.drag_snap_active);
+    try std.testing.expectEqual(@as(?f32, 32), summary.snap_guide_x);
+    try std.testing.expectEqual(@as(?f32, null), summary.snap_guide_y);
 }
 
 test "zui-nodes devtools reports strict graph validation issues" {

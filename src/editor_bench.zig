@@ -13,6 +13,11 @@ const draw_command_capacity: usize = 16384;
 const input_labels = [_][]const u8{ "input", "mask" };
 const output_labels = [_][]const u8{ "value", "image" };
 
+fn expectedSnapDelta(origin: f32, accumulated: f32, spacing: f32, threshold_pixels: f32, zoom: f32) f32 {
+    const snapped = @round((origin + accumulated) / spacing) * spacing;
+    return if (@abs(snapped - (origin + accumulated)) * zoom <= threshold_pixels) snapped - origin else accumulated;
+}
+
 const Options = struct {
     iterations: usize = default_iterations,
     max_paint_ns: ?f64 = null,
@@ -224,6 +229,7 @@ fn run(init: std.process.Init, options: Options) !Report {
     if (!viewport_index.prepareVersioned(nodes, &.{}, connections, viewport, state.pan, state.zoom, drag_revision).ready) return error.EditorDragViewportUnavailable;
     const rebuilds_before_drag = viewport_index.summary().rebuild_count;
     _ = state.beginNodeDrag(selected_ids[0]);
+    var drag_changed_count: usize = 0;
     const drag_started = std.Io.Clock.awake.now(init.io);
     for (0..options.iterations) |iteration| {
         var move = zui.ElementEvent{ .mouse_move = .{
@@ -232,7 +238,7 @@ fn run(init: std.process.Init, options: Options) !Report {
             .dx = 1,
             .dy = 0.5,
         } };
-        if (!node_editor.handleEditorEvent(viewport, .{}, node_editor.Options(node_editor.State){
+        if (node_editor.handleEditorEvent(viewport, .{}, node_editor.Options(node_editor.State){
             .state = &state,
             .nodes = nodes,
             .mutable_nodes = nodes,
@@ -240,21 +246,30 @@ fn run(init: std.process.Init, options: Options) !Report {
             .viewport_index = &viewport_index,
             .geometry_revision = drag_revision,
             .drag_auto_pan = .{ .enabled = false },
+            .drag_snap = .{ .enabled = true, .spacing = .{ 16, 16 }, .threshold_pixels = 6, .show_guides = false },
             .show_minimap = false,
-        }, &move)) return error.EditorMultiDragDidNotMove;
+        }, &move)) drag_changed_count += 1;
     }
     const drag_elapsed_ns: u64 = @intCast(drag_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
     const multi_drag_ns_per_iteration = @as(f64, @floatFromInt(drag_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
     _ = state.endDrag();
     const drag_summary = viewport_index.summary();
-    var drag_correct = !drag_summary.valid and drag_summary.rebuild_count == rebuilds_before_drag;
+    const accumulated_drag = [2]f32{
+        @floatFromInt(options.iterations),
+        @as(f32, @floatFromInt(options.iterations)) * 0.5,
+    };
+    const expected_drag = [2]f32{
+        expectedSnapDelta(drag_before[0][0], accumulated_drag[0], 16, 6, 1),
+        expectedSnapDelta(drag_before[0][1], accumulated_drag[1], 16, 6, 1),
+    };
+    var drag_correct = drag_changed_count > 0 and !drag_summary.valid and drag_summary.rebuild_count == rebuilds_before_drag;
     for (selected_ids, drag_before) |selected_id, before| {
         const node_index = viewport_index.nodeIndexForId(selected_id) orelse {
             drag_correct = false;
             continue;
         };
-        drag_correct = drag_correct and nodes[node_index].pos[0] == before[0] + @as(f32, @floatFromInt(options.iterations)) and
-            nodes[node_index].pos[1] == before[1] + @as(f32, @floatFromInt(options.iterations)) * 0.5;
+        drag_correct = drag_correct and nodes[node_index].pos[0] == before[0] + expected_drag[0] and
+            nodes[node_index].pos[1] == before[1] + expected_drag[1];
     }
     const unselected_before_x = (@as(f32, @floatFromInt(columns - 1)) - @as(f32, @floatFromInt(columns)) * 0.5) * 184.0;
     drag_correct = drag_correct and nodes[node_count - 1].pos[0] == unselected_before_x;

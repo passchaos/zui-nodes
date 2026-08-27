@@ -427,6 +427,12 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.resizing_group_id = null;
             state.resizing_group_edges = .{};
             state.interaction_history_pushed = false;
+            state.node_drag_tracking = false;
+            state.node_drag_origin = .{ 0, 0 };
+            state.node_drag_accumulated_delta = .{ 0, 0 };
+            state.node_drag_applied_delta = .{ 0, 0 };
+            state.snap_guide_x = null;
+            state.snap_guide_y = null;
             state.dragging_connection_from_id = null;
             state.dragging_connection_from_port = 0;
             state.reconnecting_connection = null;
