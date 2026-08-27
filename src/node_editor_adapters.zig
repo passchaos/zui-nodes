@@ -43,7 +43,25 @@ pub fn connectionFrom(value: anytype) NodeEditorConnection {
         .from_port = value.from_port,
         .to_port = value.to_port,
         .color = value.color,
+        .waypoints = compatibleWaypoints(value),
+        .waypoint_count = compatibleWaypointCount(value),
     };
+}
+
+fn compatibleWaypoints(value: anytype) [node_editor.max_connection_waypoints][2]f32 {
+    var out = [_][2]f32{.{ 0.0, 0.0 }} ** node_editor.max_connection_waypoints;
+    if (comptime @hasField(@TypeOf(value), "waypoints")) {
+        const count = @min(value.waypoints.len, out.len);
+        @memcpy(out[0..count], value.waypoints[0..count]);
+    }
+    return out;
+}
+
+fn compatibleWaypointCount(value: anytype) u8 {
+    if (comptime @hasField(@TypeOf(value), "waypoints") and @hasField(@TypeOf(value), "waypoint_count")) {
+        return @intCast(@min(@as(usize, value.waypoint_count), @min(value.waypoints.len, node_editor.max_connection_waypoints)));
+    }
+    return 0;
 }
 
 pub fn groupFrom(value: anytype) NodeEditorGroup {
@@ -116,7 +134,7 @@ test "zui-nodes adapters copy native node editor model values" {
         .{ .id = 2, .title = "B", .pos = .{ 100, 0 }, .input_types = &.{.image} },
     };
     const source_connections = [_]NodeEditorConnection{
-        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 1, .to_id = 2, .waypoints = .{ .{ 20, 30 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 1 },
     };
     const source_groups = [_]NodeEditorGroup{
         .{ .id = 7, .title = "Group", .rect = .{ .x = 0, .y = 0, .w = 120, .h = 80 } },
@@ -133,7 +151,21 @@ test "zui-nodes adapters copy native node editor model values" {
     try @import("std").testing.expectEqual(@as(f32, 24), nodes[0].collapsed_height);
     try @import("std").testing.expectEqual(NodeEditorPortType.image, portTypeFrom(source_nodes[0].output_types[0]));
     try @import("std").testing.expectEqual(@as(u32, 2), connections[0].to_id);
+    try @import("std").testing.expectEqual(@as(usize, 1), connections[0].boundedWaypointCount());
+    try @import("std").testing.expectEqual([2]f32{ 20, 30 }, connections[0].waypoints[0]);
     try @import("std").testing.expectEqual(@as(u32, 7), groups[0].id);
+}
+
+test "zui-nodes adapters default legacy connection waypoints" {
+    const LegacyConnection = struct {
+        from_id: u32,
+        to_id: u32,
+        from_port: u8 = 0,
+        to_port: u8 = 0,
+        color: zui.Color = zui.Color.rgba8(59, 130, 246, 190),
+    };
+    const adapted = connectionFrom(LegacyConnection{ .from_id = 1, .to_id = 2 });
+    try @import("std").testing.expectEqual(@as(usize, 0), adapted.boundedWaypointCount());
 }
 
 test "zui-nodes adapters default legacy collapse fields" {

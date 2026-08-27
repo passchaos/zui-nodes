@@ -231,6 +231,10 @@ pub fn applyDocumentSnapshot(options: ApplyOptions) !ApplyResult {
     options.state.dragging_connection_from_id = null;
     options.state.dragging_connection_from_port = 0;
     options.state.reconnecting_connection = null;
+    options.state.resizing_node_id = null;
+    options.state.resizing_node_edges = .{};
+    options.state.selected_connection_waypoint = null;
+    options.state.dragging_connection_waypoint = null;
     options.state.pending_connection = null;
     options.state.hover_node_id = null;
     options.state.hover_group_id = null;
@@ -272,7 +276,7 @@ pub fn summarizeDocumentSnapshotWithPolicy(snapshot: DocumentSnapshot, policy: n
         .selected_node_id = snapshot.selected_node_id,
         .selected_group_id = snapshot.selected_group_id,
         .has_selected_connection = snapshot.selected_connection != null or snapshot.selected_connections.len > 0,
-        .bounds = node_editor.graphBounds(snapshot.nodes, snapshot.groups),
+        .bounds = node_editor.graphBoundsWithConnections(snapshot.nodes, snapshot.groups, snapshot.connections),
         .valid = validation.validFor(policy),
         .graph_validation = node_editor.validateGraph(snapshot.nodes, snapshot.connections, policy),
     };
@@ -535,6 +539,43 @@ test "zui-nodes document snapshot preserves collapsed nodes and defaults legacy 
     defer legacy.deinit();
     try std.testing.expect(!legacy.value.nodes[0].collapsed);
     try std.testing.expectEqual(@as(f32, 32), legacy.value.nodes[0].collapsed_height);
+}
+
+test "zui-nodes document snapshot stores compact connection waypoint arrays" {
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+    };
+    const connections = [_]Connection{.{
+        .from_id = 1,
+        .to_id = 2,
+        .waypoints = .{ .{ 50, -30 }, .{ 75, 40 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } },
+        .waypoint_count = 2,
+    }};
+    const json = try (DocumentSnapshot{ .nodes = &nodes, .connections = &connections }).toJsonAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"waypoints\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"waypoint_count\"") == null);
+    var parsed = try parseDocumentSnapshotJson(std.testing.allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.connections[0].boundedWaypointCount());
+    try std.testing.expectEqual([2]f32{ 75, 40 }, parsed.value.connections[0].waypoints[1]);
+}
+
+test "zui-nodes document snapshot summary includes routed connection bounds" {
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+    };
+    const connections = [_]Connection{.{
+        .from_id = 1,
+        .to_id = 2,
+        .waypoints = .{ .{ 60, -500 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } },
+        .waypoint_count = 1,
+    }};
+    const summary = summarizeDocumentSnapshot(.{ .nodes = &nodes, .connections = &connections });
+    try std.testing.expect(summary.bounds.y <= -500);
+    try std.testing.expect(summary.bounds.h >= 500);
 }
 
 test "zui-nodes document validation reports duplicate and orphan graph data" {

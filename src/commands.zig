@@ -71,6 +71,9 @@ pub const NodeEditorCommand = enum(u8) {
     toggle_selected_nodes_collapsed,
     collapse_selected_nodes,
     expand_selected_nodes,
+    add_connection_waypoint,
+    remove_connection_waypoint,
+    clear_connection_waypoints,
 
     pub fn commandId(self: NodeEditorCommand) CommandId {
         return nodeEditorCommandId(self);

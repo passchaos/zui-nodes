@@ -467,6 +467,10 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.dragging_group_id = null;
             state.resizing_group_id = null;
             state.resizing_group_edges = .{};
+            if (comptime @hasField(@TypeOf(state.*), "resizing_node_id")) {
+                state.resizing_node_id = null;
+                state.resizing_node_edges = .{};
+            }
             state.interaction_history_pushed = false;
             state.node_drag_tracking = false;
             state.node_drag_origin = .{ 0, 0 };
@@ -481,6 +485,10 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.dragging_connection_from_id = null;
             state.dragging_connection_from_port = 0;
             state.reconnecting_connection = null;
+            if (comptime @hasField(@TypeOf(state.*), "selected_connection_waypoint")) {
+                state.selected_connection_waypoint = null;
+                state.dragging_connection_waypoint = null;
+            }
             state.pending_connection = null;
             state.hover_node_id = null;
             state.hover_group_id = null;

@@ -434,7 +434,10 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                         self.orphan_connection_count += 1;
                         continue;
                     }
-                    connection_bounds[index] = connectionBounds(nodes[from_index.?], nodes[to_index.?]);
+                    connection_bounds[index] = connectionBounds(nodes[from_index.?], nodes[to_index.?], connection);
+                    if (comptime @hasField(Connection, "waypoints") and @hasField(Connection, "waypoint_count")) {
+                        if (connection.waypoint_count > 0) includeRect(&self.graph_bounds, &self.has_graph_bounds, connection_bounds[index]);
+                    }
                     connection_order[self.indexed_connection_count] = index;
                     self.indexed_connection_count += 1;
                 }
@@ -527,18 +530,36 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             return .{ .x = node.pos[0], .y = node.pos[1], .w = size.w, .h = size.h };
         }
 
-        fn connectionBounds(from: Node, to: Node) Rect {
+        fn connectionBounds(from: Node, to: Node, connection: Connection) Rect {
             const from_size = node_geometry.effectiveSize(from);
             const to_size = node_geometry.effectiveSize(to);
             const a_x = from.pos[0] + from_size.w;
             const b_x = to.pos[0];
-            const dx = @abs(b_x - a_x) * 0.5;
-            const min_x = @min(@min(a_x, b_x), @min(a_x + dx, b_x - dx));
-            const max_x = @max(@max(a_x, b_x), @max(a_x + dx, b_x - dx));
+            var min_x = @min(a_x, b_x);
+            var max_x = @max(a_x, b_x);
             // The query expands by the screen-space port inset, so this
             // zoom-invariant node hull conservatively contains every curve.
-            const min_y = @min(from.pos[1], to.pos[1]);
-            const max_y = @max(from.pos[1] + from_size.h, to.pos[1] + to_size.h);
+            var min_y = @min(from.pos[1], to.pos[1]);
+            var max_y = @max(from.pos[1] + from_size.h, to.pos[1] + to_size.h);
+            if (comptime @hasField(Connection, "waypoints") and @hasField(Connection, "waypoint_count")) {
+                const waypoint_count = @min(@as(usize, connection.waypoint_count), connection.waypoints.len);
+                var previous_x = a_x;
+                for (connection.waypoints[0..waypoint_count]) |waypoint| {
+                    const dx = @max(40.0, @abs(waypoint[0] - previous_x) * 0.5);
+                    min_x = @min(min_x, @min(waypoint[0], @min(previous_x + dx, waypoint[0] - dx)));
+                    max_x = @max(max_x, @max(waypoint[0], @max(previous_x + dx, waypoint[0] - dx)));
+                    min_y = @min(min_y, waypoint[1]);
+                    max_y = @max(max_y, waypoint[1]);
+                    previous_x = waypoint[0];
+                }
+                const dx = @max(40.0, @abs(b_x - previous_x) * 0.5);
+                min_x = @min(min_x, @min(previous_x + dx, b_x - dx));
+                max_x = @max(max_x, @max(previous_x + dx, b_x - dx));
+            } else {
+                const dx = @max(40.0, @abs(b_x - a_x) * 0.5);
+                min_x = @min(min_x, @min(a_x + dx, b_x - dx));
+                max_x = @max(max_x, @max(a_x + dx, b_x - dx));
+            }
             return .{ .x = min_x, .y = min_y, .w = max_x - min_x, .h = max_y - min_y };
         }
 
@@ -676,6 +697,14 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 mix(&hash, connection.to_id);
                 mix(&hash, connection.from_port);
                 mix(&hash, connection.to_port);
+                if (comptime @hasField(Connection, "waypoints") and @hasField(Connection, "waypoint_count")) {
+                    const waypoint_count = @min(@as(usize, connection.waypoint_count), connection.waypoints.len);
+                    mix(&hash, waypoint_count);
+                    for (connection.waypoints[0..waypoint_count]) |waypoint| {
+                        mixFloat(&hash, waypoint[0]);
+                        mixFloat(&hash, waypoint[1]);
+                    }
+                }
             }
             return hash;
         }
@@ -722,6 +751,8 @@ const TestConnection = struct {
     to_id: u32,
     from_port: u8 = 0,
     to_port: u8 = 0,
+    waypoints: [8][2]f32 = .{.{ 0, 0 }} ** 8,
+    waypoint_count: u8 = 0,
 };
 
 const TestIndexTypes = Types(TestNode, TestGroup, TestConnection, TestRect);
@@ -776,6 +807,38 @@ test "connection rectangle query retains minimum-handle Bezier lobes" {
     const viewport = TestRect{ .x = 0, .y = 0, .w = 400, .h = 240 };
     try std.testing.expect(index.prepare(&nodes, &.{}, &connections, viewport, .{ 0, 0 }, 1).ready);
     try std.testing.expectEqualSlices(usize, &.{0}, index.connectionIndicesInScreenRect(viewport, .{ 0, 0 }, 1, .{ .x = 209, .y = 77, .w = 5, .h = 7 }));
+}
+
+test "connection bounds and fingerprint include remote waypoints" {
+    const nodes = [_]TestNode{
+        .{ .id = 1, .pos = .{ -500, -20 } },
+        .{ .id = 2, .pos = .{ -300, -20 } },
+    };
+    var connections = [_]TestConnection{.{ .from_id = 1, .to_id = 2, .waypoints = .{ .{ 40, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 1 }};
+    var storage = TestIndexTypes.StaticWorkspace(nodes.len, 0, connections.len){};
+    var index = TestIndexTypes.Index.init(storage.workspace());
+    const viewport = TestRect{ .x = 0, .y = 0, .w = 240, .h = 120 };
+
+    try std.testing.expect(index.prepare(&nodes, &.{}, &connections, viewport, .{ 0, 0 }, 1).ready);
+    try std.testing.expectEqualSlices(usize, &.{0}, index.visibleConnectionIndices());
+    connections[0].waypoints[0] = .{ -600, 0 };
+    try std.testing.expect(index.prepare(&nodes, &.{}, &connections, viewport, .{ 0, 0 }, 1).ready);
+    try std.testing.expectEqual(@as(usize, 0), index.visibleConnectionIndices().len);
+    try std.testing.expectEqual(@as(u64, 2), index.summary().rebuild_count);
+}
+
+test "connection bounds include waypoint segment control lobes" {
+    const nodes = [_]TestNode{
+        .{ .id = 1, .pos = .{ 0, 0 } },
+        .{ .id = 2, .pos = .{ 120, 0 } },
+    };
+    const connections = [_]TestConnection{.{ .from_id = 1, .to_id = 2, .waypoints = .{ .{ 260, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 1 }};
+    var storage = TestIndexTypes.StaticWorkspace(nodes.len, 0, connections.len){};
+    var index = TestIndexTypes.Index.init(storage.workspace());
+    const viewport = TestRect{ .x = 0, .y = 0, .w = 640, .h = 240 };
+    try std.testing.expect(index.prepare(&nodes, &.{}, &connections, viewport, .{ 0, 0 }, 1).ready);
+    const bounds = index.graphBounds() orelse return error.MissingGraphBounds;
+    try std.testing.expect(bounds.x + bounds.w >= 260);
 }
 
 test "viewport index versioned mode rebuilds only on geometry revision" {

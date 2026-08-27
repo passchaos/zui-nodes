@@ -48,12 +48,68 @@ pub const ContextTarget = enum {
     output_port,
 };
 
+pub const max_connection_waypoints: usize = 8;
+pub const connection_path_command_capacity: usize = max_connection_waypoints + 2;
+
 pub const Connection = struct {
     from_id: u32,
     to_id: u32,
     from_port: u8 = 0,
     to_port: u8 = 0,
     color: Color = Color.rgba8(59, 130, 246, 190),
+    /// Stable graph-space routing points. Inline storage preserves value
+    /// semantics for snapshots, history, selection, and caller-owned arrays.
+    waypoints: [max_connection_waypoints][2]f32 = .{.{ 0.0, 0.0 }} ** max_connection_waypoints,
+    waypoint_count: u8 = 0,
+
+    pub fn boundedWaypointCount(self: Connection) usize {
+        return @min(@as(usize, self.waypoint_count), self.waypoints.len);
+    }
+
+    pub fn jsonStringify(self: Connection, stringify: anytype) !void {
+        try stringify.beginObject();
+        try stringify.objectField("from_id");
+        try stringify.write(self.from_id);
+        try stringify.objectField("to_id");
+        try stringify.write(self.to_id);
+        try stringify.objectField("from_port");
+        try stringify.write(self.from_port);
+        try stringify.objectField("to_port");
+        try stringify.write(self.to_port);
+        try stringify.objectField("color");
+        try stringify.write(self.color);
+        try stringify.objectField("waypoints");
+        try stringify.write(self.waypoints[0..self.boundedWaypointCount()]);
+        try stringify.endObject();
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!Connection {
+        const Wire = struct {
+            from_id: u32,
+            to_id: u32,
+            from_port: u8 = 0,
+            to_port: u8 = 0,
+            color: Color = Color.rgba8(59, 130, 246, 190),
+            waypoints: []const [2]f32 = &.{},
+        };
+        const wire = try std.json.innerParse(Wire, allocator, source, options);
+        if (wire.waypoints.len > max_connection_waypoints) return error.UnexpectedToken;
+        var connection = Connection{
+            .from_id = wire.from_id,
+            .to_id = wire.to_id,
+            .from_port = wire.from_port,
+            .to_port = wire.to_port,
+            .color = wire.color,
+            .waypoint_count = @intCast(wire.waypoints.len),
+        };
+        @memcpy(connection.waypoints[0..wire.waypoints.len], wire.waypoints);
+        return connection;
+    }
+};
+
+pub const ConnectionWaypointHit = struct {
+    connection: Connection,
+    waypoint_index: u8,
 };
 
 pub const ConnectionPolicy = graph_validation.ConnectionPolicy;
@@ -312,6 +368,12 @@ pub const NodeResizeOptions = struct {
     show_handles: bool = true,
 };
 
+pub const ConnectionRerouteOptions = struct {
+    enabled: bool = false,
+    hit_radius: f32 = 8.0,
+    show_waypoints: bool = true,
+};
+
 pub const Node = struct {
     id: u32,
     title: []const u8,
@@ -509,6 +571,7 @@ pub fn Options(comptime StateType: type) type {
         spatial_navigation: SpatialNavigationOptions = .{},
         node_collapse: NodeCollapseOptions = .{},
         node_resize: NodeResizeOptions = .{},
+        connection_reroute: ConnectionRerouteOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -613,6 +676,29 @@ pub fn graphBounds(nodes: []const Node, groups: []const Group) Rect {
     return bounds orelse .zero;
 }
 
+pub fn graphBoundsWithConnections(nodes: []const Node, groups: []const Group, connections: []const Connection) Rect {
+    var bounds: ?Rect = null;
+    for (groups) |group| includeBounds(&bounds, group.rect);
+    for (nodes) |node| includeBounds(&bounds, nodeGraphRect(node));
+    for (connections) |connection| if (connectionGraphBounds(nodes, connection)) |connection_bounds| includeBounds(&bounds, connection_bounds);
+    return bounds orelse .zero;
+}
+
+pub fn connectionGraphBounds(nodes: []const Node, connection: Connection) ?Rect {
+    const from = nodeById(nodes, connection.from_id) orelse return null;
+    const to = nodeById(nodes, connection.to_id) orelse return null;
+    const start = outputPortGraphPositionAt(from, connection.from_port);
+    const end = inputPortGraphPositionAt(to, connection.to_port);
+    var bounds: ?Rect = null;
+    var segment_index: usize = 0;
+    while (segment_index <= connection.boundedWaypointCount()) : (segment_index += 1) {
+        const a = if (segment_index == 0) start else connection.waypoints[segment_index - 1];
+        const b = if (segment_index >= connection.boundedWaypointCount()) end else connection.waypoints[segment_index];
+        includeBounds(&bounds, cubicBounds(connectionPathForPoints(a, b)));
+    }
+    return bounds;
+}
+
 pub fn paddedBounds(bounds: Rect, frac: f32) Rect {
     const pad_x = bounds.w * frac;
     const pad_y = bounds.h * frac;
@@ -685,7 +771,7 @@ fn minimapSnapshotPrepared(viewport: Rect, editor: anytype, viewport_index: ?*Vi
     if (viewport_index) |index| {
         if (index.graphBounds()) |bounds| return minimapSnapshotFromGraphBounds(viewport, editor.state.*, paddedBounds(bounds, 0.12), editor.minimap_size);
     }
-    return minimapSnapshot(viewport, editor.state.*, editor.nodes, editor.groups, editor.minimap_size);
+    return minimapSnapshotFromGraphBounds(viewport, editor.state.*, paddedBounds(graphBoundsWithConnections(editor.nodes, editor.groups, editorActiveConnections(editor)), 0.12), editor.minimap_size);
 }
 
 pub fn rectIntersects(a: Rect, b: Rect) bool {
@@ -753,18 +839,26 @@ pub fn inputPortPosition(rect: Rect, state: anytype, node: Node) [2]f32 {
     return inputPortPositionAt(rect, state, node, 0);
 }
 
-pub fn inputPortPositionAt(rect: Rect, state: anytype, node: Node, port_index: u8) [2]f32 {
-    const node_rect = nodeRectFromState(rect, state, node);
+pub fn inputPortGraphPositionAt(node: Node, port_index: u8) [2]f32 {
+    const node_rect = nodeGraphRect(node);
     return .{ node_rect.x, if (node.collapsed) node_rect.y + node_rect.h * 0.5 else portY(node_rect, inputPortCount(node), port_index) };
+}
+
+pub fn inputPortPositionAt(rect: Rect, state: anytype, node: Node, port_index: u8) [2]f32 {
+    return graphToScreen(rect, state, inputPortGraphPositionAt(node, port_index));
 }
 
 pub fn outputPortPosition(rect: Rect, state: anytype, node: Node) [2]f32 {
     return outputPortPositionAt(rect, state, node, 0);
 }
 
-pub fn outputPortPositionAt(rect: Rect, state: anytype, node: Node, port_index: u8) [2]f32 {
-    const node_rect = nodeRectFromState(rect, state, node);
+pub fn outputPortGraphPositionAt(node: Node, port_index: u8) [2]f32 {
+    const node_rect = nodeGraphRect(node);
     return .{ node_rect.x + node_rect.w, if (node.collapsed) node_rect.y + node_rect.h * 0.5 else portY(node_rect, outputPortCount(node), port_index) };
+}
+
+pub fn outputPortPositionAt(rect: Rect, state: anytype, node: Node, port_index: u8) [2]f32 {
+    return graphToScreen(rect, state, outputPortGraphPositionAt(node, port_index));
 }
 
 pub fn inputPortCount(node: Node) u8 {
@@ -1030,9 +1124,14 @@ pub fn connectionAtPoint(
 pub fn connectionHit(rect: Rect, state: anytype, nodes: []const Node, connection: Connection, point: [2]f32) bool {
     const from = nodeById(nodes, connection.from_id) orelse return false;
     const to = nodeById(nodes, connection.to_id) orelse return false;
-    const a = outputPortPositionAt(rect, state, from, connection.from_port);
-    const b = inputPortPositionAt(rect, state, to, connection.to_port);
-    return cubicDistanceToPoint(a, .{ a[0] + @max(40.0, @abs(b[0] - a[0]) * 0.5), a[1] }, .{ b[0] - @max(40.0, @abs(b[0] - a[0]) * 0.5), b[1] }, b, point) <= 7.0;
+    const start = outputPortPositionAt(rect, state, from, connection.from_port);
+    const end = inputPortPositionAt(rect, state, to, connection.to_port);
+    var segment_index: usize = 0;
+    while (segment_index <= connection.boundedWaypointCount()) : (segment_index += 1) {
+        const path = connectionSegmentPath(rect, state, connection, start, end, segment_index);
+        if (cubicDistanceToPoint(path.start, path.c0, path.c1, path.end, point) <= 7.0) return true;
+    }
+    return false;
 }
 
 fn nodeMatchesBox(node: Node, selection: Rect, editor_rect: Rect, state: State, crossing: bool) bool {
@@ -1045,12 +1144,16 @@ fn connectionMatchesBox(editor_rect: Rect, state: State, nodes: []const Node, no
     const to = nodeForBoxSelection(nodes, node_lookup, connection.to_id) orelse return false;
     const start = outputPortPositionAt(editor_rect, state, from, connection.from_port);
     const end = inputPortPositionAt(editor_rect, state, to, connection.to_port);
-    const path = connectionPathForPoints(start, end);
-    const bounds = cubicBounds(path);
-    if (!rectIntersects(bounds, selection)) return false;
-    if (!crossing) return rectContainsRect(selection, bounds);
-    if (selection.contains(path.start) or selection.contains(path.end)) return true;
-    return cubicIntersectsRect(path, selection, 0);
+    var all_contained = true;
+    var segment_index: usize = 0;
+    while (segment_index <= connection.boundedWaypointCount()) : (segment_index += 1) {
+        const path = connectionSegmentPath(editor_rect, state, connection, start, end, segment_index);
+        const bounds = cubicBounds(path);
+        all_contained = all_contained and rectContainsRect(selection, bounds);
+        if (crossing and rectIntersects(bounds, selection) and
+            (selection.contains(path.start) or selection.contains(path.end) or cubicIntersectsRect(path, selection, 0))) return true;
+    }
+    return !crossing and all_contained;
 }
 
 fn nodeForBoxSelection(nodes: []const Node, node_lookup: ?*const ViewportIndex, id: u32) ?Node {
@@ -1340,6 +1443,55 @@ pub fn connectionPathForPoints(a: [2]f32, b: [2]f32) ConnectionPath {
     };
 }
 
+pub fn connectionSegmentPath(rect: Rect, state: anytype, connection: Connection, start: [2]f32, end: [2]f32, segment_index: usize) ConnectionPath {
+    const waypoint_count = connection.boundedWaypointCount();
+    const a = if (segment_index == 0) start else graphToScreen(rect, state, connection.waypoints[segment_index - 1]);
+    const b = if (segment_index >= waypoint_count) end else graphToScreen(rect, state, connection.waypoints[segment_index]);
+    return connectionPathForPoints(a, b);
+}
+
+pub fn connectionSegmentAtPoint(rect: Rect, state: anytype, nodes: []const Node, connection: Connection, point: [2]f32) ?usize {
+    const from = nodeById(nodes, connection.from_id) orelse return null;
+    const to = nodeById(nodes, connection.to_id) orelse return null;
+    const start = outputPortPositionAt(rect, state, from, connection.from_port);
+    const end = inputPortPositionAt(rect, state, to, connection.to_port);
+    var best_index: ?usize = null;
+    var best_distance = std.math.inf(f32);
+    var segment_index: usize = 0;
+    while (segment_index <= connection.boundedWaypointCount()) : (segment_index += 1) {
+        const path = connectionSegmentPath(rect, state, connection, start, end, segment_index);
+        const distance = cubicDistanceToPoint(path.start, path.c0, path.c1, path.end, point);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = segment_index;
+        }
+    }
+    return best_index;
+}
+
+pub fn connectionWaypointPosition(rect: Rect, state: anytype, connection: Connection, waypoint_index: usize) ?[2]f32 {
+    if (waypoint_index >= connection.boundedWaypointCount()) return null;
+    return graphToScreen(rect, state, connection.waypoints[waypoint_index]);
+}
+
+pub fn connectionWaypointAtPoint(rect: Rect, state: anytype, connections: []const Connection, point: [2]f32, hit_radius_value: f32) ?ConnectionWaypointHit {
+    const hit_radius = if (std.math.isFinite(hit_radius_value)) @max(0.0, hit_radius_value) else 8.0;
+    var connection_index = connections.len;
+    while (connection_index > 0) {
+        connection_index -= 1;
+        const connection = connections[connection_index];
+        var waypoint_index = connection.boundedWaypointCount();
+        while (waypoint_index > 0) {
+            waypoint_index -= 1;
+            const position = graphToScreen(rect, state, connection.waypoints[waypoint_index]);
+            if (@abs(point[0] - position[0]) <= hit_radius and @abs(point[1] - position[1]) <= hit_radius) {
+                return .{ .connection = connection, .waypoint_index = @intCast(waypoint_index) };
+            }
+        }
+    }
+    return null;
+}
+
 pub const ConnectionPathCacheCapacity: usize = 128;
 
 pub const ConnectionPathCacheEntry = struct {
@@ -1437,6 +1589,7 @@ pub const ConnectionPathCache = struct {
 /// workspace must outlive every retained draw list that borrows from it.
 pub const ConnectionDrawWorkspace = struct {
     path_commands: [][2]render.PathCommand,
+    routed_path_commands: [][connection_path_command_capacity]render.PathCommand = &.{},
     frame_count: u64 = 0,
     borrowed_connection_count: usize = 0,
     fallback_connection_count: usize = 0,
@@ -1475,30 +1628,36 @@ pub const ConnectionDrawSummary = struct {
 pub const ConnectionDrawStorage = struct {
     allocator: std.mem.Allocator,
     path_commands: [][2]render.PathCommand,
+    routed_path_commands: [][connection_path_command_capacity]render.PathCommand,
 
     pub fn init(allocator: std.mem.Allocator, connection_capacity: usize) !ConnectionDrawStorage {
+        const path_commands = try allocator.alloc([2]render.PathCommand, connection_capacity);
+        errdefer allocator.free(path_commands);
         return .{
             .allocator = allocator,
-            .path_commands = try allocator.alloc([2]render.PathCommand, connection_capacity),
+            .path_commands = path_commands,
+            .routed_path_commands = try allocator.alloc([connection_path_command_capacity]render.PathCommand, connection_capacity),
         };
     }
 
     pub fn deinit(self: *ConnectionDrawStorage) void {
         self.allocator.free(self.path_commands);
+        self.allocator.free(self.routed_path_commands);
         self.* = undefined;
     }
 
     pub fn workspace(self: *ConnectionDrawStorage) ConnectionDrawWorkspace {
-        return .{ .path_commands = self.path_commands };
+        return .{ .path_commands = self.path_commands, .routed_path_commands = self.routed_path_commands };
     }
 };
 
 pub fn StaticConnectionDrawWorkspace(comptime connection_capacity: usize) type {
     return struct {
         path_commands: [connection_capacity][2]render.PathCommand = undefined,
+        routed_path_commands: [connection_capacity][connection_path_command_capacity]render.PathCommand = undefined,
 
         pub fn workspace(self: *@This()) ConnectionDrawWorkspace {
-            return .{ .path_commands = &self.path_commands };
+            return .{ .path_commands = &self.path_commands, .routed_path_commands = &self.routed_path_commands };
         }
     };
 }
@@ -1560,6 +1719,8 @@ pub const State = struct {
     resizing_group_edges: GroupResizeEdges = .{},
     resizing_node_id: ?u32 = null,
     resizing_node_edges: NodeResizeEdges = .{},
+    selected_connection_waypoint: ?u8 = null,
+    dragging_connection_waypoint: ?u8 = null,
     interaction_history_pushed: bool = false,
     node_drag_tracking: bool = false,
     node_drag_origin: [2]f32 = .{ 0, 0 },
@@ -1598,6 +1759,7 @@ pub const State = struct {
     navigation_topology_hit_count: u64 = 0,
     navigation_spatial_fallback_count: u64 = 0,
     node_collapse_mutation_count: u64 = 0,
+    connection_reroute_mutation_count: u64 = 0,
     dragging_minimap: bool = false,
     minimap_drag_offset: [2]f32 = .{ 0.0, 0.0 },
     context_menu: ContextMenuState = .{},
@@ -1675,6 +1837,7 @@ pub const State = struct {
         if (!snapshot.contains(point)) return false;
         self.resizing_node_id = null;
         self.resizing_node_edges = .{};
+        self.dragging_connection_waypoint = null;
         self.dragging_minimap = true;
         self.minimap_drag_offset = if (snapshot.viewport_rect.contains(point))
             .{ point[0] - (snapshot.viewport_rect.x + snapshot.viewport_rect.w * 0.5), point[1] - (snapshot.viewport_rect.y + snapshot.viewport_rect.h * 0.5) }
@@ -1703,6 +1866,7 @@ pub const State = struct {
         self.dragging_node_id = id;
         self.resizing_node_id = null;
         self.resizing_node_edges = .{};
+        self.dragging_connection_waypoint = null;
         self.dragging_group_id = null;
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
@@ -1719,7 +1883,7 @@ pub const State = struct {
     }
 
     pub fn endDrag(self: *State) bool {
-        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.resizing_node_id != null or self.resizing_node_edges.any() or self.dragging_connection_from_id != null or self.box_selecting or self.dragging_minimap;
+        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.resizing_node_id != null or self.resizing_node_edges.any() or self.dragging_connection_from_id != null or self.dragging_connection_waypoint != null or self.box_selecting or self.dragging_minimap;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
         self.dragging_group_id = null;
@@ -1731,6 +1895,7 @@ pub const State = struct {
         self.resetNodeDragTracking();
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_waypoint = null;
         self.connection_preview_valid = true;
         self.reconnecting_connection = null;
         _ = self.finishBoxSelection(false);
@@ -1764,6 +1929,7 @@ pub const State = struct {
         self.resizing_group_edges = .{};
         self.resizing_node_id = null;
         self.resizing_node_edges = .{};
+        self.dragging_connection_waypoint = null;
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
         self.dragging_node_id = null;
@@ -1786,6 +1952,7 @@ pub const State = struct {
         self.dragging_node_id = null;
         self.resizing_node_id = null;
         self.resizing_node_edges = .{};
+        self.dragging_connection_waypoint = null;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
         self.connection_preview_valid = true;
@@ -1803,6 +1970,7 @@ pub const State = struct {
         self.dragging_group_id = null;
         self.resizing_group_id = null;
         self.resizing_group_edges = .{};
+        self.dragging_connection_waypoint = null;
         self.interaction_history_pushed = false;
         self.resetNodeDragTracking();
         self.dragging_connection_from_id = null;
@@ -1932,6 +2100,8 @@ pub const State = struct {
         _ = self.clearNodeSelection();
         self.selected_group_id = null;
         self.selected_connection = connection;
+        self.selected_connection_waypoint = null;
+        self.dragging_connection_waypoint = null;
         if (self.selected_connections.len > 0) {
             self.selected_connections[0] = connection;
             self.selected_connection_len = 1;
@@ -1955,6 +2125,8 @@ pub const State = struct {
         const changed = self.selected_connection != null or self.selected_connection_len != 0;
         self.selected_connection = null;
         self.selected_connection_len = 0;
+        self.selected_connection_waypoint = null;
+        self.dragging_connection_waypoint = null;
         return changed;
     }
 
@@ -2007,6 +2179,8 @@ pub const State = struct {
             self.selected_connections[self.selected_connection_len] = connection;
             self.selected_connection_len += 1;
             self.selected_connection = connection;
+            self.selected_connection_waypoint = null;
+            self.dragging_connection_waypoint = null;
             return true;
         }
 
@@ -2021,6 +2195,8 @@ pub const State = struct {
         }
         self.selected_connection_len = write;
         if (primary_removed or self.selected_connection == null) self.selected_connection = if (write > 0) self.selected_connections[write - 1] else null;
+        self.selected_connection_waypoint = null;
+        self.dragging_connection_waypoint = null;
         return true;
     }
 
@@ -2038,6 +2214,127 @@ pub const State = struct {
             if (State.connectionEndpointsEqual(selected.*, previous)) selected.* = replacement;
         }
         self.selected_connection = replacement;
+    }
+
+    pub fn beginConnectionWaypointDrag(self: *State, connection: Connection, waypoint_index: u8) bool {
+        if (@as(usize, waypoint_index) >= connection.boundedWaypointCount()) return false;
+        _ = self.setConnectionSelectionPrimary(connection);
+        self.selected_connection_waypoint = waypoint_index;
+        self.dragging_connection_waypoint = waypoint_index;
+        self.dragging_node_id = null;
+        self.dragging_group_id = null;
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
+        self.resizing_group_id = null;
+        self.resizing_group_edges = .{};
+        self.dragging_canvas = false;
+        self.dragging_minimap = false;
+        self.interaction_history_pushed = false;
+        _ = self.finishBoxSelection(false);
+        return true;
+    }
+
+    pub fn canAddSelectedConnectionWaypoint(self: *const State, connections: []const Connection, connection_len: usize) bool {
+        const target = self.selected_connection orelse return false;
+        for (connections[0..@min(connection_len, connections.len)]) |connection| {
+            if (State.connectionEndpointsEqual(connection, target)) return connection.boundedWaypointCount() < connection.waypoints.len;
+        }
+        return false;
+    }
+
+    pub fn canRemoveSelectedConnectionWaypoint(self: *const State, connections: []const Connection, connection_len: usize) bool {
+        const target = self.selected_connection orelse return false;
+        const waypoint_index = self.selected_connection_waypoint orelse return false;
+        for (connections[0..@min(connection_len, connections.len)]) |connection| {
+            if (State.connectionEndpointsEqual(connection, target)) return @as(usize, waypoint_index) < connection.boundedWaypointCount();
+        }
+        return false;
+    }
+
+    pub fn canClearSelectedConnectionWaypoints(self: *const State, connections: []const Connection, connection_len: usize) bool {
+        const target = self.selected_connection orelse return false;
+        for (connections[0..@min(connection_len, connections.len)]) |connection| {
+            if (State.connectionEndpointsEqual(connection, target)) return connection.boundedWaypointCount() > 0;
+        }
+        return false;
+    }
+
+    pub fn addConnectionWaypoint(self: *State, connections: []Connection, connection_len: usize, target: Connection, segment_index: usize, graph_point: [2]f32) bool {
+        if (!std.math.isFinite(graph_point[0]) or !std.math.isFinite(graph_point[1])) return false;
+        for (connections[0..@min(connection_len, connections.len)]) |*connection| {
+            if (!State.connectionEndpointsEqual(connection.*, target)) continue;
+            const count = connection.boundedWaypointCount();
+            if (count >= connection.waypoints.len or segment_index > count) return false;
+            var index = count;
+            while (index > segment_index) : (index -= 1) connection.waypoints[index] = connection.waypoints[index - 1];
+            const previous = connection.*;
+            connection.waypoints[segment_index] = graph_point;
+            connection.waypoint_count = @intCast(count + 1);
+            self.replaceSelectedConnection(previous, connection.*);
+            if (self.hover_connection != null and State.connectionEndpointsEqual(self.hover_connection.?, previous)) self.hover_connection = connection.*;
+            self.selected_connection_waypoint = @intCast(segment_index);
+            self.dragging_connection_waypoint = null;
+            self.connection_reroute_mutation_count +%= 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn moveSelectedConnectionWaypointBy(self: *State, connections: []Connection, connection_len: usize, delta: [2]f32) bool {
+        if (!std.math.isFinite(delta[0]) or !std.math.isFinite(delta[1])) return false;
+        const target = self.selected_connection orelse return false;
+        const waypoint_index = self.dragging_connection_waypoint orelse return false;
+        for (connections[0..@min(connection_len, connections.len)]) |*connection| {
+            if (!State.connectionEndpointsEqual(connection.*, target) or @as(usize, waypoint_index) >= connection.boundedWaypointCount()) continue;
+            if (@abs(delta[0]) <= 0.001 and @abs(delta[1]) <= 0.001) return false;
+            const previous = connection.*;
+            connection.waypoints[waypoint_index][0] += delta[0];
+            connection.waypoints[waypoint_index][1] += delta[1];
+            self.replaceSelectedConnection(previous, connection.*);
+            if (self.hover_connection != null and State.connectionEndpointsEqual(self.hover_connection.?, previous)) self.hover_connection = connection.*;
+            self.connection_reroute_mutation_count +%= 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeSelectedConnectionWaypoint(self: *State, connections: []Connection, connection_len: usize) bool {
+        const target = self.selected_connection orelse return false;
+        const waypoint_index = self.selected_connection_waypoint orelse return false;
+        for (connections[0..@min(connection_len, connections.len)]) |*connection| {
+            if (!State.connectionEndpointsEqual(connection.*, target)) continue;
+            const count = connection.boundedWaypointCount();
+            if (@as(usize, waypoint_index) >= count) return false;
+            const previous = connection.*;
+            var index: usize = waypoint_index;
+            while (index + 1 < count) : (index += 1) connection.waypoints[index] = connection.waypoints[index + 1];
+            connection.waypoints[count - 1] = .{ 0.0, 0.0 };
+            connection.waypoint_count = @intCast(count - 1);
+            self.replaceSelectedConnection(previous, connection.*);
+            if (self.hover_connection != null and State.connectionEndpointsEqual(self.hover_connection.?, previous)) self.hover_connection = connection.*;
+            self.selected_connection_waypoint = null;
+            self.dragging_connection_waypoint = null;
+            self.connection_reroute_mutation_count +%= 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn clearSelectedConnectionWaypoints(self: *State, connections: []Connection, connection_len: usize) bool {
+        const target = self.selected_connection orelse return false;
+        for (connections[0..@min(connection_len, connections.len)]) |*connection| {
+            if (!State.connectionEndpointsEqual(connection.*, target) or connection.boundedWaypointCount() == 0) continue;
+            const previous = connection.*;
+            connection.waypoint_count = 0;
+            @memset(&connection.waypoints, .{ 0.0, 0.0 });
+            self.replaceSelectedConnection(previous, connection.*);
+            if (self.hover_connection != null and State.connectionEndpointsEqual(self.hover_connection.?, previous)) self.hover_connection = connection.*;
+            self.selected_connection_waypoint = null;
+            self.dragging_connection_waypoint = null;
+            self.connection_reroute_mutation_count +%= 1;
+            return true;
+        }
+        return false;
     }
 
     fn retainExistingConnectionSelection(self: *State, connections: []const Connection) void {
@@ -2372,6 +2669,7 @@ pub const State = struct {
             var duplicate = connection;
             duplicate.from_id = from_id;
             duplicate.to_id = to_id;
+            offsetConnectionWaypoints(&duplicate, offset);
             if (!connectionExists(connections[0..append_index], duplicate)) {
                 connections[append_index] = duplicate;
                 append_index += 1;
@@ -2431,8 +2729,23 @@ pub const State = struct {
         return bounds;
     }
 
+    pub fn selectedGraphBoundsWithConnections(self: *const State, nodes: []const Node, node_len: usize, groups: []const Group, connections: []const Connection, connection_len: usize) ?Rect {
+        var bounds = self.selectedGraphBounds(nodes, node_len, groups);
+        const active_nodes = nodes[0..@min(node_len, nodes.len)];
+        for (connections[0..@min(connection_len, connections.len)]) |connection| {
+            if (!self.isConnectionSelected(connection)) continue;
+            if (connectionGraphBounds(active_nodes, connection)) |connection_bounds| includeBounds(&bounds, connection_bounds);
+        }
+        return bounds;
+    }
+
     pub fn focusSelectionInViewport(self: *State, viewport: Rect, nodes: []const Node, node_len: usize, groups: []const Group) bool {
         const bounds = self.selectedGraphBounds(nodes, node_len, groups) orelse return false;
+        return self.frameGraphBoundsInViewport(viewport, bounds, 0.18);
+    }
+
+    pub fn focusSelectionWithConnectionsInViewport(self: *State, viewport: Rect, nodes: []const Node, node_len: usize, groups: []const Group, connections: []const Connection, connection_len: usize) bool {
+        const bounds = self.selectedGraphBoundsWithConnections(nodes, node_len, groups, connections, connection_len) orelse return false;
         return self.frameGraphBoundsInViewport(viewport, bounds, 0.18);
     }
 
@@ -2440,6 +2753,13 @@ pub const State = struct {
         const count = @min(node_len, nodes.len);
         if (count == 0 and groups.len == 0) return false;
         return self.frameGraphBoundsInViewport(viewport, graphBounds(nodes[0..count], groups), 0.14);
+    }
+
+    pub fn frameAllWithConnectionsInViewport(self: *State, viewport: Rect, nodes: []const Node, node_len: usize, groups: []const Group, connections: []const Connection, connection_len: usize) bool {
+        const count = @min(node_len, nodes.len);
+        const active_connections = connections[0..@min(connection_len, connections.len)];
+        if (count == 0 and groups.len == 0 and active_connections.len == 0) return false;
+        return self.frameGraphBoundsInViewport(viewport, graphBoundsWithConnections(nodes[0..count], groups, active_connections), 0.14);
     }
 
     pub fn canReconnectSelectedConnectionToPreviousNode(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize) bool {
@@ -2843,6 +3163,7 @@ pub const State = struct {
             var pasted = connection;
             pasted.from_id = from_id;
             pasted.to_id = to_id;
+            offsetConnectionWaypoints(&pasted, delta);
             if (connectionAllowed(nodes[0..append_node], connections[0..append_connection], pasted, policy, .{})) {
                 connections[append_connection] = pasted;
                 append_connection += 1;
@@ -2888,7 +3209,15 @@ pub const State = struct {
                 try items.append(allocator, .{ .command_id = NodeEditorCommand.select_all.commandId(), .enabled = @min(node_len, nodes.len) > 0 });
                 try items.append(allocator, .{ .command_id = NodeEditorCommand.frame_all.commandId(), .enabled = @min(node_len, nodes.len) > 0 });
             },
-            .connection, .input_port, .output_port => {
+            .connection => {
+                try items.append(allocator, .{ .command_id = NodeEditorCommand.disconnect_selected_link.commandId(), .enabled = self.selectedConnectionExists(connections, connection_len) });
+                try items.append(allocator, .{ .command_id = NodeEditorCommand.add_connection_waypoint.commandId(), .enabled = self.canAddSelectedConnectionWaypoint(connections, connection_len) });
+                try items.append(allocator, .{ .command_id = NodeEditorCommand.remove_connection_waypoint.commandId(), .enabled = self.canRemoveSelectedConnectionWaypoint(connections, connection_len) });
+                try items.append(allocator, .{ .command_id = NodeEditorCommand.clear_connection_waypoints.commandId(), .enabled = self.canClearSelectedConnectionWaypoints(connections, connection_len) });
+                try items.append(allocator, .{ .command_id = NodeEditorCommand.select_upstream_nodes.commandId(), .enabled = self.canSelectConnectedNodes(connections, connection_len, nodes, node_len, .select_upstream_nodes) });
+                try items.append(allocator, .{ .command_id = NodeEditorCommand.select_downstream_nodes.commandId(), .enabled = self.canSelectConnectedNodes(connections, connection_len, nodes, node_len, .select_downstream_nodes) });
+            },
+            .input_port, .output_port => {
                 try items.append(allocator, .{ .command_id = NodeEditorCommand.disconnect_selected_link.commandId(), .enabled = self.selectedConnectionExists(connections, connection_len) });
                 try items.append(allocator, .{ .command_id = NodeEditorCommand.select_upstream_nodes.commandId(), .enabled = self.canSelectConnectedNodes(connections, connection_len, nodes, node_len, .select_upstream_nodes) });
                 try items.append(allocator, .{ .command_id = NodeEditorCommand.select_downstream_nodes.commandId(), .enabled = self.canSelectConnectedNodes(connections, connection_len, nodes, node_len, .select_downstream_nodes) });
@@ -3397,6 +3726,13 @@ pub const State = struct {
         return selected_connection_count;
     }
 
+    fn offsetConnectionWaypoints(connection: *Connection, delta: [2]f32) void {
+        for (connection.waypoints[0..connection.boundedWaypointCount()]) |*waypoint| {
+            waypoint[0] += delta[0];
+            waypoint[1] += delta[1];
+        }
+    }
+
     pub fn connectionExists(connections: []const Connection, needle: Connection) bool {
         for (connections) |connection| {
             if (State.connectionEndpointsEqual(connection, needle)) return true;
@@ -3447,6 +3783,7 @@ pub const State = struct {
         self.resizing_group_edges = .{};
         self.resizing_node_id = null;
         self.resizing_node_edges = .{};
+        self.dragging_connection_waypoint = null;
         self.interaction_history_pushed = false;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
@@ -3873,7 +4210,11 @@ pub const State = struct {
     fn addConnectionToSelectionMixed(self: *State, connection: Connection) void {
         if (self.isConnectionSelected(connection)) return;
         if (self.selected_connections.len == 0) {
-            if (self.selected_connection == null) self.selected_connection = connection;
+            if (self.selected_connection == null) {
+                self.selected_connection = connection;
+                self.selected_connection_waypoint = null;
+                self.dragging_connection_waypoint = null;
+            }
             return;
         }
         if (self.storedConnectionSelectionLen() == 0) {
@@ -3887,6 +4228,8 @@ pub const State = struct {
         self.selected_connections[self.selected_connection_len] = connection;
         self.selected_connection_len += 1;
         self.selected_connection = connection;
+        self.selected_connection_waypoint = null;
+        self.dragging_connection_waypoint = null;
     }
 
     fn removeConnectionFromSelectionMixed(self: *State, connection: Connection) void {
@@ -3903,7 +4246,11 @@ pub const State = struct {
             write += 1;
         }
         self.selected_connection_len = write;
-        if (primary_removed) self.selected_connection = if (write > 0) self.selected_connections[write - 1] else null;
+        if (primary_removed) {
+            self.selected_connection = if (write > 0) self.selected_connections[write - 1] else null;
+            self.selected_connection_waypoint = null;
+            self.dragging_connection_waypoint = null;
+        }
     }
 
     fn selectedNodeSelectionHash(self: *const State) u64 {
@@ -3986,6 +4333,7 @@ pub const State = struct {
         self.dragging_node_id = null;
         self.resizing_node_id = null;
         self.resizing_node_edges = .{};
+        self.dragging_connection_waypoint = null;
         _ = self.finishBoxSelection(false);
         self.connection_preview = preview;
         return changed;
@@ -4163,6 +4511,11 @@ fn editorNodeResizeOptions(editor: anytype) NodeResizeOptions {
     return if (@hasField(Editor, "node_resize")) editor.node_resize else .{};
 }
 
+fn editorConnectionRerouteOptions(editor: anytype) ConnectionRerouteOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "connection_reroute")) editor.connection_reroute else .{};
+}
+
 fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: anytype, viewport_index: ?*ViewportIndex, direction: NodeNavigationDirection) bool {
     const options = editorSpatialNavigationOptions(editor);
     if (!options.enabled or input.control_down or input.super_down or input.alt_down) return false;
@@ -4230,7 +4583,7 @@ fn topologyDirectionForNavigation(flow_direction: ?graph_layout.LayeredLayoutDir
 fn editorDragAutoPanActive(editor: anytype) bool {
     return editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or
         editor.state.resizing_group_id != null or editor.state.resizing_node_id != null or editor.state.dragging_connection_from_id != null or
-        editor.state.reconnecting_connection != null or editor.state.box_selecting;
+        editor.state.reconnecting_connection != null or editor.state.dragging_connection_waypoint != null or editor.state.box_selecting;
 }
 
 fn editorDragAutoPanDelta(rect: Rect, editor: anytype, point: [2]f32) [2]f32 {
@@ -4356,14 +4709,24 @@ fn appendNodeEditorConnectionItem(allocator: std.mem.Allocator, out: *std.ArrayL
     const hovered = editor.state.isConnectionHovered(connection);
     const color = if (selected) editor.selected_color else if (hovered) connection.color.lighten(0.12) else connection.color;
     const width: f32 = if (selected) 3.25 else if (hovered) 2.7 else 2.0;
+    if (connection.boundedWaypointCount() == 0) {
+        if (connection_draw_workspace) |workspace| {
+            if (connection_index < workspace.path_commands.len) {
+                workspace.borrowed_connection_count += 1;
+                return appendNodeEditorConnectionBorrowed(allocator, out, connection_path_cache, &workspace.path_commands[connection_index], a, b, color, width, layer);
+            }
+            workspace.fallback_connection_count += 1;
+        }
+        return appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, width, layer);
+    }
     if (connection_draw_workspace) |workspace| {
-        if (connection_index < workspace.path_commands.len) {
+        if (connection_index < workspace.routed_path_commands.len) {
             workspace.borrowed_connection_count += 1;
-            return appendNodeEditorConnectionBorrowed(allocator, out, connection_path_cache, &workspace.path_commands[connection_index], a, b, color, width, layer);
+            return appendNodeEditorRoutedConnectionBorrowed(allocator, out, connection_path_cache, &workspace.routed_path_commands[connection_index], rect, editor.state.*, connection, a, b, color, width, layer);
         }
         workspace.fallback_connection_count += 1;
     }
-    try appendNodeEditorConnection(allocator, out, connection_path_cache, a, b, color, width, layer);
+    try appendNodeEditorRoutedConnection(allocator, out, connection_path_cache, rect, editor.state.*, connection, a, b, color, width, layer);
 }
 
 fn appendNodeEditorConnectionBorrowed(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), cache: ?*ConnectionPathCache, commands: *[2]render.PathCommand, a: [2]f32, b: [2]f32, color: Color, width: f32, layer: i32) !void {
@@ -4376,6 +4739,41 @@ fn appendNodeEditorConnectionBorrowed(allocator: std.mem.Allocator, out: *std.Ar
         .color = color,
         .layer = layer,
         .owns_commands = false,
+    } });
+}
+
+fn appendNodeEditorRoutedConnectionBorrowed(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), cache: ?*ConnectionPathCache, commands: *[connection_path_command_capacity]render.PathCommand, rect: Rect, state: State, connection: Connection, a: [2]f32, b: [2]f32, color: Color, width: f32, layer: i32) !void {
+    const segment_count = connection.boundedWaypointCount() + 1;
+    commands[0] = .{ .move_to = a };
+    for (0..segment_count) |segment_index| {
+        const path = connectionSegmentPath(rect, state, connection, a, b, segment_index);
+        const resolved = if (cache) |connection_cache| connection_cache.pathFor(path.start, path.end) else path;
+        commands[segment_index + 1] = .{ .cubic_to = .{ .c0 = resolved.c0, .c1 = resolved.c1, .end = resolved.end } };
+    }
+    try out.append(allocator, .{ .stroke_path = .{
+        .commands = commands[0 .. segment_count + 1],
+        .style = .{ .width = width, .cap = .round, .join = .round },
+        .color = color,
+        .layer = layer,
+        .owns_commands = false,
+    } });
+}
+
+fn appendNodeEditorRoutedConnection(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), cache: ?*ConnectionPathCache, rect: Rect, state: State, connection: Connection, a: [2]f32, b: [2]f32, color: Color, width: f32, layer: i32) !void {
+    const segment_count = connection.boundedWaypointCount() + 1;
+    const commands = try allocator.alloc(render.PathCommand, segment_count + 1);
+    commands[0] = .{ .move_to = a };
+    for (0..segment_count) |segment_index| {
+        const path = connectionSegmentPath(rect, state, connection, a, b, segment_index);
+        const resolved = if (cache) |connection_cache| connection_cache.pathFor(path.start, path.end) else path;
+        commands[segment_index + 1] = .{ .cubic_to = .{ .c0 = resolved.c0, .c1 = resolved.c1, .end = resolved.end } };
+    }
+    errdefer allocator.free(commands);
+    try out.append(allocator, .{ .stroke_path = .{
+        .commands = commands,
+        .style = .{ .width = width, .cap = .round, .join = .round },
+        .color = color,
+        .layer = layer,
     } });
 }
 
@@ -4468,10 +4866,43 @@ pub fn appendNodeEditorConnectionOverlay(allocator: std.mem.Allocator, out: *std
 fn appendNodeEditorConnectionOverlayPrepared(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, layer: i32) !void {
     try appendNodeEditorConnectionPreviewOverlay(allocator, out, rect, editor, layer + 3);
     if (editorDetailLevel(editor) == .overview) return;
+    try appendNodeEditorWaypointOverlay(allocator, out, rect, editor, viewport_index, layer + 7);
     if (viewport_index) |index| {
         for (index.visibleNodeIndices()) |node_index| try appendNodeEditorPortOverlay(allocator, out, rect, editor, editor.nodes[node_index], layer);
     } else {
         for (editor.nodes) |node_item| try appendNodeEditorPortOverlay(allocator, out, rect, editor, node_item, layer);
+    }
+}
+
+fn appendNodeEditorWaypointOverlay(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, layer: i32) !void {
+    const options = editorConnectionRerouteOptions(editor);
+    if (!options.enabled or !options.show_waypoints) return;
+    const connections = editorActiveConnections(editor);
+    if (viewport_index) |index| {
+        for (index.visibleConnectionIndices()) |connection_index| {
+            const connection = connections[connection_index];
+            if (!editor.state.isConnectionSelected(connection)) continue;
+            try appendConnectionWaypointMarks(allocator, out, rect, editor, connection, layer);
+        }
+        return;
+    }
+    for (connections) |connection| {
+        if (editor.state.isConnectionSelected(connection)) try appendConnectionWaypointMarks(allocator, out, rect, editor, connection, layer);
+    }
+}
+
+fn appendConnectionWaypointMarks(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, connection: Connection, layer: i32) !void {
+    for (0..connection.boundedWaypointCount()) |waypoint_index| {
+        const position = graphToScreen(rect, editor.state.*, connection.waypoints[waypoint_index]);
+        const active = editor.state.selected_connection != null and
+            State.connectionEndpointsEqual(editor.state.selected_connection.?, connection) and
+            editor.state.selected_connection_waypoint != null and editor.state.selected_connection_waypoint.? == waypoint_index;
+        try out.append(allocator, .{ .point = .{
+            .pos = position,
+            .size = if (active) 8.0 else 6.0,
+            .color = if (active) editor.selected_color.lighten(0.12) else editor.selected_color,
+            .layer = layer,
+        } });
     }
 }
 
@@ -5223,6 +5654,22 @@ fn resizeNodeBy(editor: anytype, id: u32, edges: NodeResizeEdges, delta_screen: 
     return changed;
 }
 
+fn dragConnectionWaypointBy(editor: anytype, delta_screen: [2]f32) bool {
+    const connections = editor.mutable_connections orelse return false;
+    const connection_len = if (editor.mutable_connection_len) |len| @min(len.*, connections.len) else connections.len;
+    const zoom = @max(0.0001, editor.state.zoom);
+    return editor.state.moveSelectedConnectionWaypointBy(connections, connection_len, .{ delta_screen[0] / zoom, delta_screen[1] / zoom });
+}
+
+fn removeSelectedConnectionWaypointWithHistory(editor: anytype) bool {
+    if (!editorConnectionRerouteOptions(editor).enabled) return false;
+    const connections = editor.mutable_connections orelse return false;
+    const connection_len = if (editor.mutable_connection_len) |len| @min(len.*, connections.len) else connections.len;
+    if (!editor.state.canRemoveSelectedConnectionWaypoint(connections, connection_len)) return false;
+    const history_mutation = beginEditorHistory(editor) orelse return false;
+    return finishEditorHistory(editor, history_mutation, editor.state.removeSelectedConnectionWaypoint(connections, connection_len));
+}
+
 fn dragPreviewCompatible(editor: anytype, input_hover: ?PortHit) bool {
     const from_id = editor.state.dragging_connection_from_id orelse return true;
     const hit = input_hover orelse return true;
@@ -5302,12 +5749,39 @@ pub fn connectionAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*Vi
             const to = editor.nodes[to_index];
             const a = outputPortPositionAt(rect, editor.state.*, from, connection.from_port);
             const b = inputPortPositionAt(rect, editor.state.*, to, connection.to_port);
-            const path = connectionPathForPoints(a, b);
-            if (cubicDistanceToPoint(path.start, path.c0, path.c1, path.end, point) <= 7.0) return connection;
+            var segment_index: usize = 0;
+            while (segment_index <= connection.boundedWaypointCount()) : (segment_index += 1) {
+                const path = connectionSegmentPath(rect, editor.state.*, connection, a, b, segment_index);
+                if (cubicDistanceToPoint(path.start, path.c0, path.c1, path.end, point) <= 7.0) return connection;
+            }
         }
         return null;
     }
     return connectionAtPoint(rect, editor.state.*, editor.nodes, null, null, connections, point);
+}
+
+pub fn connectionWaypointAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?ConnectionWaypointHit {
+    const options = editorConnectionRerouteOptions(editor);
+    if (!options.enabled or editorDetailLevel(editor) == .overview) return null;
+    const connections = editorActiveConnections(editor);
+    if (viewport_index) |index| {
+        const candidates = index.connectionIndicesNearPoint(rect, editor.state.pan, editor.state.zoom, point, @max(0.0, options.hit_radius));
+        var i = candidates.len;
+        while (i > 0) {
+            i -= 1;
+            const connection = connections[candidates[i]];
+            if (!editor.state.isConnectionSelected(connection)) continue;
+            if (connectionWaypointAtPoint(rect, editor.state.*, &.{connection}, point, options.hit_radius)) |hit| return hit;
+        }
+        return null;
+    }
+    var i = connections.len;
+    while (i > 0) {
+        i -= 1;
+        if (!editor.state.isConnectionSelected(connections[i])) continue;
+        if (connectionWaypointAtPoint(rect, editor.state.*, connections[i .. i + 1], point, options.hit_radius)) |hit| return hit;
+    }
+    return null;
 }
 
 pub fn nodeAtEditorPoint(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) ?usize {
@@ -5396,7 +5870,7 @@ pub const EventInputModifiers = struct {
 };
 
 pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype, event: anytype) bool {
-    const geometry_drag_active = editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or editor.state.resizing_group_id != null or editor.state.resizing_node_id != null;
+    const geometry_drag_active = editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or editor.state.resizing_group_id != null or editor.state.resizing_node_id != null or editor.state.dragging_connection_waypoint != null;
     const skip_prepare = switch (event.*) {
         .mouse_move => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap or editor.state.box_selecting,
         .mouse_up => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap,
@@ -5413,6 +5887,16 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
                 const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
                 return editor.state.updateBoxSelect(.{ m.x, m.y }) or panned;
+            }
+            if (editor.state.dragging_connection_waypoint != null) {
+                const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
+                const drag_delta = [2]f32{ m.dx - auto_pan_delta[0], m.dy - auto_pan_delta[1] };
+                if (@abs(drag_delta[0]) <= 0.001 and @abs(drag_delta[1]) <= 0.001) return false;
+                const history_mutation = beginInteractionHistoryIfNeeded(editor) orelse return false;
+                const moved = dragConnectionWaypointBy(editor, drag_delta);
+                if (!moved) return false;
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                return finishInteractionHistory(editor, history_mutation, true) or panned;
             }
             if (editor.state.reconnecting_connection != null) {
                 const input_before_pan = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
@@ -5523,6 +6007,14 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
         .mouse_down => |m| {
             if (m.button == .right) {
                 const point = [2]f32{ m.x, m.y };
+                if (connectionWaypointAtEditorPoint(rect, editor, viewport_index, point)) |hit| {
+                    _ = editor.state.setConnectionSelectionPrimary(hit.connection);
+                    editor.state.selected_connection_waypoint = hit.waypoint_index;
+                    editor.state.context_menu.connection = hit.connection;
+                    editor.state.context_menu.node_id = null;
+                    editor.state.context_menu.group_id = null;
+                    return editor.state.openContextMenu(.connection, point);
+                }
                 if (inputPortAtEditorPoint(rect, editor, viewport_index, point)) |hit| {
                     editor.state.context_menu.node_id = editor.nodes[hit.node_index].id;
                     editor.state.context_menu.port_index = hit.port_index;
@@ -5547,6 +6039,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 }
                 if (connectionAtEditorPoint(rect, editor, viewport_index, point)) |connection| {
                     _ = editor.state.setConnectionSelectionPrimary(connection);
+                    editor.state.selected_connection_waypoint = null;
                     editor.state.context_menu.connection = connection;
                     editor.state.context_menu.node_id = null;
                     editor.state.context_menu.group_id = null;
@@ -5574,6 +6067,9 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                     return editor.state.beginMinimapDrag(rect, snapshot, point);
                 }
             }
+            if (connectionWaypointAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
+                return editor.state.beginConnectionWaypointDrag(hit.connection, hit.waypoint_index);
+            }
             if (m.click_count == 2 and editorNodeCollapseOptions(editor).enabled and
                 inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null and
                 outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null)
@@ -5589,6 +6085,21 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                         _ = editor.state.setSingleSelection(node.id);
                         return finishEditorHistory(editor, mutation, editor.state.toggleNodeCollapsed(nodes, node_len, node.id));
                     }
+                }
+            }
+            if (m.click_count == 2 and editorConnectionRerouteOptions(editor).enabled and
+                inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null and
+                outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null)
+            {
+                const point = [2]f32{ m.x, m.y };
+                if (connectionAtEditorPoint(rect, editor, viewport_index, point)) |connection| {
+                    const connections = editor.mutable_connections orelse return false;
+                    const connection_len = if (editor.mutable_connection_len) |len| @min(len.*, connections.len) else connections.len;
+                    const segment_index = connectionSegmentAtPoint(rect, editor.state.*, editor.nodes, connection, point) orelse return false;
+                    const mutation = beginEditorHistory(editor) orelse return false;
+                    _ = editor.state.setConnectionSelection(connection);
+                    const changed = editor.state.addConnectionWaypoint(connections, connection_len, connection, segment_index, screenToGraph(rect, editor.state.*, point));
+                    return finishEditorHistory(editor, mutation, changed);
                 }
             }
             if (editor.state.selected_connection) |selected_connection| {
@@ -5761,6 +6272,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 editor.state.connection_preview_valid = true;
                 return true;
             }
+            if (editor.state.dragging_connection_waypoint != null) return editor.state.endDrag();
             return editor.state.endDrag();
         },
         .mouse_wheel => |w| {
@@ -5772,6 +6284,10 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             return editor.state.zoomAt(rect, .{ p.x, p.y }, @floatCast(p.scale_delta));
         },
         .key_down => |key| switch (key) {
+            .delete, .backspace => {
+                if (editorConnectionRerouteOptions(editor).enabled) return removeSelectedConnectionWaypointWithHistory(editor);
+                return false;
+            },
             .left => return navigateEditorNodeSelection(rect, input, editor, viewport_index, .left),
             .right => return navigateEditorNodeSelection(rect, input, editor, viewport_index, .right),
             .up => return navigateEditorNodeSelection(rect, input, editor, viewport_index, .up),
@@ -6352,6 +6868,85 @@ test "collapsed node paint omits ambiguous ports and keeps disclosure indicator"
     };
     try std.testing.expectEqual(@as(usize, 0), point_count);
     try std.testing.expect(line_count >= 2);
+}
+
+test "routed connections hit every segment and paint one borrowed path" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 500, .h = 300 };
+    var selected_connections: [2]Connection = undefined;
+    var state = State{ .selected_connections = &selected_connections };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "source", .pos = .{ -180, -40 }, .size = .{ .w = 80, .h = 80 } },
+        .{ .id = 2, .title = "sink", .pos = .{ 100, -40 }, .size = .{ .w = 80, .h = 80 } },
+    };
+    const connection = Connection{ .from_id = 1, .to_id = 2, .waypoints = .{ .{ 0, -90 }, .{ 40, 70 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 2 };
+    const connections = [_]Connection{connection};
+    _ = state.setConnectionSelection(connection);
+    const waypoint = connectionWaypointPosition(viewport, state, connection, 1) orelse return error.MissingWaypoint;
+    try std.testing.expectEqual(@as(?ConnectionWaypointHit, .{ .connection = connection, .waypoint_index = 1 }), connectionWaypointAtPoint(viewport, state, &connections, waypoint, 8));
+    try std.testing.expect(connectionHit(viewport, state, &nodes, connection, waypoint));
+
+    var draw_storage = StaticConnectionDrawWorkspace(1){};
+    var draw_workspace = draw_storage.workspace();
+    const editor = Options(State){ .state = &state, .nodes = &nodes, .connections = &connections, .connection_draw_workspace = &draw_workspace, .connection_reroute = .{ .enabled = true }, .show_minimap = false, .grid_color = Color.transparent };
+    var out = std.ArrayList(DrawCmd).empty;
+    defer out.deinit(std.testing.allocator);
+    _ = try appendNodeEditor(std.testing.allocator, &out, viewport, editor, 0);
+    var routed_stroke_count: usize = 0;
+    var waypoint_mark_count: usize = 0;
+    for (out.items) |command| switch (command) {
+        .stroke_path => |stroke| {
+            routed_stroke_count += 1;
+            try std.testing.expectEqual(@as(usize, 4), stroke.commands.len);
+            try std.testing.expect(!stroke.owns_commands);
+        },
+        .point => |point| if (point.size >= 6.0) {
+            waypoint_mark_count += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), routed_stroke_count);
+    try std.testing.expectEqual(@as(usize, 2), waypoint_mark_count);
+}
+
+test "connection waypoint edits preserve order capacity and selection copies" {
+    var selected_storage: [2]Connection = undefined;
+    var state = State{ .selected_connections = &selected_storage };
+    var connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.addConnectionWaypoint(&connections, connections.len, connections[0], 0, .{ 20, 10 }));
+    try std.testing.expect(state.addConnectionWaypoint(&connections, connections.len, connections[0], 0, .{ 10, -5 }));
+    try std.testing.expectEqual(@as(usize, 2), connections[0].boundedWaypointCount());
+    try std.testing.expectEqual([2]f32{ 10, -5 }, connections[0].waypoints[0]);
+    try std.testing.expectEqual([2]f32{ 20, 10 }, connections[0].waypoints[1]);
+    try std.testing.expectEqual(connections[0], state.selected_connection.?);
+
+    while (connections[0].boundedWaypointCount() < max_connection_waypoints) {
+        const index = connections[0].boundedWaypointCount();
+        try std.testing.expect(state.addConnectionWaypoint(&connections, connections.len, connections[0], index, .{ @floatFromInt(index), 0 }));
+    }
+    const full = connections[0];
+    try std.testing.expect(!state.addConnectionWaypoint(&connections, connections.len, connections[0], max_connection_waypoints, .{ 99, 99 }));
+    try std.testing.expectEqual(full, connections[0]);
+}
+
+test "duplicate and paste translate routed waypoints with graph content" {
+    var selected = [_]u32{ 1, 2, 0, 0 };
+    var state = State{ .selected_node_ids = &selected, .selected_node_len = 2, .selected_node_id = 2 };
+    var nodes: [6]Node = undefined;
+    nodes[0] = .{ .id = 1, .title = "A", .pos = .{ 0, 0 } };
+    nodes[1] = .{ .id = 2, .title = "B", .pos = .{ 120, 0 } };
+    var node_len: usize = 2;
+    var connections: [4]Connection = undefined;
+    connections[0] = .{ .from_id = 1, .to_id = 2, .waypoints = .{ .{ 80, 90 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 1 };
+    var connection_len: usize = 1;
+
+    try std.testing.expect(state.duplicateSelectedNodesAndConnections(&nodes, &node_len, &connections, &connection_len, 1000, .{ 30, 20 }));
+    try std.testing.expectEqual([2]f32{ 110, 110 }, connections[1].waypoints[0]);
+
+    var clipboard = Clipboard{};
+    try std.testing.expect(state.copySelectionToClipboard(&nodes, node_len, &connections, connection_len, &clipboard));
+    try std.testing.expect(state.pasteClipboard(&nodes, &node_len, &connections, &connection_len, &clipboard, .{ 10, 5 }));
+    try std.testing.expectEqual([2]f32{ 120, 115 }, connections[2].waypoints[0]);
 }
 
 test "NodeEditor mutable connections replace static connections in paint and hit paths" {

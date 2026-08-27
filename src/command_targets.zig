@@ -150,6 +150,9 @@ fn nodeEditorDisabledReason(context: *const CommandContext, command: NodeEditorC
         .reconnect_to_previous, .reconnect_to_next => "reconnect unavailable",
         .auto_layout_layered => if (context.layout_workspace == null) "layout workspace unavailable" else "layout unavailable",
         .toggle_selected_nodes_collapsed, .collapse_selected_nodes, .expand_selected_nodes => "selection collapse state unchanged",
+        .add_connection_waypoint => "selected connection cannot accept another waypoint",
+        .remove_connection_waypoint => "waypoint unavailable",
+        .clear_connection_waypoints => "selected connection has no waypoints",
     };
 }
 

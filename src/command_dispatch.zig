@@ -44,7 +44,7 @@ pub const CommandContext = struct {
 pub fn commandFromId(command_id: CommandId) ?NodeEditorCommand {
     if (command_id < commands.node_editor_command_id_base) return null;
     const raw = command_id - commands.node_editor_command_id_base;
-    if (raw > @intFromEnum(NodeEditorCommand.expand_selected_nodes)) return null;
+    if (raw > @intFromEnum(NodeEditorCommand.clear_connection_waypoints)) return null;
     return @enumFromInt(raw);
 }
 
@@ -119,6 +119,9 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .toggle_selected_nodes_collapsed => context.state.canToggleSelectedNodesCollapsed(context.nodes, node_count),
         .collapse_selected_nodes => context.state.canSetSelectedNodesCollapsed(context.nodes, node_count, true),
         .expand_selected_nodes => context.state.canSetSelectedNodesCollapsed(context.nodes, node_count, false),
+        .add_connection_waypoint => context.connection_len != null and context.state.canAddSelectedConnectionWaypoint(context.connections, connection_count),
+        .remove_connection_waypoint => context.connection_len != null and context.state.canRemoveSelectedConnectionWaypoint(context.connections, connection_count),
+        .clear_connection_waypoints => context.connection_len != null and context.state.canClearSelectedConnectionWaypoints(context.connections, connection_count),
     };
 }
 
@@ -129,11 +132,11 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .clear_selection => context.state.clearSelection(),
         .select_all => context.state.selectAllNodes(context.nodes, node_count),
         .focus_selection => if (context.viewport) |viewport|
-            context.state.focusSelectionInViewport(viewport, context.nodes, node_count, context.groups[0..activeGroupCount(context)])
+            context.state.focusSelectionWithConnectionsInViewport(viewport, context.nodes, node_count, context.groups[0..activeGroupCount(context)], context.connections, activeConnectionCount(context))
         else
             context.state.lastSelectedNodeId() != null,
         .frame_all => if (context.viewport) |viewport|
-            context.state.frameAllInViewport(viewport, context.nodes, node_count, context.groups[0..activeGroupCount(context)])
+            context.state.frameAllWithConnectionsInViewport(viewport, context.nodes, node_count, context.groups[0..activeGroupCount(context)], context.connections, activeConnectionCount(context))
         else
             context.state.centerViewportOnGraphPoint(.{ .x = 0, .y = 0, .w = 640, .h = 360 }, .{ 0, 0 }),
         .copy_selection => copySelection(context),
@@ -163,6 +166,9 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .toggle_selected_nodes_collapsed => setSelectedNodesCollapsed(context, null),
         .collapse_selected_nodes => setSelectedNodesCollapsed(context, true),
         .expand_selected_nodes => setSelectedNodesCollapsed(context, false),
+        .add_connection_waypoint => addSelectedConnectionWaypoint(context),
+        .remove_connection_waypoint => mutateSelectedConnectionWaypoints(context, false),
+        .clear_connection_waypoints => mutateSelectedConnectionWaypoints(context, true),
     };
 }
 
@@ -287,6 +293,9 @@ pub fn canRecordNodeEditorCommand(context: *const CommandContext, command: NodeE
         .toggle_selected_nodes_collapsed,
         .collapse_selected_nodes,
         .expand_selected_nodes,
+        .add_connection_waypoint,
+        .remove_connection_waypoint,
+        .clear_connection_waypoints,
         => canRecordHistory(context),
         else => true,
     };
@@ -443,6 +452,44 @@ fn setSelectedNodesCollapsed(context: *CommandContext, collapsed: ?bool) bool {
         context.state.setSelectedNodesCollapsed(context.nodes, activeNodeCount(context), value)
     else
         context.state.toggleSelectedNodesCollapsed(context.nodes, activeNodeCount(context));
+    const committed = finishHistoryMutation(history_mutation, changed);
+    if (committed) if (context.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
+    return committed;
+}
+
+fn addSelectedConnectionWaypoint(context: *CommandContext) bool {
+    const target = context.state.selected_connection orelse return false;
+    const from = node_editor.nodeById(context.nodes[0..activeNodeCount(context)], target.from_id) orelse return false;
+    const to = node_editor.nodeById(context.nodes[0..activeNodeCount(context)], target.to_id) orelse return false;
+    const viewport = context.viewport;
+    const context_point = context.state.context_menu.screen_pos;
+    const use_context_point = context.state.context_menu.open and context.state.context_menu.target == .connection and viewport != null;
+    const segment_index = if (use_context_point)
+        node_editor.connectionSegmentAtPoint(viewport.?, context.state.*, context.nodes[0..activeNodeCount(context)], target, context_point) orelse target.boundedWaypointCount()
+    else
+        target.boundedWaypointCount();
+    const start = if (segment_index == 0)
+        node_editor.outputPortGraphPositionAt(from, target.from_port)
+    else
+        target.waypoints[segment_index - 1];
+    const end = if (segment_index >= target.boundedWaypointCount()) node_editor.inputPortGraphPositionAt(to, target.to_port) else target.waypoints[segment_index];
+    const waypoint = if (use_context_point)
+        node_editor.screenToGraph(viewport.?, context.state.*, context_point)
+    else
+        [2]f32{ (start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5 };
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    const changed = context.state.addConnectionWaypoint(context.connections, activeConnectionCount(context), target, segment_index, waypoint);
+    const committed = finishHistoryMutation(history_mutation, changed);
+    if (committed) if (context.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
+    return committed;
+}
+
+fn mutateSelectedConnectionWaypoints(context: *CommandContext, clear_all: bool) bool {
+    const history_mutation = beginHistoryMutation(context) orelse return false;
+    const changed = if (clear_all)
+        context.state.clearSelectedConnectionWaypoints(context.connections, activeConnectionCount(context))
+    else
+        context.state.removeSelectedConnectionWaypoint(context.connections, activeConnectionCount(context));
     const committed = finishHistoryMutation(history_mutation, changed);
     if (committed) if (context.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
     return committed;
@@ -1067,4 +1114,46 @@ test "zui-nodes collapse command rejects insufficient history atomically" {
     try std.testing.expect(!dispatch(&context, .collapse_selected_nodes));
     for (nodes) |node| try std.testing.expect(!node.collapsed);
     try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+}
+
+test "zui-nodes waypoint commands preserve selection and undo atomically" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [2]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -120, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 2 }};
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    _ = state.setConnectionSelection(connections[0]);
+    var context = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .history = &history,
+        .viewport_index = &viewport_index,
+        .viewport = .{ .x = 0, .y = 0, .w = 400, .h = 240 },
+    };
+
+    try std.testing.expect(dispatch(&context, .add_connection_waypoint));
+    try std.testing.expectEqual(@as(usize, 1), connections[0].boundedWaypointCount());
+    try std.testing.expectEqual(connections[0], state.selected_connection.?);
+    try std.testing.expectEqual(@as(?u8, 0), state.selected_connection_waypoint);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expectEqual(@as(usize, 0), connections[0].boundedWaypointCount());
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expectEqual(@as(usize, 1), connections[0].boundedWaypointCount());
+
+    _ = state.setConnectionSelection(connections[0]);
+    state.selected_connection_waypoint = 0;
+    try std.testing.expect(dispatch(&context, .remove_connection_waypoint));
+    try std.testing.expectEqual(@as(usize, 0), connections[0].boundedWaypointCount());
 }

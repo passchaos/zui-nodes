@@ -41,6 +41,7 @@ pub const SummaryOptions = struct {
     spatial_navigation: node_editor.SpatialNavigationOptions = .{},
     node_collapse: node_editor.NodeCollapseOptions = .{},
     node_resize: node_editor.NodeResizeOptions = .{},
+    connection_reroute: node_editor.ConnectionRerouteOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -85,6 +86,10 @@ pub const Summary = struct {
     node_collapse_mutation_count: u64 = 0,
     node_resize_enabled: bool = false,
     resizing_node_id: ?u32 = null,
+    connection_waypoint_count: usize = 0,
+    selected_connection_waypoint: ?u8 = null,
+    connection_reroute_enabled: bool = false,
+    connection_reroute_mutation_count: u64 = 0,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -138,9 +143,9 @@ pub fn summarize(options: SummaryOptions) Summary {
         if (viewport_index.graphBounds()) |bounds|
             node_editor.minimapSnapshotFromGraphBounds(options.viewport, state.*, node_editor.paddedBounds(bounds, 0.12), options.minimap_size)
         else
-            node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size)
+            node_editor.minimapSnapshotFromGraphBounds(options.viewport, state.*, node_editor.paddedBounds(node_editor.graphBoundsWithConnections(options.nodes, options.groups, options.connections), 0.12), options.minimap_size)
     else
-        node_editor.minimapSnapshot(options.viewport, state.*, options.nodes, options.groups, options.minimap_size);
+        node_editor.minimapSnapshotFromGraphBounds(options.viewport, state.*, node_editor.paddedBounds(node_editor.graphBoundsWithConnections(options.nodes, options.groups, options.connections), 0.12), options.minimap_size);
     var collapsed_node_count: usize = 0;
     var selected_collapsed_node_count: usize = 0;
     for (options.nodes) |node| {
@@ -148,6 +153,8 @@ pub fn summarize(options: SummaryOptions) Summary {
         collapsed_node_count += 1;
         if (state.isNodeSelected(node.id)) selected_collapsed_node_count += 1;
     }
+    var connection_waypoint_count: usize = 0;
+    for (options.connections) |connection| connection_waypoint_count += connection.boundedWaypointCount();
     return .{
         .node_count = options.nodes.len,
         .connection_count = options.connections.len,
@@ -161,12 +168,12 @@ pub fn summarize(options: SummaryOptions) Summary {
         .has_selected_connection = state.boundedConnectionSelectionLen() > 0,
         .hover_node_id = state.hover_node_id,
         .hover_group_id = state.hover_group_id,
-        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.box_selecting or state.dragging_minimap,
+        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.dragging_connection_waypoint != null or state.resizing_group_id != null or state.resizing_node_id != null or state.box_selecting or state.dragging_minimap,
         .dragging_minimap = state.dragging_minimap,
         .zoom = state.zoom,
         .detail_level = node_editor.semanticDetailLevel(state.*, options.semantic_zoom),
         .drag_auto_pan_enabled = options.drag_auto_pan.enabled,
-        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.box_selecting,
+        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.dragging_connection_waypoint != null or state.box_selecting,
         .drag_snap_enabled = options.drag_snap.enabled,
         .drag_snap_active = state.dragging_node_id != null and
             ((state.snap_guide_x != null and state.snap_guide_x_span == null) or
@@ -190,6 +197,10 @@ pub fn summarize(options: SummaryOptions) Summary {
         .node_collapse_mutation_count = state.node_collapse_mutation_count,
         .node_resize_enabled = options.node_resize.enabled,
         .resizing_node_id = state.resizing_node_id,
+        .connection_waypoint_count = connection_waypoint_count,
+        .selected_connection_waypoint = state.selected_connection_waypoint,
+        .connection_reroute_enabled = options.connection_reroute.enabled,
+        .connection_reroute_mutation_count = state.connection_reroute_mutation_count,
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -288,6 +299,12 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.connection_draw.fallback_connection_count,
         options.summary.connection_draw.frame_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const reroute = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "reroute enabled={} waypoints={d} selected={?d} mutations={d}", .{
+        options.summary.connection_reroute_enabled,
+        options.summary.connection_waypoint_count,
+        options.summary.selected_connection_waypoint,
+        options.summary.connection_reroute_mutation_count,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const graph = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "graph valid={} issues={d} dup={d} fanin={d} orphan={d} port={d} type={d} cycle={d}", .{
         options.summary.graph_valid,
         options.summary.graph_issue_count,
@@ -328,7 +345,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, box_select, navigation, drag_snap, path_cache, connection_draw, topology, viewport_index, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, box_select, navigation, drag_snap, path_cache, connection_draw, reroute, topology, viewport_index, history, graph });
     return root;
 }
 
@@ -346,7 +363,7 @@ test "zui-nodes devtools summarize node editor state" {
         .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
         .{ .id = 2, .title = "B", .pos = .{ 160, 64 }, .collapsed = true },
     };
-    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2 }};
+    const connections = [_]Connection{.{ .from_id = 1, .to_id = 2, .waypoints = .{ .{ 80, -240 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 1 }};
     var path_cache = node_editor.ConnectionPathCache{};
     _ = path_cache.pathFor(.{ 0, 0 }, .{ 100, 20 });
     _ = path_cache.pathFor(.{ 0, 0 }, .{ 100, 20 });
@@ -358,17 +375,36 @@ test "zui-nodes devtools summarize node editor state" {
         .viewport = .{ .x = 0, .y = 0, .w = 360, .h = 220 },
         .connection_path_cache = &path_cache,
         .node_collapse = .{ .enabled = true },
+        .connection_reroute = .{ .enabled = true },
     });
     try std.testing.expectEqual(@as(usize, 2), summary.node_count);
     try std.testing.expectEqual(@as(usize, 1), summary.collapsed_node_count);
     try std.testing.expectEqual(@as(usize, 1), summary.selected_collapsed_node_count);
     try std.testing.expect(summary.node_collapse_enabled);
+    try std.testing.expect(summary.connection_reroute_enabled);
+    try std.testing.expectEqual(@as(usize, 1), summary.connection_waypoint_count);
     try std.testing.expectEqual(@as(usize, 1), summary.connection_count);
     try std.testing.expect(summary.hasSelection());
     try std.testing.expect(summary.minimap.visible);
+    try std.testing.expect(summary.minimap.graph_bounds.y <= -240);
     try std.testing.expectEqual(@as(u64, 1), summary.connection_path_cache.hit_count);
     try std.testing.expectEqual(node_editor.DetailLevel.full, summary.detail_level);
     try std.testing.expectEqualStrings("selected", summary.statusText());
+}
+
+test "zui-nodes devtools reports connection waypoint drag activity" {
+    var state = State{
+        .selected_connection_waypoint = 0,
+        .dragging_connection_waypoint = 0,
+    };
+    const summary = summarize(.{
+        .state = &state,
+        .drag_auto_pan = .{ .enabled = true },
+        .connection_reroute = .{ .enabled = true },
+    });
+    try std.testing.expect(summary.dragging);
+    try std.testing.expect(summary.drag_auto_pan_active);
+    try std.testing.expectEqualStrings("dragging", summary.statusText());
 }
 
 test "zui-nodes devtools exposes active drag snap guides" {

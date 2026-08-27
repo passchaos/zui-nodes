@@ -28,7 +28,7 @@ pub const node_editor_command_category = "node editor";
 pub const node_editor_selection_category = "node editor selection";
 pub const node_editor_history_category = "node editor history";
 pub const node_editor_selection_command_count: usize = @intFromEnum(SelectionCommand.focus) + 1;
-pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.expand_selected_nodes) + 1;
+pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.clear_connection_waypoints) + 1;
 pub const node_editor_history_command_count: usize = @intFromEnum(HistoryCommand.redo) + 1;
 pub const node_editor_all_command_count: usize = node_editor_selection_command_count + node_editor_command_count + node_editor_history_command_count;
 pub const node_editor_context_menu_capacity: usize = 40;
@@ -79,6 +79,9 @@ pub const node_editor_commands = [_]Command{
     .{ .id = NodeEditorCommand.toggle_selected_nodes_collapsed.commandId(), .title = "Toggle Selected Nodes Collapsed", .description = "Collapse a mixed or expanded selection, or expand a fully collapsed selection", .category = node_editor_command_category, .panel_role = .viewport },
     .{ .id = NodeEditorCommand.collapse_selected_nodes.commandId(), .title = "Collapse Selected Nodes", .description = "Collapse all expanded nodes in the selection", .category = node_editor_command_category, .panel_role = .viewport },
     .{ .id = NodeEditorCommand.expand_selected_nodes.commandId(), .title = "Expand Selected Nodes", .description = "Expand all collapsed nodes in the selection", .category = node_editor_command_category, .panel_role = .viewport },
+    .{ .id = NodeEditorCommand.add_connection_waypoint.commandId(), .title = "Add Connection Waypoint", .description = "Add a routing point to the selected node connection", .category = node_editor_command_category, .panel_role = .viewport },
+    .{ .id = NodeEditorCommand.remove_connection_waypoint.commandId(), .title = "Remove Connection Waypoint", .description = "Remove the active routing point from the selected connection", .category = node_editor_command_category, .panel_role = .viewport },
+    .{ .id = NodeEditorCommand.clear_connection_waypoints.commandId(), .title = "Clear Connection Waypoints", .description = "Restore automatic routing for the selected connection", .category = node_editor_command_category, .panel_role = .viewport },
 };
 
 pub const node_editor_history_commands = [_]Command{
@@ -156,6 +159,9 @@ pub const NodeEditorContextMenuCapabilities = struct {
     can_toggle_selected_nodes_collapsed: bool = false,
     can_collapse_selected_nodes: bool = false,
     can_expand_selected_nodes: bool = false,
+    can_add_connection_waypoint: bool = false,
+    can_remove_connection_waypoint: bool = false,
+    can_clear_connection_waypoints: bool = false,
 };
 
 pub fn nodeEditorCommandRegistry() CommandRegistry {
@@ -317,6 +323,9 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
                 builder.appendCommand(.reconnect_to_previous);
                 builder.appendCommand(.reconnect_to_next);
                 builder.appendCommand(.disconnect_selected_link);
+                builder.appendCommand(.add_connection_waypoint);
+                builder.appendCommand(.remove_connection_waypoint);
+                builder.appendCommand(.clear_connection_waypoints);
                 builder.appendSeparator();
                 builder.appendCommand(.select_upstream_nodes);
                 builder.appendCommand(.select_downstream_nodes);
@@ -440,6 +449,9 @@ pub fn nodeEditorContextMenuModelForCapabilities(capabilities: NodeEditorContext
                 builder.appendCommand(.reconnect_to_previous, capabilities.can_reconnect_to_previous);
                 builder.appendCommand(.reconnect_to_next, capabilities.can_reconnect_to_next);
                 builder.appendCommand(.disconnect_selected_link, capabilities.can_disconnect_selected_link);
+                builder.appendCommand(.add_connection_waypoint, capabilities.can_add_connection_waypoint);
+                builder.appendCommand(.remove_connection_waypoint, capabilities.can_remove_connection_waypoint);
+                builder.appendCommand(.clear_connection_waypoints, capabilities.can_clear_connection_waypoints);
                 builder.appendSeparator();
                 builder.appendCommand(.select_upstream_nodes, capabilities.can_select_upstream_nodes);
                 builder.appendCommand(.select_downstream_nodes, capabilities.can_select_downstream_nodes);
@@ -603,6 +615,19 @@ test "zui-nodes context menu capabilities build legacy-compatible menu without s
     try std.testing.expect(menuContainsCommand(model, .select_context_port_peers));
     try std.testing.expect(menuContainsCommand(model, .disconnect_selected_outputs));
     try std.testing.expect(menuContainsCommand(model, .select_downstream_nodes));
+}
+
+test "zui-nodes connection menu exposes waypoint actions" {
+    var items: [node_editor_context_menu_capacity]MenuItem = undefined;
+    const model = nodeEditorContextMenuModelForCapabilities(.{
+        .target = .connection,
+        .can_add_connection_waypoint = true,
+        .can_remove_connection_waypoint = true,
+        .can_clear_connection_waypoints = true,
+    }, .{}, &items);
+    try std.testing.expect(menuContainsCommand(model, .add_connection_waypoint));
+    try std.testing.expect(menuContainsCommand(model, .remove_connection_waypoint));
+    try std.testing.expect(menuContainsCommand(model, .clear_connection_waypoints));
 }
 
 fn menuContainsSelectionCommand(model: MenuModel, command: SelectionCommand) bool {
