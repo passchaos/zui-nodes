@@ -1380,6 +1380,18 @@ pub const State = struct {
         return self.selected_node_id != null and self.selected_node_id.? == id;
     }
 
+    pub fn toggleNodeSelection(self: *State, id: u32) bool {
+        const was_selected = self.isNodeSelected(id);
+        if (was_selected) {
+            self.removeNodeFromSelection(id);
+        } else {
+            self.addNodeToSelection(id);
+        }
+        self.selected_group_id = null;
+        self.selected_connection = null;
+        return self.isNodeSelected(id) != was_selected;
+    }
+
     pub fn clearSelection(self: *State) bool {
         const changed = self.selected_node_id != null or self.selected_node_len != 0 or self.selected_group_id != null or self.selected_connection != null;
         self.selected_node_id = null;
@@ -3708,9 +3720,11 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 editor.state.pending_connection = null;
                 return true;
             }
-            if (!input.shift_down) {
-                if (nodeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |index| {
-                    const id = editor.nodes[index].id;
+            if (nodeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |index| {
+                const id = editor.nodes[index].id;
+                if (input.shift_down) {
+                    return editor.state.toggleNodeSelection(id);
+                } else {
                     return editor.state.beginNodeDrag(id);
                 }
             }

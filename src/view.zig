@@ -371,11 +371,11 @@ test "node editor view drags mutable nodes" {
     try std.testing.expectEqual(before, nodes[1].pos);
 }
 
-test "node editor view drags multi-selection as one undo transaction" {
-    var selected = [_]u32{ 1, 2, 0, 0 };
+test "node editor view shift-selects and drags multi-selection as one undo transaction" {
+    var selected = [_]u32{ 2, 0, 0, 0 };
     var state = node_editor.State{
         .selected_node_ids = &selected,
-        .selected_node_len = 2,
+        .selected_node_len = 1,
         .selected_node_id = 2,
         .zoom = 2,
     };
@@ -410,6 +410,14 @@ test "node editor view drags multi-selection as one undo transaction" {
     editor_node.rect = .{ .x = 0, .y = 0, .w = 620, .h = 260 };
     const node_rect = node_editor.nodeRectFromState(editor_node.rect, state, nodes[0]);
     const start = [2]f32{ node_rect.x + node_rect.w * 0.5, node_rect.y + node_rect.h * 0.5 };
+    editor_node.input_shift_down = true;
+    var shift_down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &shift_down, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expectEqual(@as(?u32, null), state.dragging_node_id);
+
+    editor_node.input_shift_down = false;
     var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = start[0], .y = start[1] } };
     try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
     try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
@@ -436,6 +444,13 @@ test "node editor view drags multi-selection as one undo transaction" {
     try std.testing.expect(nodeEditorViewEvent(editor_node, &third_down, editor_node.paint_user_data));
     try std.testing.expectEqual(@as(?u32, 3), state.selected_node_id);
     try std.testing.expectEqual(@as(usize, 1), state.boundedSelectionLen());
+
+    _ = state.endDrag();
+    editor_node.input_shift_down = true;
+    var third_toggle = ElementEvent{ .mouse_down = .{ .button = .left, .x = third_point[0], .y = third_point[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &third_toggle, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 0), state.boundedSelectionLen());
+    try std.testing.expectEqual(@as(?u32, null), state.dragging_node_id);
 }
 
 test "node editor multi-drag is atomic when history capacity is insufficient" {
