@@ -1921,7 +1921,13 @@ pub const State = struct {
 
     pub fn canSelectConnectedNodes(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, command: NodeEditorCommand) bool {
         const related = self.connectedNodeSelection(connections, connection_len, nodes, node_len, command);
-        return related.len > 0;
+        if (related.len == 0) return false;
+        if (self.selected_connection != null or self.selected_group_id != null) return true;
+        if (related.len != self.selectedNodeStorageCount(nodes, node_len)) return true;
+        for (related.ids[0..related.len]) |id| {
+            if (!self.isNodeSelected(id)) return true;
+        }
+        return false;
     }
 
     pub fn selectConnectedNodes(self: *State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, command: NodeEditorCommand) bool {
@@ -2281,19 +2287,52 @@ pub const State = struct {
     fn connectedNodeSelection(self: *const State, connections: []const Connection, connection_len: usize, nodes: []const Node, node_len: usize, command: NodeEditorCommand) SelectedNodeIdList {
         const active_nodes = nodes[0..@min(node_len, nodes.len)];
         var out = SelectedNodeIdList{};
-        for (connections[0..@min(connection_len, connections.len)]) |connection| {
-            const maybe_id = switch (command) {
-                .select_upstream_nodes => if (self.isNodeSelected(connection.to_id)) connection.from_id else null,
-                .select_downstream_nodes => if (self.isNodeSelected(connection.from_id)) connection.to_id else null,
-                else => null,
+        if (command != .select_upstream_nodes and command != .select_downstream_nodes) return out;
+
+        if (self.selected_connection) |connection| {
+            const seed_id = switch (command) {
+                .select_upstream_nodes => connection.from_id,
+                .select_downstream_nodes => connection.to_id,
+                else => unreachable,
             };
-            const id = maybe_id orelse continue;
-            if (!nodeIdExists(active_nodes, id) or idInList(out.ids[0..out.len], id)) continue;
-            if (out.len >= out.ids.len) break;
-            out.ids[out.len] = id;
-            out.len += 1;
+            appendUniqueNodeId(&out, active_nodes, seed_id);
         }
+        for (active_nodes) |node| {
+            if (self.isNodeSelected(node.id)) appendUniqueNodeId(&out, active_nodes, node.id);
+        }
+
+        var scan: usize = 0;
+        while (scan < out.len) : (scan += 1) {
+            const anchor = out.ids[scan];
+            for (connections[0..@min(connection_len, connections.len)]) |connection| {
+                const maybe_id = switch (command) {
+                    .select_upstream_nodes => if (connection.to_id == anchor) connection.from_id else null,
+                    .select_downstream_nodes => if (connection.from_id == anchor) connection.to_id else null,
+                    else => unreachable,
+                };
+                const id = maybe_id orelse continue;
+                appendUniqueNodeId(&out, active_nodes, id);
+            }
+        }
+        sortSelectedNodeIdsByStorageOrder(&out, active_nodes);
         return out;
+    }
+
+    fn appendUniqueNodeId(out: *SelectedNodeIdList, nodes: []const Node, id: u32) void {
+        if (!nodeIdExists(nodes, id) or idInList(out.ids[0..out.len], id) or out.len >= out.ids.len) return;
+        out.ids[out.len] = id;
+        out.len += 1;
+    }
+
+    fn sortSelectedNodeIdsByStorageOrder(out: *SelectedNodeIdList, nodes: []const Node) void {
+        const discovered = out.*;
+        var write: usize = 0;
+        for (nodes) |node| {
+            if (!idInList(discovered.ids[0..discovered.len], node.id)) continue;
+            out.ids[write] = node.id;
+            write += 1;
+        }
+        out.len = write;
     }
 
     fn contextPortTarget(self: *const State) ?ContextPortTarget {
@@ -3542,6 +3581,99 @@ test "NodeEditor strict dataflow policy rejects cyclic link mutation" {
     const graph_report = validateGraph(&nodes, connections[0..connection_len], .strict_dataflow);
     try std.testing.expect(graph_report.cycle_count > 0);
     try std.testing.expect(!graph_report.validFor(.strict_dataflow));
+}
+
+test "NodeEditor connected selection follows full upstream and downstream chains" {
+    var selected: [8]u32 = .{0} ** 8;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "Normalize", .pos = .{ 160, 0 } },
+        .{ .id = 3, .title = "Grade", .pos = .{ 320, 0 } },
+        .{ .id = 4, .title = "Composite", .pos = .{ 480, 0 } },
+        .{ .id = 5, .title = "Viewer", .pos = .{ 640, 0 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 3, .to_id = 4 },
+        .{ .from_id = 2, .to_id = 5 },
+    };
+
+    _ = state.setSingleSelection(4);
+    try std.testing.expect(state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_upstream_nodes));
+    try std.testing.expectEqual(@as(usize, 4), state.boundedSelectionLen());
+    try std.testing.expect(state.isNodeSelected(1));
+    try std.testing.expect(state.isNodeSelected(2));
+    try std.testing.expect(state.isNodeSelected(3));
+    try std.testing.expect(state.isNodeSelected(4));
+    try std.testing.expectEqual(@as(?u32, 4), state.selected_node_id);
+
+    _ = state.setSingleSelection(1);
+    try std.testing.expect(state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_downstream_nodes));
+    try std.testing.expectEqual(@as(usize, 5), state.boundedSelectionLen());
+    try std.testing.expect(state.isNodeSelected(5));
+    try std.testing.expectEqual(@as(?u32, 5), state.selected_node_id);
+}
+
+test "NodeEditor connected selection can start from a selected connection" {
+    var selected: [8]u32 = .{0} ** 8;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 240, 0 } },
+        .{ .id = 4, .title = "D", .pos = .{ 360, 0 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 3, .to_id = 4 },
+    };
+
+    _ = state.setConnectionSelection(connections[1]);
+    try std.testing.expect(state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_upstream_nodes));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+    try std.testing.expect(state.isNodeSelected(1));
+    try std.testing.expect(state.isNodeSelected(2));
+    try std.testing.expectEqual(@as(?u32, 2), state.selected_node_id);
+
+    _ = state.setConnectionSelection(connections[1]);
+    try std.testing.expect(state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_downstream_nodes));
+    try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+    try std.testing.expect(state.isNodeSelected(3));
+    try std.testing.expect(state.isNodeSelected(4));
+    try std.testing.expectEqual(@as(?u32, 4), state.selected_node_id);
+}
+
+test "NodeEditor connected selection handles cycles branches and no-op capabilities" {
+    var selected: [8]u32 = .{0} ** 8;
+    var state = State{ .selected_node_ids = &selected };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ 0, 0 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, 0 } },
+        .{ .id = 3, .title = "C", .pos = .{ 240, 0 } },
+        .{ .id = 4, .title = "Branch", .pos = .{ 240, 120 } },
+        .{ .id = 5, .title = "Isolated", .pos = .{ 480, 0 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 2, .to_id = 3 },
+        .{ .from_id = 3, .to_id = 1 },
+        .{ .from_id = 2, .to_id = 4 },
+    };
+
+    _ = state.setSingleSelection(1);
+    try std.testing.expect(state.canSelectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_downstream_nodes));
+    try std.testing.expect(state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_downstream_nodes));
+    try std.testing.expectEqual(@as(usize, 4), state.boundedSelectionLen());
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, state.selected_node_ids[0..state.boundedSelectionLen()]);
+    try std.testing.expect(!state.canSelectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_downstream_nodes));
+    try std.testing.expect(!state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_downstream_nodes));
+
+    _ = state.setSingleSelection(5);
+    try std.testing.expect(!state.canSelectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_upstream_nodes));
+    try std.testing.expect(!state.selectConnectedNodes(&connections, connections.len, &nodes, nodes.len, .select_upstream_nodes));
 }
 
 test "NodeEditor connection path cache reuses cubic controls" {
