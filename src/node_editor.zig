@@ -11,6 +11,7 @@ const graph_validation = @import("graph_validation.zig");
 const graph_topology = @import("graph_topology.zig");
 const node_geometry = @import("node_geometry.zig");
 const node_navigation = @import("node_navigation.zig");
+const connection_cut = @import("connection_cut.zig");
 const viewport_types = @import("node_viewport.zig").Types(Node, Group, Connection, Rect);
 
 const render = struct {
@@ -110,6 +111,15 @@ pub const Connection = struct {
 pub const ConnectionWaypointHit = struct {
     connection: Connection,
     waypoint_index: u8,
+};
+
+pub const ConnectionCutStroke = connection_cut.Stroke;
+pub const ConnectionCutBounds = connection_cut.Bounds;
+pub const max_connection_cut_points = connection_cut.max_points;
+
+pub const ConnectionCutResult = struct {
+    candidate_count: usize = 0,
+    removed_count: usize = 0,
 };
 
 pub const ConnectionPolicy = graph_validation.ConnectionPolicy;
@@ -374,6 +384,15 @@ pub const ConnectionRerouteOptions = struct {
     show_waypoints: bool = true,
 };
 
+pub const ConnectionCutOptions = struct {
+    enabled: bool = false,
+    sample_distance: f32 = 4.0,
+    hit_tolerance: f32 = 3.0,
+    min_stroke_length: f32 = 4.0,
+    show_stroke: bool = true,
+    stroke_color: Color = Color.rgba8(248, 113, 113, 230),
+};
+
 pub const Node = struct {
     id: u32,
     title: []const u8,
@@ -572,6 +591,7 @@ pub fn Options(comptime StateType: type) type {
         node_collapse: NodeCollapseOptions = .{},
         node_resize: NodeResizeOptions = .{},
         connection_reroute: ConnectionRerouteOptions = .{},
+        connection_cut: ConnectionCutOptions = .{},
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -1492,6 +1512,80 @@ pub fn connectionWaypointAtPoint(rect: Rect, state: anytype, connections: []cons
     return null;
 }
 
+pub fn connectionCutStrokeBounds(stroke: ConnectionCutStroke, tolerance: f32) ?Rect {
+    const bounds = stroke.bounds(tolerance) orelse return null;
+    return .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = bounds.h };
+}
+
+fn connectionIntersectsPreparedCutStroke(rect: Rect, state: anytype, nodes: []const Node, node_lookup: ?*const ViewportIndex, connection: Connection, stroke: *const connection_cut.PreparedStroke, tolerance: f32) bool {
+    const from = nodeForBoxSelection(nodes, node_lookup, connection.from_id) orelse return false;
+    const to = nodeForBoxSelection(nodes, node_lookup, connection.to_id) orelse return false;
+    const start = outputPortPositionAt(rect, state, from, connection.from_port);
+    const end = inputPortPositionAt(rect, state, to, connection.to_port);
+    var segment_index: usize = 0;
+    while (segment_index <= connection.boundedWaypointCount()) : (segment_index += 1) {
+        if (connection_cut.cubicIntersectsPreparedStroke(connectionSegmentPath(rect, state, connection, start, end, segment_index), stroke, tolerance)) return true;
+    }
+    return false;
+}
+
+pub fn connectionIntersectsCutStroke(rect: Rect, state: anytype, nodes: []const Node, connection: Connection, stroke: ConnectionCutStroke, tolerance: f32) bool {
+    const prepared = connection_cut.PreparedStroke.init(stroke, tolerance);
+    return connectionIntersectsPreparedCutStroke(rect, state, nodes, null, connection, &prepared, tolerance);
+}
+
+pub fn countConnectionsIntersectingCutStroke(
+    rect: Rect,
+    state: anytype,
+    nodes: []const Node,
+    connections: []const Connection,
+    candidate_indices: ?[]const usize,
+    stroke: ConnectionCutStroke,
+    tolerance: f32,
+) ConnectionCutResult {
+    return countConnectionsIntersectingCutStrokeWithLookup(rect, state, nodes, null, connections, candidate_indices, stroke, tolerance);
+}
+
+pub fn countConnectionsIntersectingCutStrokeIndexed(
+    rect: Rect,
+    state: anytype,
+    nodes: []const Node,
+    node_lookup: *const ViewportIndex,
+    connections: []const Connection,
+    candidate_indices: []const usize,
+    stroke: ConnectionCutStroke,
+    tolerance: f32,
+) ConnectionCutResult {
+    return countConnectionsIntersectingCutStrokeWithLookup(rect, state, nodes, node_lookup, connections, candidate_indices, stroke, tolerance);
+}
+
+fn countConnectionsIntersectingCutStrokeWithLookup(
+    rect: Rect,
+    state: anytype,
+    nodes: []const Node,
+    node_lookup: ?*const ViewportIndex,
+    connections: []const Connection,
+    candidate_indices: ?[]const usize,
+    stroke: ConnectionCutStroke,
+    tolerance: f32,
+) ConnectionCutResult {
+    var result = ConnectionCutResult{};
+    const prepared_stroke = connection_cut.PreparedStroke.init(stroke, tolerance);
+    if (candidate_indices) |indices| {
+        for (indices) |connection_index| {
+            if (connection_index >= connections.len) continue;
+            result.candidate_count += 1;
+            result.removed_count += @intFromBool(connectionIntersectsPreparedCutStroke(rect, state, nodes, node_lookup, connections[connection_index], &prepared_stroke, tolerance));
+        }
+    } else {
+        for (connections) |connection| {
+            result.candidate_count += 1;
+            result.removed_count += @intFromBool(connectionIntersectsPreparedCutStroke(rect, state, nodes, node_lookup, connection, &prepared_stroke, tolerance));
+        }
+    }
+    return result;
+}
+
 pub const ConnectionPathCacheCapacity: usize = 128;
 
 pub const ConnectionPathCacheEntry = struct {
@@ -1721,6 +1815,8 @@ pub const State = struct {
     resizing_node_edges: NodeResizeEdges = .{},
     selected_connection_waypoint: ?u8 = null,
     dragging_connection_waypoint: ?u8 = null,
+    connection_cut_mode: bool = false,
+    connection_cut_stroke: ConnectionCutStroke = .{},
     interaction_history_pushed: bool = false,
     node_drag_tracking: bool = false,
     node_drag_origin: [2]f32 = .{ 0, 0 },
@@ -1760,6 +1856,9 @@ pub const State = struct {
     navigation_spatial_fallback_count: u64 = 0,
     node_collapse_mutation_count: u64 = 0,
     connection_reroute_mutation_count: u64 = 0,
+    connection_cut_operation_count: u64 = 0,
+    connection_cut_removed_count: u64 = 0,
+    connection_cut_candidate_count: usize = 0,
     dragging_minimap: bool = false,
     minimap_drag_offset: [2]f32 = .{ 0.0, 0.0 },
     context_menu: ContextMenuState = .{},
@@ -1883,7 +1982,7 @@ pub const State = struct {
     }
 
     pub fn endDrag(self: *State) bool {
-        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.resizing_node_id != null or self.resizing_node_edges.any() or self.dragging_connection_from_id != null or self.dragging_connection_waypoint != null or self.box_selecting or self.dragging_minimap;
+        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.resizing_node_id != null or self.resizing_node_edges.any() or self.dragging_connection_from_id != null or self.dragging_connection_waypoint != null or self.connection_cut_stroke.active or self.box_selecting or self.dragging_minimap;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
         self.dragging_group_id = null;
@@ -1896,6 +1995,7 @@ pub const State = struct {
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
         self.dragging_connection_waypoint = null;
+        _ = self.connection_cut_stroke.cancel();
         self.connection_preview_valid = true;
         self.reconnecting_connection = null;
         _ = self.finishBoxSelection(false);
@@ -2335,6 +2435,116 @@ pub const State = struct {
             return true;
         }
         return false;
+    }
+
+    pub fn setConnectionCutMode(self: *State, enabled: bool) bool {
+        const changed = self.connection_cut_mode != enabled or self.connection_cut_stroke.active;
+        self.connection_cut_mode = enabled;
+        _ = self.connection_cut_stroke.cancel();
+        self.connection_cut_candidate_count = 0;
+        if (enabled) {
+            self.dragging_canvas = false;
+            self.dragging_node_id = null;
+            self.dragging_group_id = null;
+            self.resizing_group_id = null;
+            self.resizing_group_edges = .{};
+            self.resizing_node_id = null;
+            self.resizing_node_edges = .{};
+            self.dragging_connection_from_id = null;
+            self.dragging_connection_from_port = 0;
+            self.reconnecting_connection = null;
+            self.dragging_connection_waypoint = null;
+            self.dragging_minimap = false;
+            self.interaction_history_pushed = false;
+            _ = self.finishBoxSelection(false);
+        }
+        return changed;
+    }
+
+    pub fn toggleConnectionCutMode(self: *State) bool {
+        return self.setConnectionCutMode(!self.connection_cut_mode);
+    }
+
+    pub fn beginConnectionCut(self: *State, point: [2]f32) bool {
+        if (!self.connection_cut_mode) return false;
+        self.dragging_canvas = false;
+        self.dragging_node_id = null;
+        self.dragging_group_id = null;
+        self.resizing_group_id = null;
+        self.resizing_group_edges = .{};
+        self.resizing_node_id = null;
+        self.resizing_node_edges = .{};
+        self.dragging_connection_from_id = null;
+        self.dragging_connection_from_port = 0;
+        self.reconnecting_connection = null;
+        self.dragging_connection_waypoint = null;
+        self.dragging_minimap = false;
+        self.interaction_history_pushed = false;
+        _ = self.finishBoxSelection(false);
+        self.connection_cut_mode = true;
+        self.connection_cut_candidate_count = 0;
+        return self.connection_cut_stroke.begin(point);
+    }
+
+    pub fn updateConnectionCut(self: *State, point: [2]f32, sample_distance: f32) bool {
+        return self.connection_cut_stroke.append(point, sample_distance);
+    }
+
+    pub fn cancelConnectionCut(self: *State) bool {
+        return self.connection_cut_stroke.cancel();
+    }
+
+    pub fn connectionCutPreview(self: *State, rect: Rect, nodes: []const Node, node_lookup: ?*const ViewportIndex, connections: []const Connection, candidate_indices: ?[]const usize, tolerance: f32) ConnectionCutResult {
+        const result = countConnectionsIntersectingCutStrokeWithLookup(rect, self.*, nodes, node_lookup, connections, candidate_indices, self.connection_cut_stroke, tolerance);
+        self.connection_cut_candidate_count = result.candidate_count;
+        return result;
+    }
+
+    pub fn cutConnections(
+        self: *State,
+        rect: Rect,
+        nodes: []const Node,
+        node_lookup: ?*const ViewportIndex,
+        connections: []Connection,
+        connection_len: *usize,
+        /// Candidate indices must be sorted in ascending storage order. The
+        /// viewport index returns this form directly. Pass null for a full scan.
+        candidate_indices: ?[]const usize,
+        tolerance: f32,
+    ) ConnectionCutResult {
+        const count = @min(connection_len.*, connections.len);
+        connection_len.* = count;
+        const prepared_stroke = connection_cut.PreparedStroke.init(self.connection_cut_stroke, tolerance);
+        var result = ConnectionCutResult{};
+        var write: usize = 0;
+        var candidate_cursor: usize = 0;
+        for (connections[0..count], 0..) |connection, read| {
+            const candidate = if (candidate_indices) |indices| blk: {
+                while (candidate_cursor < indices.len and indices[candidate_cursor] < read) candidate_cursor += 1;
+                break :blk candidate_cursor < indices.len and indices[candidate_cursor] == read;
+            } else true;
+            if (candidate) {
+                result.candidate_count += 1;
+                if (connectionIntersectsPreparedCutStroke(rect, self.*, nodes, node_lookup, connection, &prepared_stroke, tolerance)) {
+                    result.removed_count += 1;
+                    continue;
+                }
+            }
+            if (write != read) connections[write] = connection;
+            write += 1;
+        }
+        self.connection_cut_candidate_count = result.candidate_count;
+        if (result.removed_count == 0) return result;
+        connection_len.* = write;
+        self.retainExistingConnectionSelection(connections[0..write]);
+        if (self.hover_connection) |hovered| {
+            if (!connectionExists(connections[0..write], hovered)) self.hover_connection = null;
+        }
+        self.selected_connection_waypoint = null;
+        self.dragging_connection_waypoint = null;
+        self.connection_cut_operation_count +%= 1;
+        self.connection_cut_removed_count +%= @intCast(result.removed_count);
+        return result;
     }
 
     fn retainExistingConnectionSelection(self: *State, connections: []const Connection) void {
@@ -4516,6 +4726,11 @@ fn editorConnectionRerouteOptions(editor: anytype) ConnectionRerouteOptions {
     return if (@hasField(Editor, "connection_reroute")) editor.connection_reroute else .{};
 }
 
+fn editorConnectionCutOptions(editor: anytype) ConnectionCutOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "connection_cut")) editor.connection_cut else .{};
+}
+
 fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: anytype, viewport_index: ?*ViewportIndex, direction: NodeNavigationDirection) bool {
     const options = editorSpatialNavigationOptions(editor);
     if (!options.enabled or input.control_down or input.super_down or input.alt_down) return false;
@@ -4583,7 +4798,7 @@ fn topologyDirectionForNavigation(flow_direction: ?graph_layout.LayeredLayoutDir
 fn editorDragAutoPanActive(editor: anytype) bool {
     return editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or
         editor.state.resizing_group_id != null or editor.state.resizing_node_id != null or editor.state.dragging_connection_from_id != null or
-        editor.state.reconnecting_connection != null or editor.state.dragging_connection_waypoint != null or editor.state.box_selecting;
+        editor.state.reconnecting_connection != null or editor.state.dragging_connection_waypoint != null or editor.state.connection_cut_stroke.active or editor.state.box_selecting;
 }
 
 fn editorDragAutoPanDelta(rect: Rect, editor: anytype, point: [2]f32) [2]f32 {
@@ -4599,6 +4814,7 @@ fn applyEditorDragAutoPan(editor: anytype, delta: [2]f32) bool {
         editor.state.box_select_start[1] += delta[1];
         editor.state.box_select_origin_x += delta[0];
     }
+    if (editor.state.connection_cut_stroke.active) editor.state.connection_cut_stroke.translate(delta);
     return true;
 }
 
@@ -4865,12 +5081,29 @@ pub fn appendNodeEditorConnectionOverlay(allocator: std.mem.Allocator, out: *std
 
 fn appendNodeEditorConnectionOverlayPrepared(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, layer: i32) !void {
     try appendNodeEditorConnectionPreviewOverlay(allocator, out, rect, editor, layer + 3);
+    try appendNodeEditorConnectionCutOverlay(allocator, out, editor, layer + 8);
     if (editorDetailLevel(editor) == .overview) return;
     try appendNodeEditorWaypointOverlay(allocator, out, rect, editor, viewport_index, layer + 7);
     if (viewport_index) |index| {
         for (index.visibleNodeIndices()) |node_index| try appendNodeEditorPortOverlay(allocator, out, rect, editor, editor.nodes[node_index], layer);
     } else {
         for (editor.nodes) |node_item| try appendNodeEditorPortOverlay(allocator, out, rect, editor, node_item, layer);
+    }
+}
+
+fn appendNodeEditorConnectionCutOverlay(allocator: std.mem.Allocator, out: *std.ArrayList(DrawCmd), editor: anytype, layer: i32) !void {
+    const options = editorConnectionCutOptions(editor);
+    if (!options.enabled or !options.show_stroke or !editor.state.connection_cut_stroke.active) return;
+    const points = editor.state.connection_cut_stroke.slice();
+    if (points.len < 2) return;
+    for (points[1..], points[0 .. points.len - 1]) |point, previous| {
+        try out.append(allocator, .{ .line = .{
+            .a = previous,
+            .b = point,
+            .thickness = 1.5,
+            .color = options.stroke_color,
+            .layer = layer,
+        } });
     }
 }
 
@@ -5670,6 +5903,36 @@ fn removeSelectedConnectionWaypointWithHistory(editor: anytype) bool {
     return finishEditorHistory(editor, history_mutation, editor.state.removeSelectedConnectionWaypoint(connections, connection_len));
 }
 
+fn finishConnectionCutWithHistory(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) bool {
+    const options = editorConnectionCutOptions(editor);
+    if (!editor.state.connection_cut_stroke.active) return false;
+    if (!options.enabled) return editor.state.cancelConnectionCut();
+    _ = editor.state.updateConnectionCut(point, options.sample_distance);
+    if (editor.state.connection_cut_stroke.length() < @max(0.0, options.min_stroke_length)) return editor.state.cancelConnectionCut();
+    const connections = editor.mutable_connections orelse {
+        return editor.state.cancelConnectionCut();
+    };
+    const connection_len = editor.mutable_connection_len orelse {
+        return editor.state.cancelConnectionCut();
+    };
+    const candidates = if (viewport_index) |index|
+        if (connectionCutStrokeBounds(editor.state.connection_cut_stroke, options.hit_tolerance)) |bounds|
+            index.connectionIndicesInScreenRect(rect, editor.state.pan, editor.state.zoom, bounds)
+        else
+            &.{}
+    else
+        null;
+    const history_mutation = beginEditorHistory(editor) orelse {
+        _ = editor.state.cancelConnectionCut();
+        return true;
+    };
+    const result = editor.state.cutConnections(rect, editor.nodes, viewport_index, connections, connection_len, candidates, options.hit_tolerance);
+    _ = editor.state.connection_cut_stroke.cancel();
+    if (result.removed_count == 0) return true;
+    invalidateEditorTopology(editor);
+    return finishEditorHistory(editor, history_mutation, true);
+}
+
 fn dragPreviewCompatible(editor: anytype, input_hover: ?PortHit) bool {
     const from_id = editor.state.dragging_connection_from_id orelse return true;
     const hit = input_hover orelse return true;
@@ -5870,7 +6133,7 @@ pub const EventInputModifiers = struct {
 };
 
 pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype, event: anytype) bool {
-    const geometry_drag_active = editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or editor.state.resizing_group_id != null or editor.state.resizing_node_id != null or editor.state.dragging_connection_waypoint != null;
+    const geometry_drag_active = editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or editor.state.resizing_group_id != null or editor.state.resizing_node_id != null or editor.state.dragging_connection_waypoint != null or editor.state.connection_cut_stroke.active;
     const skip_prepare = switch (event.*) {
         .mouse_move => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap or editor.state.box_selecting,
         .mouse_up => geometry_drag_active or editor.state.dragging_canvas or editor.state.dragging_minimap,
@@ -5879,6 +6142,24 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
     const viewport_index = if (skip_prepare) editorViewportIndex(editor) else prepareNodeEditorViewportIndex(rect, editor);
     switch (event.*) {
         .mouse_move => |m| {
+            if (editor.state.connection_cut_stroke.active) {
+                const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                const options = editorConnectionCutOptions(editor);
+                const changed = editor.state.updateConnectionCut(.{ m.x, m.y }, options.sample_distance);
+                if (changed or panned) {
+                    const connections = editorActiveConnections(editor);
+                    const candidates = if (viewport_index) |index|
+                        if (connectionCutStrokeBounds(editor.state.connection_cut_stroke, options.hit_tolerance)) |bounds|
+                            index.connectionIndicesInScreenRect(rect, editor.state.pan, editor.state.zoom, bounds)
+                        else
+                            &.{}
+                    else
+                        null;
+                    _ = editor.state.connectionCutPreview(rect, editor.nodes, viewport_index, connections, candidates, options.hit_tolerance);
+                }
+                return changed or panned;
+            }
             if (editor.state.dragging_minimap) {
                 const snapshot = minimapSnapshotPrepared(rect, editor, viewport_index);
                 return editor.state.updateMinimapDrag(rect, snapshot, .{ m.x, m.y });
@@ -6059,6 +6340,10 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return editor.state.openContextMenu(.canvas, point);
             }
             if (m.button != .left) return false;
+            if (editorConnectionCutOptions(editor).enabled and editor.state.connection_cut_mode) {
+                _ = editor.state.closeContextMenu();
+                return editor.state.beginConnectionCut(.{ m.x, m.y });
+            }
             if (editor.show_minimap) {
                 const point = [2]f32{ m.x, m.y };
                 const snapshot = minimapSnapshotPrepared(rect, editor, viewport_index);
@@ -6161,6 +6446,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
         },
         .mouse_up => |m| {
             if (m.button != .left) return false;
+            if (editor.state.connection_cut_stroke.active) return finishConnectionCutWithHistory(rect, editor, viewport_index, .{ m.x, m.y });
             if (editor.state.dragging_minimap) {
                 editor.state.dragging_minimap = false;
                 editor.state.minimap_drag_offset = .{ 0.0, 0.0 };
@@ -6283,7 +6569,12 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             if (!rect.contains(.{ p.x, p.y })) return false;
             return editor.state.zoomAt(rect, .{ p.x, p.y }, @floatCast(p.scale_delta));
         },
+        .pointer_capture_lost, .interaction_cancel, .focus_lost => return editor.state.cancelConnectionCut(),
         .key_down => |key| switch (key) {
+            .escape => {
+                if (editor.state.connection_cut_stroke.active) return editor.state.cancelConnectionCut();
+                return false;
+            },
             .delete, .backspace => {
                 if (editorConnectionRerouteOptions(editor).enabled) return removeSelectedConnectionWaypointWithHistory(editor);
                 return false;
@@ -6947,6 +7238,85 @@ test "duplicate and paste translate routed waypoints with graph content" {
     try std.testing.expect(state.copySelectionToClipboard(&nodes, node_len, &connections, connection_len, &clipboard));
     try std.testing.expect(state.pasteClipboard(&nodes, &node_len, &connections, &connection_len, &clipboard, .{ 10, 5 }));
     try std.testing.expectEqual([2]f32{ 120, 115 }, connections[2].waypoints[0]);
+}
+
+test "connection cut removes crossed straight and routed links in stable order" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 500, .h = 300 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ -200, -80 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 2, .title = "B", .pos = .{ 120, -80 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 3, .title = "C", .pos = .{ -200, 60 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 4, .title = "D", .pos = .{ 120, 60 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 5, .title = "E", .pos = .{ -200, 140 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 6, .title = "F", .pos = .{ 120, 140 }, .size = .{ .w = 80, .h = 40 } },
+    };
+    var connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 3, .to_id = 4, .waypoints = .{ .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 1 },
+        .{ .from_id = 5, .to_id = 6 },
+    };
+    var connection_len: usize = connections.len;
+    var selected_connections: [3]Connection = undefined;
+    var state = State{ .selected_connections = &selected_connections, .connection_cut_mode = true };
+    _ = state.setConnectionSelection(connections[0]);
+    try std.testing.expect(state.beginConnectionCut(.{ 250, 20 }));
+    try std.testing.expect(state.updateConnectionCut(.{ 250, 180 }, 0));
+    const result = state.cutConnections(viewport, &nodes, null, &connections, &connection_len, &.{ 0, 1 }, 2);
+    try std.testing.expectEqual(@as(usize, 2), result.candidate_count);
+    try std.testing.expectEqual(@as(usize, 2), result.removed_count);
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(@as(u32, 5), connections[0].from_id);
+    try std.testing.expectEqual(@as(?Connection, null), state.selected_connection);
+    try std.testing.expectEqual(@as(u64, 1), state.connection_cut_operation_count);
+    try std.testing.expectEqual(@as(u64, 2), state.connection_cut_removed_count);
+}
+
+test "connection cut preview uses sparse candidate indices" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 500, .h = 300 };
+    const nodes = [_]Node{
+        .{ .id = 1, .title = "A", .pos = .{ -180, -70 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, -70 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 3, .title = "C", .pos = .{ -180, 50 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 4, .title = "D", .pos = .{ 100, 50 }, .size = .{ .w = 80, .h = 40 } },
+    };
+    const connections = [_]Connection{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 3, .to_id = 4 },
+    };
+    var state = State{ .connection_cut_mode = true };
+    _ = state.beginConnectionCut(.{ 250, 20 });
+    _ = state.updateConnectionCut(.{ 250, 200 }, 0);
+    const result = state.connectionCutPreview(viewport, &nodes, null, &connections, &.{0}, 2);
+    try std.testing.expectEqual(@as(usize, 1), result.candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), result.removed_count);
+    try std.testing.expectEqual(@as(usize, 1), state.connection_cut_candidate_count);
+}
+
+test "connection cut overlay paints the sampled freehand stroke" {
+    var state = State{ .connection_cut_mode = true };
+    _ = state.beginConnectionCut(.{ 20, 30 });
+    _ = state.updateConnectionCut(.{ 80, 90 }, 0);
+    const color = Color.rgb8(255, 64, 32);
+    var out = std.ArrayList(DrawCmd).empty;
+    defer out.deinit(std.testing.allocator);
+    _ = try appendNodeEditor(std.testing.allocator, &out, .{ .x = 0, .y = 0, .w = 200, .h = 120 }, Options(State){
+        .state = &state,
+        .nodes = &.{},
+        .connection_cut = .{ .enabled = true, .stroke_color = color },
+        .show_minimap = false,
+        .grid_color = Color.transparent,
+    }, 0);
+    var cut_line_count: usize = 0;
+    for (out.items) |command| switch (command) {
+        .line => |line| if (std.meta.eql(line.color, color)) {
+            cut_line_count += 1;
+            try std.testing.expectEqual([2]f32{ 20, 30 }, line.a);
+            try std.testing.expectEqual([2]f32{ 80, 90 }, line.b);
+            try std.testing.expectEqual(@as(f32, 1.5), line.thickness);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), cut_line_count);
 }
 
 test "NodeEditor mutable connections replace static connections in paint and hit paths" {

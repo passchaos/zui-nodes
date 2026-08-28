@@ -74,6 +74,7 @@ pub const NodeEditorCommand = enum(u8) {
     add_connection_waypoint,
     remove_connection_waypoint,
     clear_connection_waypoints,
+    toggle_connection_cut_mode,
 
     pub fn commandId(self: NodeEditorCommand) CommandId {
         return nodeEditorCommandId(self);

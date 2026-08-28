@@ -18,6 +18,7 @@ const Options = struct {
     max_paint_ns: ?f64 = null,
     max_multi_drag_ns: ?f64 = null,
     max_box_connection_ns: ?f64 = null,
+    max_cut_preview_ns: ?f64 = null,
     max_navigation_ns: ?f64 = null,
 };
 
@@ -42,6 +43,9 @@ const Report = struct {
     box_connection_ns_per_iteration: f64,
     max_box_connection_candidates: usize,
     box_connection_candidate_misses: usize,
+    cut_preview_ns_per_iteration: f64,
+    max_cut_candidates: usize,
+    cut_candidate_misses: usize,
     navigation_ns_per_iteration: f64,
     max_navigation_candidates: usize,
     topology_navigation_ns_per_iteration: f64,
@@ -471,6 +475,38 @@ fn run(init: std.process.Init, options: Options) !Report {
     box_selection_correct = box_selection_correct and full_box_state.boundedSelectionLen() > 0 and full_box_state.boundedConnectionSelectionLen() > 0 and
         box_connection_candidate_misses == 0 and max_box_connection_candidates > 0 and max_box_connection_candidates < connection_count / 20;
 
+    var cut_state = node_editor.State{ .connection_cut_mode = true };
+    const cut_revision: u64 = 9;
+    var cut_elapsed_ns: u64 = 0;
+    var max_cut_candidates: usize = 0;
+    var cut_candidate_misses: usize = 0;
+    var cut_correct = true;
+    for (0..options.iterations) |iteration| {
+        const row = (iteration * 37) % rows;
+        const column = (iteration * 61) % (columns - 1);
+        const target = nodes[row * columns + column];
+        cut_state.pan = .{ -target.pos[0], -target.pos[1] };
+        const start = node_editor.graphToScreen(viewport, cut_state, .{ target.pos[0] + target.size.w + 20, target.pos[1] - 40 });
+        const end = [2]f32{ start[0], start[1] + 160 };
+        _ = cut_state.beginConnectionCut(start);
+        _ = cut_state.updateConnectionCut(end, 0);
+        const bounds = node_editor.connectionCutStrokeBounds(cut_state.connection_cut_stroke, 3) orelse return error.EditorCutBoundsUnavailable;
+        const cut_started = std.Io.Clock.awake.now(init.io);
+        if (!viewport_index.prepareVersioned(nodes, &.{}, connections, viewport, cut_state.pan, 1, cut_revision).ready) return error.EditorCutViewportUnavailable;
+        const candidates = viewport_index.connectionIndicesInScreenRect(viewport, cut_state.pan, 1, bounds);
+        const indexed = cut_state.connectionCutPreview(viewport, nodes, &viewport_index, connections, candidates, 3);
+        cut_elapsed_ns += @intCast(cut_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+        max_cut_candidates = @max(max_cut_candidates, indexed.candidate_count);
+        if (iteration % @max(@as(usize, 1), options.iterations / 8) == 0) {
+            const full = node_editor.countConnectionsIntersectingCutStroke(viewport, cut_state, nodes, connections, null, cut_state.connection_cut_stroke, 3);
+            if (full.removed_count != indexed.removed_count) cut_candidate_misses += 1;
+        }
+        cut_correct = cut_correct and indexed.candidate_count < connection_count / 20;
+        _ = cut_state.cancelConnectionCut();
+    }
+    const cut_preview_ns_per_iteration = @as(f64, @floatFromInt(cut_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+    cut_correct = cut_correct and max_cut_candidates > 0 and cut_candidate_misses == 0;
+
     var navigation_selected: [64]u32 = .{0} ** 64;
     var navigation_state = node_editor.State{ .selected_node_ids = &navigation_selected };
     var navigation_topology_storage = node_editor.StaticGraphTopologyWorkspace(node_count, connection_count){};
@@ -551,12 +587,13 @@ fn run(init: std.process.Init, options: Options) !Report {
         draw_summary.frame_count == options.iterations * 2 + 2 and draw_summary.borrowed_connection_count == selected_paint_visible_connection_count and
         draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and
         overview_adaptive_commands * 3 < overview_full_commands and drag_correct and alignment_snap_count > 0 and distribution_correct and resize_correct and
-        selected_connection_correct and box_selection_correct and navigation_correct and topology_navigation_correct and checksum != 0;
+        selected_connection_correct and box_selection_correct and cut_correct and navigation_correct and topology_navigation_correct and checksum != 0;
     const performance_passed = options.max_paint_ns == null or paint_ns_per_frame <= options.max_paint_ns.?;
     const drag_performance_passed = options.max_multi_drag_ns == null or
         (multi_drag_ns_per_iteration <= options.max_multi_drag_ns.? and node_resize_ns_per_iteration <= options.max_multi_drag_ns.? and distribution_snap_ns_per_iteration <= options.max_multi_drag_ns.? and
             selected_connection_paint_ns_per_frame <= options.max_multi_drag_ns.? and selected_connection_delete_ns <= options.max_multi_drag_ns.?);
     const box_performance_passed = options.max_box_connection_ns == null or box_connection_ns_per_iteration <= options.max_box_connection_ns.?;
+    const cut_performance_passed = options.max_cut_preview_ns == null or cut_preview_ns_per_iteration <= options.max_cut_preview_ns.?;
     const navigation_performance_passed = options.max_navigation_ns == null or
         (navigation_ns_per_iteration <= options.max_navigation_ns.? and topology_navigation_ns_per_iteration <= options.max_navigation_ns.?);
     return .{
@@ -580,6 +617,9 @@ fn run(init: std.process.Init, options: Options) !Report {
         .box_connection_ns_per_iteration = box_connection_ns_per_iteration,
         .max_box_connection_candidates = max_box_connection_candidates,
         .box_connection_candidate_misses = box_connection_candidate_misses,
+        .cut_preview_ns_per_iteration = cut_preview_ns_per_iteration,
+        .max_cut_candidates = max_cut_candidates,
+        .cut_candidate_misses = cut_candidate_misses,
         .navigation_ns_per_iteration = navigation_ns_per_iteration,
         .max_navigation_candidates = max_navigation_candidates,
         .topology_navigation_ns_per_iteration = topology_navigation_ns_per_iteration,
@@ -594,8 +634,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         .owning_payload_count = owning_payload_count,
         .checksum = checksum,
         .quality_passed = quality_passed,
-        .performance_passed = performance_passed and drag_performance_passed and box_performance_passed and navigation_performance_passed,
-        .passed = quality_passed and performance_passed and drag_performance_passed and box_performance_passed and navigation_performance_passed,
+        .performance_passed = performance_passed and drag_performance_passed and box_performance_passed and cut_performance_passed and navigation_performance_passed,
+        .passed = quality_passed and performance_passed and drag_performance_passed and box_performance_passed and cut_performance_passed and navigation_performance_passed,
     };
 }
 
@@ -613,6 +653,8 @@ fn parseOptions(init: std.process.Init) !Options {
             options.max_multi_drag_ns = try std.fmt.parseFloat(f64, arg["--max-multi-drag-ns=".len..])
         else if (std.mem.startsWith(u8, arg, "--max-box-connection-ns="))
             options.max_box_connection_ns = try std.fmt.parseFloat(f64, arg["--max-box-connection-ns=".len..])
+        else if (std.mem.startsWith(u8, arg, "--max-cut-preview-ns="))
+            options.max_cut_preview_ns = try std.fmt.parseFloat(f64, arg["--max-cut-preview-ns=".len..])
         else if (std.mem.startsWith(u8, arg, "--max-navigation-ns="))
             options.max_navigation_ns = try std.fmt.parseFloat(f64, arg["--max-navigation-ns=".len..])
         else
@@ -631,8 +673,8 @@ fn printReport(io: std.Io, report: Report) !void {
         .{ report.node_count, report.collapsed_node_count, report.connection_count, report.routed_connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.node_resize_ns_per_iteration },
     );
     try stdout.print(
-        "alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns box_connections={d:.3}ns candidates={d} misses={d} navigation={d:.3}ns candidates={d} topology_navigation={d:.3}ns candidates={d} max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
-        .{ report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.box_connection_ns_per_iteration, report.max_box_connection_candidates, report.box_connection_candidate_misses, report.navigation_ns_per_iteration, report.max_navigation_candidates, report.topology_navigation_ns_per_iteration, report.max_topology_navigation_candidates, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+        "alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns box_connections={d:.3}ns candidates={d} misses={d} cut_preview={d:.3}ns candidates={d} misses={d} navigation={d:.3}ns candidates={d} topology_navigation={d:.3}ns candidates={d} max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.box_connection_ns_per_iteration, report.max_box_connection_candidates, report.box_connection_candidate_misses, report.cut_preview_ns_per_iteration, report.max_cut_candidates, report.cut_candidate_misses, report.navigation_ns_per_iteration, report.max_navigation_candidates, report.topology_navigation_ns_per_iteration, report.max_topology_navigation_candidates, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
     );
     try stdout.flush();
 }

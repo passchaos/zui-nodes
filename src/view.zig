@@ -103,6 +103,9 @@ pub const NodeEditorViewOptions = struct {
     node_resize: node_editor.NodeResizeOptions = .{},
     /// Opt-in editable connection waypoints and double-click insertion.
     connection_reroute: node_editor.ConnectionRerouteOptions = .{},
+    /// Opt-in freehand link cutting. Applications activate the tool through
+    /// `State.setConnectionCutMode` or the corresponding editor command.
+    connection_cut: node_editor.ConnectionCutOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -152,6 +155,7 @@ const Binding = struct {
     node_collapse: node_editor.NodeCollapseOptions = .{},
     node_resize: node_editor.NodeResizeOptions = .{},
     connection_reroute: node_editor.ConnectionRerouteOptions = .{},
+    connection_cut: node_editor.ConnectionCutOptions = .{},
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -192,6 +196,7 @@ const Binding = struct {
             .node_collapse = self.node_collapse,
             .node_resize = self.node_resize,
             .connection_reroute = self.connection_reroute,
+            .connection_cut = self.connection_cut,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -250,6 +255,7 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .node_collapse = options.node_collapse,
         .node_resize = options.node_resize,
         .connection_reroute = options.connection_reroute,
+        .connection_cut = options.connection_cut,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -314,6 +320,7 @@ fn nodeEditorCanvasHitTest(node: *const ElementNode, point: [2]f32, user_data: ?
 
 fn nodeEditorCanvasCursor(node: *const ElementNode, point: [2]f32, user_data: ?*anyopaque) zui.CursorShape {
     const binding: *const Binding = if (user_data) |ptr| @ptrCast(@alignCast(ptr)) else return .default;
+    if (binding.connection_cut.enabled and binding.state.connection_cut_mode) return .crosshair;
     if (binding.state.resizing_node_id != null) return node_editor.nodeResizeCursor(zui.CursorShape, binding.state.resizing_node_edges);
     if (binding.state.dragging_connection_waypoint != null) return .grabbing;
     if (binding.state.resizing_group_id != null) return node_editor.nodeResizeCursor(zui.CursorShape, binding.state.resizing_group_edges);
@@ -336,6 +343,7 @@ const InteractionSnapshot = struct {
     node_drag_applied_delta: [2]f32 = .{ 0.0, 0.0 },
     node_collapse_mutation_count: u64 = 0,
     connection_reroute_mutation_count: u64 = 0,
+    connection_cut_operation_count: u64 = 0,
     non_node_structural_drag: bool = false,
 
     fn capture(state: *const node_editor.State) InteractionSnapshot {
@@ -345,6 +353,7 @@ const InteractionSnapshot = struct {
             .node_drag_applied_delta = state.node_drag_applied_delta,
             .node_collapse_mutation_count = state.node_collapse_mutation_count,
             .connection_reroute_mutation_count = state.connection_reroute_mutation_count,
+            .connection_cut_operation_count = state.connection_cut_operation_count,
             .non_node_structural_drag = state.dragging_group_id != null or
                 state.resizing_group_id != null or
                 state.resizing_node_id != null or
@@ -365,16 +374,21 @@ const InteractionSnapshot = struct {
         return @abs(self.node_drag_applied_delta[0] - state.node_drag_applied_delta[0]) > 0.001 or
             @abs(self.node_drag_applied_delta[1] - state.node_drag_applied_delta[1]) > 0.001 or
             self.node_collapse_mutation_count != state.node_collapse_mutation_count or
-            self.connection_reroute_mutation_count != state.connection_reroute_mutation_count;
+            self.connection_reroute_mutation_count != state.connection_reroute_mutation_count or
+            self.connection_cut_operation_count != state.connection_cut_operation_count;
     }
 };
 
 fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, before: InteractionSnapshot, changed: bool) void {
     if (!changed) return;
+    const connection_cut_changed = before.connection_cut_operation_count != binding.state.connection_cut_operation_count;
     const geometry_changed = before.nodeGeometryChanged(binding.state) or before.non_node_structural_drag or
         binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.resizing_node_id != null or binding.state.reconnecting_connection != null;
     if (geometry_changed) {
         if (binding.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
+    }
+    if (connection_cut_changed) {
+        if (binding.topology_index) |topology_index| topology_index.invalidate();
     }
     const canvas_state = binding.canvas_state orelse return;
     if (before.transformChanged(binding.state)) {
@@ -405,7 +419,7 @@ fn connectionHash(connection: node_editor.Connection) u32 {
 test "node editor view builds on zui custom paint primitives" {
     var selected: [4]u32 = .{0} ** 4;
     var state = node_editor.State{ .selected_node_ids = &selected };
-    const nodes = [_]node_editor.Node{
+    var nodes = [_]node_editor.Node{
         .{ .id = 1, .title = "Input", .pos = .{ 0, 0 } },
         .{ .id = 2, .title = "Output", .pos = .{ 160, 80 } },
     };
@@ -573,6 +587,145 @@ test "node editor view inserts drags and deletes a connection waypoint with undo
     try std.testing.expectEqual(node_editor.screenToGraph(editor_node.rect, state, middle), connections[0].waypoints[0]);
     try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
     try std.testing.expectEqual(@as(usize, 0), connections[0].boundedWaypointCount());
+}
+
+test "node editor view cuts multiple links as one undo transaction" {
+    var selected_nodes: [2]u32 = .{0} ** 2;
+    var selected_connections: [3]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections, .connection_cut_mode = true };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -180, -70 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 2, .title = "B", .pos = .{ 100, -70 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 3, .title = "C", .pos = .{ -180, 50 }, .size = .{ .w = 80, .h = 40 } },
+        .{ .id = 4, .title = "D", .pos = .{ 100, 50 }, .size = .{ .w = 80, .h = 40 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections: [3]node_editor.Connection = .{
+        .{ .from_id = 1, .to_id = 2 },
+        .{ .from_id = 3, .to_id = 4 },
+        .{ .from_id = 1, .to_id = 4, .waypoints = .{ .{ -20, 140 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } }, .waypoint_count = 1 },
+    };
+    const original_connections = connections;
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    var topology_storage = node_editor.StaticGraphTopologyWorkspace(nodes.len, connections.len){};
+    var topology_index = node_editor.GraphTopologyIndex.init(topology_storage.workspace());
+    try std.testing.expect(topology_index.ensure(&nodes, &connections).complete());
+    var canvas_state = zui.CanvasState{};
+    var view = try zui.View.init(std.testing.allocator, .{ .x = 0, .y = 0, .w = 500, .h = 300 }, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = 500, .h = 300 } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9435,
+        .canvas_state = &canvas_state,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .history = &history,
+        .viewport_index = &viewport_index,
+        .topology_index = &topology_index,
+        .connection_cut = .{ .enabled = true },
+        .drag_auto_pan = .{ .enabled = false },
+        .show_minimap = false,
+    });
+    editor_node.rect = .{ .x = 0, .y = 0, .w = 500, .h = 300 };
+
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = 250, .y = 20 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var move = ElementEvent{ .mouse_move = .{ .x = 250, .y = 240, .dx = 0, .dy = 220 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = 250, .y = 240 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(@as(u64, 1), state.connection_cut_operation_count);
+    try std.testing.expectEqual(@as(u64, 2), state.connection_cut_removed_count);
+    try std.testing.expectEqual(@as(usize, 3), state.connection_cut_candidate_count);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(!state.connection_cut_stroke.active);
+    try std.testing.expect(state.connection_cut_mode);
+    try std.testing.expect(!topology_index.summary().valid);
+    try std.testing.expect(canvas_state.dirtySummary().invalidation.contains(.data));
+    try std.testing.expect(history.undo(&state, &nodes, &node_len, &connections, &connection_len));
+    try std.testing.expectEqual(original_connections, connections);
+    try std.testing.expectEqual(@as(usize, 3), connection_len);
+}
+
+test "node editor view cancels an active link cut without mutation" {
+    var state = node_editor.State{ .connection_cut_mode = true };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "A", .pos = .{ -120, -30 }, .size = .{ .w = 80, .h = 60 } },
+        .{ .id = 2, .title = "B", .pos = .{ 80, -30 }, .size = .{ .w = 80, .h = 60 } },
+    };
+    var node_len: usize = nodes.len;
+    var connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 2 }};
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    var event = ElementEvent{ .mouse_down = .{ .button = .left, .x = 250, .y = 20 } };
+    const editor = node_editor.Options(node_editor.State){
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .history = &history,
+        .connection_cut = .{ .enabled = true },
+        .show_minimap = false,
+    };
+    const viewport = Rect{ .x = 0, .y = 0, .w = 500, .h = 260 };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &event));
+    event = .{ .mouse_move = .{ .x = 250, .y = 180, .dx = 0, .dy = 160 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &event));
+    event = .{ .key_down = .escape };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &event));
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+    try std.testing.expect(!state.connection_cut_stroke.active);
+    try std.testing.expect(state.connection_cut_mode);
+    _ = state.beginConnectionCut(.{ 250, 20 });
+    event = .{ .pointer_capture_lost = .{ .pointer_id = 1, .reason = .cancel } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &event));
+    try std.testing.expect(!state.connection_cut_stroke.active);
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+}
+
+test "node editor link cutting refuses insufficient history atomically" {
+    const node_count = 17;
+    var state = node_editor.State{ .connection_cut_mode = true };
+    var nodes: [node_count]node_editor.Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{ .id = @intCast(index + 1), .title = "N", .pos = .{ @floatFromInt(index * 40), 0 } };
+    var connections: [node_count - 1]node_editor.Connection = undefined;
+    for (&connections, 0..) |*connection, index| connection.* = .{ .from_id = @intCast(index + 1), .to_id = @intCast(index + 2) };
+    const original = connections;
+    var node_len: usize = nodes.len;
+    var connection_len: usize = connections.len;
+    var history = node_editor.History{};
+    const viewport = Rect{ .x = 0, .y = 0, .w = 800, .h = 300 };
+    const editor = node_editor.Options(node_editor.State){
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .history = &history,
+        .connection_cut = .{ .enabled = true },
+        .show_minimap = false,
+    };
+    var event = ElementEvent{ .mouse_down = .{ .button = .left, .x = 400, .y = 20 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &event));
+    event = .{ .mouse_move = .{ .x = 400, .y = 250, .dx = 0, .dy = 230 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &event));
+    event = .{ .mouse_up = .{ .button = .left, .x = 400, .y = 250 } };
+    try std.testing.expect(node_editor.handleEditorEvent(viewport, .{}, editor, &event));
+    try std.testing.expectEqual(original, connections);
+    try std.testing.expectEqual(connections.len, connection_len);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
+    try std.testing.expectEqual(@as(u64, 0), state.connection_cut_operation_count);
+    try std.testing.expect(!state.connection_cut_stroke.active);
 }
 
 test "node editor view drags mutable nodes" {

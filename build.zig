@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_editor_bench = b.addRunArtifact(editor_bench);
     if (b.args) |args| run_editor_bench.addArgs(args);
-    const editor_bench_step = b.step("bench-editor-frame", "Benchmark 10k-node paint, snapping, selection, and indexed keyboard navigation");
+    const editor_bench_step = b.step("bench-editor-frame", "Benchmark 10k-node paint, snapping, selection, link cutting, and indexed keyboard navigation");
     if (can_run_target) {
         editor_bench_step.dependOn(&run_editor_bench.step);
     } else {
@@ -111,9 +111,10 @@ pub fn build(b: *std.Build) void {
         "--max-paint-ns=1000000",
         "--max-multi-drag-ns=100000",
         "--max-box-connection-ns=100000",
+        "--max-cut-preview-ns=100000",
         "--max-navigation-ns=100000",
     });
-    const verify_editor_step = b.step("verify-editor-performance", "Verify 10k-node paint, snapping, selection, indexed keyboard navigation, and zero allocation");
+    const verify_editor_step = b.step("verify-editor-performance", "Verify 10k-node paint, snapping, selection, link cutting, indexed keyboard navigation, and zero allocation");
     if (can_run_target) {
         verify_editor_step.dependOn(&verify_editor_bench.step);
     } else {

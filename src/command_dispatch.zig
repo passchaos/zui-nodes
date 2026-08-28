@@ -35,6 +35,7 @@ pub const CommandContext = struct {
     duplicate_id_offset: u32 = 1000,
     duplicate_offset: [2]f32 = .{ 32.0, 24.0 },
     connection_policy: node_editor.ConnectionPolicy = .default,
+    connection_cut_enabled: bool = false,
     topology_index: ?*graph_topology.Index = null,
     viewport_index: ?*node_editor.ViewportIndex = null,
     layout_workspace: ?graph_layout.LayeredLayoutWorkspace = null,
@@ -44,7 +45,7 @@ pub const CommandContext = struct {
 pub fn commandFromId(command_id: CommandId) ?NodeEditorCommand {
     if (command_id < commands.node_editor_command_id_base) return null;
     const raw = command_id - commands.node_editor_command_id_base;
-    if (raw > @intFromEnum(NodeEditorCommand.clear_connection_waypoints)) return null;
+    if (raw > @intFromEnum(NodeEditorCommand.toggle_connection_cut_mode)) return null;
     return @enumFromInt(raw);
 }
 
@@ -122,6 +123,7 @@ pub fn canDispatch(context: *const CommandContext, command: NodeEditorCommand) b
         .add_connection_waypoint => context.connection_len != null and context.state.canAddSelectedConnectionWaypoint(context.connections, connection_count),
         .remove_connection_waypoint => context.connection_len != null and context.state.canRemoveSelectedConnectionWaypoint(context.connections, connection_count),
         .clear_connection_waypoints => context.connection_len != null and context.state.canClearSelectedConnectionWaypoints(context.connections, connection_count),
+        .toggle_connection_cut_mode => context.connection_cut_enabled and context.connection_len != null and connection_count > 0,
     };
 }
 
@@ -169,6 +171,7 @@ pub fn dispatch(context: *CommandContext, command: NodeEditorCommand) bool {
         .add_connection_waypoint => addSelectedConnectionWaypoint(context),
         .remove_connection_waypoint => mutateSelectedConnectionWaypoints(context, false),
         .clear_connection_waypoints => mutateSelectedConnectionWaypoints(context, true),
+        .toggle_connection_cut_mode => toggleConnectionCutMode(context),
     };
 }
 
@@ -493,6 +496,12 @@ fn mutateSelectedConnectionWaypoints(context: *CommandContext, clear_all: bool) 
     const committed = finishHistoryMutation(history_mutation, changed);
     if (committed) if (context.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
     return committed;
+}
+
+fn toggleConnectionCutMode(context: *CommandContext) bool {
+    const changed = context.state.toggleConnectionCutMode();
+    if (changed) if (context.viewport_index) |viewport_index| viewport_index.invalidateViewport();
+    return changed;
 }
 
 fn finishHistoryMutation(mutation: HistoryMutation, changed: bool) bool {
@@ -1156,4 +1165,19 @@ test "zui-nodes waypoint commands preserve selection and undo atomically" {
     state.selected_connection_waypoint = 0;
     try std.testing.expect(dispatch(&context, .remove_connection_waypoint));
     try std.testing.expectEqual(@as(usize, 0), connections[0].boundedWaypointCount());
+}
+
+test "zui-nodes cut tool command is opt in and toggleable" {
+    var state = node_editor.State{};
+    var nodes: [1]node_editor.Node = .{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }};
+    var node_len: usize = nodes.len;
+    var connections: [1]node_editor.Connection = .{.{ .from_id = 1, .to_id = 1 }};
+    var connection_len: usize = 1;
+    var context = CommandContext{ .state = &state, .nodes = &nodes, .node_len = &node_len, .connections = &connections, .connection_len = &connection_len };
+    try std.testing.expect(!canDispatch(&context, .toggle_connection_cut_mode));
+    context.connection_cut_enabled = true;
+    try std.testing.expect(dispatch(&context, .toggle_connection_cut_mode));
+    try std.testing.expect(state.connection_cut_mode);
+    try std.testing.expect(dispatch(&context, .toggle_connection_cut_mode));
+    try std.testing.expect(!state.connection_cut_mode);
 }

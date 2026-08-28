@@ -489,6 +489,9 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
                 state.selected_connection_waypoint = null;
                 state.dragging_connection_waypoint = null;
             }
+            if (comptime @hasField(@TypeOf(state.*), "connection_cut_stroke")) {
+                _ = state.connection_cut_stroke.cancel();
+            }
             state.pending_connection = null;
             state.hover_node_id = null;
             state.hover_group_id = null;

@@ -42,6 +42,7 @@ pub const SummaryOptions = struct {
     node_collapse: node_editor.NodeCollapseOptions = .{},
     node_resize: node_editor.NodeResizeOptions = .{},
     connection_reroute: node_editor.ConnectionRerouteOptions = .{},
+    connection_cut: node_editor.ConnectionCutOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -90,6 +91,13 @@ pub const Summary = struct {
     selected_connection_waypoint: ?u8 = null,
     connection_reroute_enabled: bool = false,
     connection_reroute_mutation_count: u64 = 0,
+    connection_cut_enabled: bool = false,
+    connection_cut_mode: bool = false,
+    connection_cut_active: bool = false,
+    connection_cut_point_count: usize = 0,
+    connection_cut_candidate_count: usize = 0,
+    connection_cut_operation_count: u64 = 0,
+    connection_cut_removed_count: u64 = 0,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -168,12 +176,12 @@ pub fn summarize(options: SummaryOptions) Summary {
         .has_selected_connection = state.boundedConnectionSelectionLen() > 0,
         .hover_node_id = state.hover_node_id,
         .hover_group_id = state.hover_group_id,
-        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.dragging_connection_waypoint != null or state.resizing_group_id != null or state.resizing_node_id != null or state.box_selecting or state.dragging_minimap,
+        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.dragging_connection_waypoint != null or state.connection_cut_stroke.active or state.resizing_group_id != null or state.resizing_node_id != null or state.box_selecting or state.dragging_minimap,
         .dragging_minimap = state.dragging_minimap,
         .zoom = state.zoom,
         .detail_level = node_editor.semanticDetailLevel(state.*, options.semantic_zoom),
         .drag_auto_pan_enabled = options.drag_auto_pan.enabled,
-        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.dragging_connection_waypoint != null or state.box_selecting,
+        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.dragging_connection_waypoint != null or state.connection_cut_stroke.active or state.box_selecting,
         .drag_snap_enabled = options.drag_snap.enabled,
         .drag_snap_active = state.dragging_node_id != null and
             ((state.snap_guide_x != null and state.snap_guide_x_span == null) or
@@ -201,6 +209,13 @@ pub fn summarize(options: SummaryOptions) Summary {
         .selected_connection_waypoint = state.selected_connection_waypoint,
         .connection_reroute_enabled = options.connection_reroute.enabled,
         .connection_reroute_mutation_count = state.connection_reroute_mutation_count,
+        .connection_cut_enabled = options.connection_cut.enabled,
+        .connection_cut_mode = state.connection_cut_mode,
+        .connection_cut_active = state.connection_cut_stroke.active,
+        .connection_cut_point_count = state.connection_cut_stroke.boundedPointCount(),
+        .connection_cut_candidate_count = state.connection_cut_candidate_count,
+        .connection_cut_operation_count = state.connection_cut_operation_count,
+        .connection_cut_removed_count = state.connection_cut_removed_count,
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -305,6 +320,15 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.selected_connection_waypoint,
         options.summary.connection_reroute_mutation_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const connection_cut = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "cut enabled={} mode={} active={} points={d} candidates={d} operations={d} removed={d}", .{
+        options.summary.connection_cut_enabled,
+        options.summary.connection_cut_mode,
+        options.summary.connection_cut_active,
+        options.summary.connection_cut_point_count,
+        options.summary.connection_cut_candidate_count,
+        options.summary.connection_cut_operation_count,
+        options.summary.connection_cut_removed_count,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const graph = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "graph valid={} issues={d} dup={d} fanin={d} orphan={d} port={d} type={d} cycle={d}", .{
         options.summary.graph_valid,
         options.summary.graph_issue_count,
@@ -345,7 +369,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, box_select, navigation, drag_snap, path_cache, connection_draw, reroute, topology, viewport_index, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, box_select, navigation, drag_snap, path_cache, connection_draw, reroute, connection_cut, topology, viewport_index, history, graph });
     return root;
 }
 
@@ -405,6 +429,23 @@ test "zui-nodes devtools reports connection waypoint drag activity" {
     try std.testing.expect(summary.dragging);
     try std.testing.expect(summary.drag_auto_pan_active);
     try std.testing.expectEqualStrings("dragging", summary.statusText());
+}
+
+test "zui-nodes devtools reports connection cut diagnostics" {
+    var state = State{ .connection_cut_mode = true };
+    _ = state.connection_cut_stroke.begin(.{ 10, 20 });
+    _ = state.connection_cut_stroke.append(.{ 40, 50 }, 0);
+    state.connection_cut_candidate_count = 7;
+    state.connection_cut_operation_count = 2;
+    state.connection_cut_removed_count = 5;
+    const summary = summarize(.{ .state = &state, .connection_cut = .{ .enabled = true } });
+    try std.testing.expect(summary.connection_cut_enabled);
+    try std.testing.expect(summary.connection_cut_mode);
+    try std.testing.expect(summary.connection_cut_active);
+    try std.testing.expectEqual(@as(usize, 2), summary.connection_cut_point_count);
+    try std.testing.expectEqual(@as(usize, 7), summary.connection_cut_candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), summary.connection_cut_operation_count);
+    try std.testing.expectEqual(@as(u64, 5), summary.connection_cut_removed_count);
 }
 
 test "zui-nodes devtools exposes active drag snap guides" {

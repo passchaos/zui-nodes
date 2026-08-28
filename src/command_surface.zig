@@ -28,7 +28,7 @@ pub const node_editor_command_category = "node editor";
 pub const node_editor_selection_category = "node editor selection";
 pub const node_editor_history_category = "node editor history";
 pub const node_editor_selection_command_count: usize = @intFromEnum(SelectionCommand.focus) + 1;
-pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.clear_connection_waypoints) + 1;
+pub const node_editor_command_count: usize = @intFromEnum(NodeEditorCommand.toggle_connection_cut_mode) + 1;
 pub const node_editor_history_command_count: usize = @intFromEnum(HistoryCommand.redo) + 1;
 pub const node_editor_all_command_count: usize = node_editor_selection_command_count + node_editor_command_count + node_editor_history_command_count;
 pub const node_editor_context_menu_capacity: usize = 40;
@@ -82,6 +82,7 @@ pub const node_editor_commands = [_]Command{
     .{ .id = NodeEditorCommand.add_connection_waypoint.commandId(), .title = "Add Connection Waypoint", .description = "Add a routing point to the selected node connection", .category = node_editor_command_category, .panel_role = .viewport },
     .{ .id = NodeEditorCommand.remove_connection_waypoint.commandId(), .title = "Remove Connection Waypoint", .description = "Remove the active routing point from the selected connection", .category = node_editor_command_category, .panel_role = .viewport },
     .{ .id = NodeEditorCommand.clear_connection_waypoints.commandId(), .title = "Clear Connection Waypoints", .description = "Restore automatic routing for the selected connection", .category = node_editor_command_category, .panel_role = .viewport },
+    .{ .id = NodeEditorCommand.toggle_connection_cut_mode.commandId(), .title = "Toggle Cut Links Tool", .description = "Toggle the freehand tool for cutting every crossed connection", .category = node_editor_command_category, .panel_role = .viewport, .default_shortcut = "K", .pinned = true },
 };
 
 pub const node_editor_history_commands = [_]Command{
@@ -162,6 +163,7 @@ pub const NodeEditorContextMenuCapabilities = struct {
     can_add_connection_waypoint: bool = false,
     can_remove_connection_waypoint: bool = false,
     can_clear_connection_waypoints: bool = false,
+    can_toggle_connection_cut_mode: bool = false,
 };
 
 pub fn nodeEditorCommandRegistry() CommandRegistry {
@@ -243,6 +245,8 @@ pub fn nodeEditorContextMenuModel(context: *const CommandContext, options: NodeE
 
     switch (target) {
         .canvas => {
+            builder.appendCommand(.toggle_connection_cut_mode);
+            builder.appendSeparator();
             if (options.include_clipboard) {
                 builder.appendCommand(.paste_clipboard);
                 builder.appendCommand(.copy_selection);
@@ -369,6 +373,8 @@ pub fn nodeEditorContextMenuModelForCapabilities(capabilities: NodeEditorContext
     }
     switch (target) {
         .canvas => {
+            builder.appendCommand(.toggle_connection_cut_mode, capabilities.can_toggle_connection_cut_mode);
+            builder.appendSeparator();
             if (options.include_clipboard) {
                 builder.appendCommand(.paste_clipboard, capabilities.can_paste);
                 builder.appendCommand(.copy_selection, capabilities.can_copy);
@@ -503,6 +509,7 @@ fn nodeEditorCommandChecked(context: *const CommandContext, command: NodeEditorC
     return switch (command) {
         .open_context_menu, .close_context_menu => context.state.context_menu.open,
         .toggle_selected_nodes_collapsed => context.state.selectedNodesAllCollapsed(context.nodes, context.node_len.*),
+        .toggle_connection_cut_mode => context.state.connection_cut_mode,
         else => false,
     };
 }
@@ -630,6 +637,27 @@ test "zui-nodes connection menu exposes waypoint actions" {
     try std.testing.expect(menuContainsCommand(model, .clear_connection_waypoints));
 }
 
+test "zui-nodes canvas menu exposes opt-in cut tool" {
+    var items: [node_editor_context_menu_capacity]MenuItem = undefined;
+    const disabled = nodeEditorContextMenuModelForCapabilities(.{ .target = .canvas }, .{}, &items);
+    const registry = nodeEditorCommandRegistry();
+    const cut_id = NodeEditorCommand.toggle_connection_cut_mode.commandId();
+    for (disabled.items, 0..) |item, index| {
+        if (item.command_id == cut_id) {
+            try std.testing.expect(!disabled.isSelectable(index, registry));
+            break;
+        }
+    } else return error.MissingConnectionCutCommand;
+
+    const enabled = nodeEditorContextMenuModelForCapabilities(.{ .target = .canvas, .can_toggle_connection_cut_mode = true }, .{}, &items);
+    for (enabled.items, 0..) |item, index| {
+        if (item.command_id == cut_id) {
+            try std.testing.expect(enabled.isSelectable(index, registry));
+            break;
+        }
+    } else return error.MissingConnectionCutCommand;
+}
+
 fn menuContainsSelectionCommand(model: MenuModel, command: SelectionCommand) bool {
     const id = command.commandId();
     for (model.items) |item| {
@@ -693,6 +721,30 @@ test "zui-nodes dynamic command registry mirrors dispatch availability" {
     try std.testing.expect(selection_registry.isEnabled(SelectionCommand.delete.commandId()));
     try std.testing.expect(selection_registry.isEnabled(SelectionCommand.duplicate.commandId()));
     try std.testing.expectEqual(@as(usize, 2), state.boundedSelectionLen());
+}
+
+test "zui-nodes dynamic command registry checks active cut tool" {
+    var state = node_editor.State{};
+    var nodes = [_]node_editor.Node{.{ .id = 1, .title = "A", .pos = .{ 0, 0 } }};
+    var node_len: usize = nodes.len;
+    var connections = [_]node_editor.Connection{.{ .from_id = 1, .to_id = 1 }};
+    var connection_len: usize = connections.len;
+    var context = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .connection_cut_enabled = true,
+    };
+    var storage: [node_editor_command_count]Command = undefined;
+    var registry = nodeEditorCommandRegistryForContext(&context, &storage);
+    const cut_id = NodeEditorCommand.toggle_connection_cut_mode.commandId();
+    try std.testing.expect(registry.isEnabled(cut_id));
+    try std.testing.expect(!registry.find(cut_id).?.checked);
+    try std.testing.expect(command_dispatch.dispatch(&context, .toggle_connection_cut_mode));
+    registry = nodeEditorCommandRegistryForContext(&context, &storage);
+    try std.testing.expect(registry.find(cut_id).?.checked);
 }
 
 test "zui-nodes context menu model resolves through command registry" {

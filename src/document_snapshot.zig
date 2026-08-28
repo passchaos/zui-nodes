@@ -235,6 +235,7 @@ pub fn applyDocumentSnapshot(options: ApplyOptions) !ApplyResult {
     options.state.resizing_node_edges = .{};
     options.state.selected_connection_waypoint = null;
     options.state.dragging_connection_waypoint = null;
+    _ = options.state.connection_cut_stroke.cancel();
     options.state.pending_connection = null;
     options.state.hover_node_id = null;
     options.state.hover_group_id = null;

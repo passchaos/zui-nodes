@@ -153,6 +153,7 @@ fn nodeEditorDisabledReason(context: *const CommandContext, command: NodeEditorC
         .add_connection_waypoint => "selected connection cannot accept another waypoint",
         .remove_connection_waypoint => "waypoint unavailable",
         .clear_connection_waypoints => "selected connection has no waypoints",
+        .toggle_connection_cut_mode => "cut links tool unavailable",
     };
 }
 
