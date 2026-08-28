@@ -43,6 +43,7 @@ pub const SummaryOptions = struct {
     node_resize: node_editor.NodeResizeOptions = .{},
     connection_reroute: node_editor.ConnectionRerouteOptions = .{},
     connection_cut: node_editor.ConnectionCutOptions = .{},
+    connection_spawn: node_editor.ConnectionSpawnOptions = .{},
     history: ?*const node_editor.History = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 };
@@ -98,6 +99,13 @@ pub const Summary = struct {
     connection_cut_candidate_count: usize = 0,
     connection_cut_operation_count: u64 = 0,
     connection_cut_removed_count: u64 = 0,
+    connection_spawn_enabled: bool = false,
+    connection_spawn_pending: bool = false,
+    connection_spawn_existing_end: ?node_editor.ConnectionEnd = null,
+    connection_spawn_port_type: ?node_editor.PortType = null,
+    connection_spawn_request_count: u64 = 0,
+    connection_spawn_commit_count: u64 = 0,
+    connection_spawn_rejected_count: u64 = 0,
     snap_guide_x: ?f32 = null,
     snap_guide_y: ?f32 = null,
     pan: [2]f32 = .{ 0, 0 },
@@ -176,12 +184,12 @@ pub fn summarize(options: SummaryOptions) Summary {
         .has_selected_connection = state.boundedConnectionSelectionLen() > 0,
         .hover_node_id = state.hover_node_id,
         .hover_group_id = state.hover_group_id,
-        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.dragging_connection_waypoint != null or state.connection_cut_stroke.active or state.resizing_group_id != null or state.resizing_node_id != null or state.box_selecting or state.dragging_minimap,
+        .dragging = state.dragging_canvas or state.dragging_node_id != null or state.dragging_group_id != null or state.dragging_connection_from_id != null or state.dragging_connection_to_id != null or state.dragging_connection_waypoint != null or state.connection_cut_stroke.active or state.resizing_group_id != null or state.resizing_node_id != null or state.box_selecting or state.dragging_minimap,
         .dragging_minimap = state.dragging_minimap,
         .zoom = state.zoom,
         .detail_level = node_editor.semanticDetailLevel(state.*, options.semantic_zoom),
         .drag_auto_pan_enabled = options.drag_auto_pan.enabled,
-        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.dragging_connection_from_id != null or state.reconnecting_connection != null or state.dragging_connection_waypoint != null or state.connection_cut_stroke.active or state.box_selecting,
+        .drag_auto_pan_active = state.dragging_node_id != null or state.dragging_group_id != null or state.resizing_group_id != null or state.resizing_node_id != null or state.dragging_connection_from_id != null or state.dragging_connection_to_id != null or state.reconnecting_connection != null or state.dragging_connection_waypoint != null or state.connection_cut_stroke.active or state.box_selecting,
         .drag_snap_enabled = options.drag_snap.enabled,
         .drag_snap_active = state.dragging_node_id != null and
             ((state.snap_guide_x != null and state.snap_guide_x_span == null) or
@@ -216,6 +224,13 @@ pub fn summarize(options: SummaryOptions) Summary {
         .connection_cut_candidate_count = state.connection_cut_candidate_count,
         .connection_cut_operation_count = state.connection_cut_operation_count,
         .connection_cut_removed_count = state.connection_cut_removed_count,
+        .connection_spawn_enabled = options.connection_spawn.enabled,
+        .connection_spawn_pending = state.connection_spawn_request != null,
+        .connection_spawn_existing_end = if (state.connection_spawn_request) |request| request.existing_end else null,
+        .connection_spawn_port_type = if (state.connection_spawn_request) |request| request.port_type else null,
+        .connection_spawn_request_count = state.connection_spawn_request_count,
+        .connection_spawn_commit_count = state.connection_spawn_commit_count,
+        .connection_spawn_rejected_count = state.connection_spawn_rejected_count,
         .snap_guide_x = state.snap_guide_x,
         .snap_guide_y = state.snap_guide_y,
         .pan = state.pan,
@@ -329,6 +344,15 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.connection_cut_operation_count,
         options.summary.connection_cut_removed_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
+    const connection_spawn = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "spawn enabled={} pending={} end={?s} type={?s} requests={d} commits={d} rejected={d}", .{
+        options.summary.connection_spawn_enabled,
+        options.summary.connection_spawn_pending,
+        if (options.summary.connection_spawn_existing_end) |value| @tagName(value) else null,
+        if (options.summary.connection_spawn_port_type) |value| @tagName(value) else null,
+        options.summary.connection_spawn_request_count,
+        options.summary.connection_spawn_commit_count,
+        options.summary.connection_spawn_rejected_count,
+    }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
     const graph = try ctx.label(try std.fmt.allocPrint(ctx.allocator, "graph valid={} issues={d} dup={d} fanin={d} orphan={d} port={d} type={d} cycle={d}", .{
         options.summary.graph_valid,
         options.summary.graph_issue_count,
@@ -369,7 +393,7 @@ pub fn panel(ctx: *ViewContext, options: PanelOptions) !*ElementNode {
         options.summary.history.rejected_snapshot_count,
         options.summary.history.dropped_snapshot_count,
     }), .{ .font_size = 10, .color = ctx.theme().text_subtle, .height = .{ .px = options.row_height }, .line_height = options.row_height, .text_overflow = .ellipsis });
-    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, box_select, navigation, drag_snap, path_cache, connection_draw, reroute, connection_cut, topology, viewport_index, history, graph });
+    try ctx.children(root, .{ title, counts, selection, viewport, auto_pan, box_select, navigation, drag_snap, path_cache, connection_draw, reroute, connection_cut, connection_spawn, topology, viewport_index, history, graph });
     return root;
 }
 
@@ -446,6 +470,29 @@ test "zui-nodes devtools reports connection cut diagnostics" {
     try std.testing.expectEqual(@as(usize, 7), summary.connection_cut_candidate_count);
     try std.testing.expectEqual(@as(u64, 2), summary.connection_cut_operation_count);
     try std.testing.expectEqual(@as(u64, 5), summary.connection_cut_removed_count);
+}
+
+test "zui-nodes devtools reports typed connection spawn diagnostics" {
+    var state = State{
+        .connection_spawn_request = .{
+            .existing_end = .to,
+            .node_id = 7,
+            .port_index = 2,
+            .port_type = .mask,
+            .graph_pos = .{ 140, 80 },
+        },
+        .connection_spawn_request_count = 4,
+        .connection_spawn_commit_count = 2,
+        .connection_spawn_rejected_count = 1,
+    };
+    const summary = summarize(.{ .state = &state, .connection_spawn = .{ .enabled = true } });
+    try std.testing.expect(summary.connection_spawn_enabled);
+    try std.testing.expect(summary.connection_spawn_pending);
+    try std.testing.expectEqual(node_editor.ConnectionEnd.to, summary.connection_spawn_existing_end.?);
+    try std.testing.expectEqual(node_editor.PortType.mask, summary.connection_spawn_port_type.?);
+    try std.testing.expectEqual(@as(u64, 4), summary.connection_spawn_request_count);
+    try std.testing.expectEqual(@as(u64, 2), summary.connection_spawn_commit_count);
+    try std.testing.expectEqual(@as(u64, 1), summary.connection_spawn_rejected_count);
 }
 
 test "zui-nodes devtools exposes active drag snap guides" {

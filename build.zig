@@ -113,8 +113,10 @@ pub fn build(b: *std.Build) void {
         "--max-box-connection-ns=100000",
         "--max-cut-preview-ns=100000",
         "--max-navigation-ns=100000",
+        "--max-spawn-filter-ns=1000000",
+        "--max-spawn-commit-ns=2000000",
     });
-    const verify_editor_step = b.step("verify-editor-performance", "Verify 10k-node paint, snapping, selection, link cutting, indexed keyboard navigation, and zero allocation");
+    const verify_editor_step = b.step("verify-editor-performance", "Verify 10k-node paint, snapping, selection, link cutting, typed connection spawning, indexed keyboard navigation, and zero allocation");
     if (can_run_target) {
         verify_editor_step.dependOn(&verify_editor_bench.step);
     } else {

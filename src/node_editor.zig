@@ -12,6 +12,7 @@ const graph_topology = @import("graph_topology.zig");
 const node_geometry = @import("node_geometry.zig");
 const node_navigation = @import("node_navigation.zig");
 const connection_cut = @import("connection_cut.zig");
+const connection_spawn = @import("connection_spawn.zig");
 const viewport_types = @import("node_viewport.zig").Types(Node, Group, Connection, Rect);
 
 const render = struct {
@@ -237,7 +238,12 @@ fn autoPanAxis(position: f32, min_value: f32, max_value: f32, margin: f32, max_s
 
 pub fn semanticDetailLevel(state: anytype, options: SemanticZoomOptions) DetailLevel {
     const detail = options.detailLevel(state.zoom);
-    if (detail == .overview and (state.dragging_connection_from_id != null or state.reconnecting_connection != null)) return .compact;
+    if (detail == .overview) {
+        if (state.dragging_connection_from_id != null or state.reconnecting_connection != null) return .compact;
+        if (comptime @hasField(@TypeOf(state), "dragging_connection_to_id")) {
+            if (state.dragging_connection_to_id != null) return .compact;
+        }
+    }
     return detail;
 }
 
@@ -425,6 +431,37 @@ pub const NodeTemplate = struct {
     collapsed_height: f32 = 32.0,
 };
 
+pub const ConnectionSpawnRequest = struct {
+    /// The endpoint already present in the graph. A `.from` request needs an
+    /// input on the new node; a `.to` request needs an output.
+    existing_end: ConnectionEnd,
+    node_id: u32,
+    port_index: u8,
+    port_type: PortType,
+    graph_pos: [2]f32,
+};
+
+pub const ConnectionSpawnPlan = struct {
+    node: Node,
+    connection: Connection,
+    new_port_index: u8,
+};
+
+pub const ConnectionSpawnCommitResult = struct {
+    committed: bool = false,
+    node_id: ?u32 = null,
+    new_port_index: ?u8 = null,
+    connection: ?Connection = null,
+};
+
+pub const ConnectionSpawnOptions = struct {
+    enabled: bool = false,
+};
+
+pub fn compatibleTemplatePort(template: NodeTemplate, request: ConnectionSpawnRequest) ?u8 {
+    return connection_spawn.compatibleTemplatePort(template, request);
+}
+
 pub const ChainTemplate = struct {
     nodes: []const NodeTemplate,
     connections: []const Connection = &.{},
@@ -443,6 +480,11 @@ pub const TemplatePaletteItem = struct {
     command: commands_mod.NodeEditorCommand,
     kind: TemplatePaletteKind = .node,
     aliases: []const []const u8 = &.{},
+    /// Required for type-aware creation from a dangling connection. Existing
+    /// command-only palette entries remain compatible for ordinary insertion.
+    template: ?NodeTemplate = null,
+    accepts_incoming_spawn: bool = true,
+    provides_outgoing_spawn: bool = true,
 };
 
 pub const TemplatePaletteState = struct {
@@ -470,17 +512,25 @@ pub const TemplatePaletteState = struct {
     }
 
     pub fn matchCount(self: TemplatePaletteState, items: []const TemplatePaletteItem) usize {
+        return self.matchCountForConnection(items, null);
+    }
+
+    pub fn matchCountForConnection(self: TemplatePaletteState, items: []const TemplatePaletteItem, request: ?ConnectionSpawnRequest) usize {
         var count: usize = 0;
         for (items) |item| {
-            if (self.matches(item)) count += 1;
+            if (self.matchesForConnection(item, request)) count += 1;
         }
         return count;
     }
 
     pub fn itemAt(self: TemplatePaletteState, items: []const TemplatePaletteItem, match_index: usize) ?TemplatePaletteItem {
+        return self.itemAtForConnection(items, match_index, null);
+    }
+
+    pub fn itemAtForConnection(self: TemplatePaletteState, items: []const TemplatePaletteItem, match_index: usize, request: ?ConnectionSpawnRequest) ?TemplatePaletteItem {
         var current: usize = 0;
         for (items) |item| {
-            if (!self.matches(item)) continue;
+            if (!self.matchesForConnection(item, request)) continue;
             if (current == match_index) return item;
             current += 1;
         }
@@ -488,13 +538,21 @@ pub const TemplatePaletteState = struct {
     }
 
     pub fn selectedItem(self: TemplatePaletteState, items: []const TemplatePaletteItem) ?TemplatePaletteItem {
-        const count = self.matchCount(items);
+        return self.selectedItemForConnection(items, null);
+    }
+
+    pub fn selectedItemForConnection(self: TemplatePaletteState, items: []const TemplatePaletteItem, request: ?ConnectionSpawnRequest) ?TemplatePaletteItem {
+        const count = self.matchCountForConnection(items, request);
         if (count == 0) return null;
-        return self.itemAt(items, @min(self.selected_index, count - 1));
+        return self.itemAtForConnection(items, @min(self.selected_index, count - 1), request);
     }
 
     pub fn moveSelection(self: *TemplatePaletteState, items: []const TemplatePaletteItem, delta: isize) void {
-        const count = self.matchCount(items);
+        self.moveSelectionForConnection(items, delta, null);
+    }
+
+    pub fn moveSelectionForConnection(self: *TemplatePaletteState, items: []const TemplatePaletteItem, delta: isize, request: ?ConnectionSpawnRequest) void {
+        const count = self.matchCountForConnection(items, request);
         if (count == 0) {
             self.selected_index = 0;
             return;
@@ -508,13 +566,28 @@ pub const TemplatePaletteState = struct {
     }
 
     pub fn submitSelected(self: *TemplatePaletteState, items: []const TemplatePaletteItem) ?commands_mod.NodeEditorCommand {
-        const item = self.selectedItem(items) orelse return null;
-        self.last_submitted = item.command;
-        self.close();
+        const item = self.submitSelectedItemForConnection(items, null) orelse return null;
         return item.command;
     }
 
+    pub fn submitSelectedItemForConnection(self: *TemplatePaletteState, items: []const TemplatePaletteItem, request: ?ConnectionSpawnRequest) ?TemplatePaletteItem {
+        const item = self.selectedItemForConnection(items, request) orelse return null;
+        self.last_submitted = item.command;
+        self.close();
+        return item;
+    }
+
     pub fn matches(self: TemplatePaletteState, item: TemplatePaletteItem) bool {
+        return self.matchesForConnection(item, null);
+    }
+
+    pub fn matchesForConnection(self: TemplatePaletteState, item: TemplatePaletteItem, request: ?ConnectionSpawnRequest) bool {
+        if (request) |spawn_request| {
+            const template = item.template orelse return false;
+            if (spawn_request.existing_end == .from and !item.accepts_incoming_spawn) return false;
+            if (spawn_request.existing_end == .to and !item.provides_outgoing_spawn) return false;
+            if (item.kind != .node or compatibleTemplatePort(template, spawn_request) == null) return false;
+        }
         if (self.query.len == 0) return true;
         if (containsIgnoreCase(item.label, self.query)) return true;
         if (containsIgnoreCase(item.description, self.query)) return true;
@@ -592,6 +665,8 @@ pub fn Options(comptime StateType: type) type {
         node_resize: NodeResizeOptions = .{},
         connection_reroute: ConnectionRerouteOptions = .{},
         connection_cut: ConnectionCutOptions = .{},
+        connection_spawn: ConnectionSpawnOptions = .{},
+        template_palette: ?*TemplatePaletteState = null,
         clipboard: ?*Clipboard = null,
         connection_path_cache: ?*ConnectionPathCache = null,
         connection_draw_workspace: ?*ConnectionDrawWorkspace = null,
@@ -964,6 +1039,16 @@ fn inputPortCountForTemplate(template: NodeTemplate) u8 {
 
 fn outputPortCountForTemplate(template: NodeTemplate) u8 {
     return @max(@as(u8, 1), template.output_count);
+}
+
+fn templateInputPortPositionAt(template: NodeTemplate, node_pos: [2]f32, port_index: u8) [2]f32 {
+    const node_rect = Rect{ .x = node_pos[0], .y = node_pos[1], .w = template.size.w, .h = if (template.collapsed) template.collapsed_height else template.size.h };
+    return .{ node_rect.x, if (template.collapsed) node_rect.y + node_rect.h * 0.5 else portY(node_rect, inputPortCountForTemplate(template), port_index) };
+}
+
+fn templateOutputPortPositionAt(template: NodeTemplate, node_pos: [2]f32, port_index: u8) [2]f32 {
+    const node_rect = Rect{ .x = node_pos[0], .y = node_pos[1], .w = template.size.w, .h = if (template.collapsed) template.collapsed_height else template.size.h };
+    return .{ node_rect.x + node_rect.w, if (template.collapsed) node_rect.y + node_rect.h * 0.5 else portY(node_rect, outputPortCountForTemplate(template), port_index) };
 }
 
 fn chainPathExists(connections: []const Connection, start_id: u32, target_id: u32, ignore: Connection) bool {
@@ -1803,11 +1888,14 @@ pub const State = struct {
     dragging_node_id: ?u32 = null,
     dragging_connection_from_id: ?u32 = null,
     dragging_connection_from_port: u8 = 0,
+    dragging_connection_to_id: ?u32 = null,
+    dragging_connection_to_port: u8 = 0,
     reconnecting_connection: ?Connection = null,
     reconnecting_connection_end: ConnectionEnd = .to,
     connection_preview: [2]f32 = .{ 0.0, 0.0 },
     connection_preview_valid: bool = true,
     pending_connection: ?Connection = null,
+    connection_spawn_request: ?ConnectionSpawnRequest = null,
     dragging_group_id: ?u32 = null,
     resizing_group_id: ?u32 = null,
     resizing_group_edges: GroupResizeEdges = .{},
@@ -1859,6 +1947,9 @@ pub const State = struct {
     connection_cut_operation_count: u64 = 0,
     connection_cut_removed_count: u64 = 0,
     connection_cut_candidate_count: usize = 0,
+    connection_spawn_request_count: u64 = 0,
+    connection_spawn_commit_count: u64 = 0,
+    connection_spawn_rejected_count: u64 = 0,
     dragging_minimap: bool = false,
     minimap_drag_offset: [2]f32 = .{ 0.0, 0.0 },
     context_menu: ContextMenuState = .{},
@@ -1982,7 +2073,7 @@ pub const State = struct {
     }
 
     pub fn endDrag(self: *State) bool {
-        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.resizing_node_id != null or self.resizing_node_edges.any() or self.dragging_connection_from_id != null or self.dragging_connection_waypoint != null or self.connection_cut_stroke.active or self.box_selecting or self.dragging_minimap;
+        const changed = self.dragging_canvas or self.dragging_node_id != null or self.dragging_group_id != null or self.resizing_group_id != null or self.resizing_group_edges.any() or self.resizing_node_id != null or self.resizing_node_edges.any() or self.dragging_connection_from_id != null or self.dragging_connection_to_id != null or self.dragging_connection_waypoint != null or self.connection_cut_stroke.active or self.box_selecting or self.dragging_minimap;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
         self.dragging_group_id = null;
@@ -1994,6 +2085,8 @@ pub const State = struct {
         self.resetNodeDragTracking();
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
         self.dragging_connection_waypoint = null;
         _ = self.connection_cut_stroke.cancel();
         self.connection_preview_valid = true;
@@ -2035,6 +2128,8 @@ pub const State = struct {
         self.dragging_node_id = null;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
         _ = self.finishBoxSelection(false);
@@ -2055,6 +2150,8 @@ pub const State = struct {
         self.dragging_connection_waypoint = null;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
         _ = self.finishBoxSelection(false);
@@ -2075,6 +2172,8 @@ pub const State = struct {
         self.resetNodeDragTracking();
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
         _ = self.finishBoxSelection(false);
@@ -2452,6 +2551,8 @@ pub const State = struct {
             self.resizing_node_edges = .{};
             self.dragging_connection_from_id = null;
             self.dragging_connection_from_port = 0;
+            self.dragging_connection_to_id = null;
+            self.dragging_connection_to_port = 0;
             self.reconnecting_connection = null;
             self.dragging_connection_waypoint = null;
             self.dragging_minimap = false;
@@ -2476,6 +2577,8 @@ pub const State = struct {
         self.resizing_node_edges = .{};
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
         self.reconnecting_connection = null;
         self.dragging_connection_waypoint = null;
         self.dragging_minimap = false;
@@ -3997,6 +4100,8 @@ pub const State = struct {
         self.interaction_history_pushed = false;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
         self.connection_preview_valid = true;
         self.box_select_start = point;
         self.box_select_end = point;
@@ -4505,6 +4610,132 @@ pub const State = struct {
         return pending;
     }
 
+    pub fn beginConnectionDragFromOutput(self: *State, node_id: u32, port_index: u8, preview: [2]f32) bool {
+        self.connection_spawn_request = null;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
+        self.dragging_connection_from_id = node_id;
+        self.dragging_connection_from_port = port_index;
+        self.connection_preview = preview;
+        self.connection_preview_valid = true;
+        self.pending_connection = null;
+        return true;
+    }
+
+    pub fn beginConnectionDragToInput(self: *State, node_id: u32, port_index: u8, preview: [2]f32) bool {
+        self.connection_spawn_request = null;
+        self.dragging_connection_from_id = null;
+        self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = node_id;
+        self.dragging_connection_to_port = port_index;
+        self.connection_preview = preview;
+        self.connection_preview_valid = true;
+        self.pending_connection = null;
+        return true;
+    }
+
+    pub fn finishConnectionDrag(self: *State) void {
+        self.dragging_connection_from_id = null;
+        self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
+        self.connection_preview_valid = true;
+    }
+
+    pub fn beginConnectionSpawn(self: *State, request: ConnectionSpawnRequest) bool {
+        if (!std.math.isFinite(request.graph_pos[0]) or !std.math.isFinite(request.graph_pos[1])) return false;
+        const changed = self.connection_spawn_request == null or !std.meta.eql(self.connection_spawn_request.?, request);
+        self.connection_spawn_request = request;
+        self.pending_connection = null;
+        self.connection_spawn_request_count +%= 1;
+        self.finishConnectionDrag();
+        return changed;
+    }
+
+    pub fn cancelConnectionSpawn(self: *State) bool {
+        if (self.connection_spawn_request == null) return false;
+        self.connection_spawn_request = null;
+        return true;
+    }
+
+    pub fn planConnectionSpawn(self: *const State, nodes: []const Node, node_len: usize, template: NodeTemplate) ?ConnectionSpawnPlan {
+        const request = self.connection_spawn_request orelse return null;
+        const active_nodes = nodes[0..@min(node_len, nodes.len)];
+        const existing = nodeById(active_nodes, request.node_id) orelse return null;
+        const new_port_index = compatibleTemplatePort(template, request) orelse return null;
+        const new_id = uniqueDuplicateNodeId(active_nodes, @as(u32, @intCast(active_nodes.len + 1)), 1000);
+        const origin = [2]f32{ 0.0, 0.0 };
+        const port_at_origin = if (request.existing_end == .from)
+            templateInputPortPositionAt(template, origin, new_port_index)
+        else
+            templateOutputPortPositionAt(template, origin, new_port_index);
+        const node_pos = [2]f32{ request.graph_pos[0] - port_at_origin[0], request.graph_pos[1] - port_at_origin[1] };
+        const node = nodeFromTemplate(template, new_id, node_pos);
+        const connection = switch (request.existing_end) {
+            .from => Connection{ .from_id = existing.id, .from_port = request.port_index, .to_id = new_id, .to_port = new_port_index },
+            .to => Connection{ .from_id = new_id, .from_port = new_port_index, .to_id = existing.id, .to_port = request.port_index },
+        };
+        return .{ .node = node, .connection = connection, .new_port_index = new_port_index };
+    }
+
+    pub fn canCommitConnectionSpawn(self: *const State, nodes: []const Node, node_len: usize, connections: []const Connection, connection_len: usize, template: NodeTemplate, policy: ConnectionPolicy) bool {
+        const active_node_len = @min(node_len, nodes.len);
+        const active_connection_len = @min(connection_len, connections.len);
+        if (active_node_len >= nodes.len or active_connection_len >= connections.len) return false;
+        const plan = self.planConnectionSpawn(nodes, active_node_len, template) orelse return false;
+        const request = self.connection_spawn_request.?;
+        const existing = nodeById(nodes[0..active_node_len], request.node_id) orelse return false;
+        const existing_port_count = if (request.existing_end == .from) outputPortCount(existing) else inputPortCount(existing);
+        if (request.port_index >= existing_port_count) return false;
+        const existing_port_type = if (request.existing_end == .from) outputPortType(existing, request.port_index) else inputPortType(existing, request.port_index);
+        if (existing_port_type != request.port_type) return false;
+        if (!policy.allow_self_links and plan.connection.from_id == plan.connection.to_id) return false;
+        if (!policy.allow_duplicate_links) for (connections[0..active_connection_len]) |connection| {
+            if (State.connectionEndpointsEqual(connection, plan.connection)) return false;
+        };
+        if (!policy.allow_multiple_links_to_input) for (connections[0..active_connection_len]) |connection| {
+            if (connection.to_id == plan.connection.to_id and connection.to_port == plan.connection.to_port) return false;
+        };
+        if (!policy.allow_cycles) {
+            // The new node has no other links yet, so a single edge to or from
+            // it cannot close an existing cycle.
+            if (plan.connection.from_id == plan.connection.to_id) return false;
+        }
+        return compatibleTemplatePort(template, request) != null;
+    }
+
+    pub fn commitConnectionSpawn(self: *State, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, template: NodeTemplate, policy: ConnectionPolicy) bool {
+        return self.commitConnectionSpawnDetailed(nodes, node_len, connections, connection_len, template, policy).committed;
+    }
+
+    pub fn commitConnectionSpawnDetailed(self: *State, nodes: []Node, node_len: *usize, connections: []Connection, connection_len: *usize, template: NodeTemplate, policy: ConnectionPolicy) ConnectionSpawnCommitResult {
+        const active_node_len = @min(node_len.*, nodes.len);
+        const active_connection_len = @min(connection_len.*, connections.len);
+        node_len.* = active_node_len;
+        connection_len.* = active_connection_len;
+        if (!self.canCommitConnectionSpawn(nodes, active_node_len, connections, active_connection_len, template, policy)) {
+            self.connection_spawn_rejected_count +%= 1;
+            return .{};
+        }
+        const plan = self.planConnectionSpawn(nodes, active_node_len, template) orelse {
+            self.connection_spawn_rejected_count +%= 1;
+            return .{};
+        };
+        if (active_node_len >= nodes.len or active_connection_len >= connections.len) {
+            self.connection_spawn_rejected_count +%= 1;
+            return .{};
+        }
+        nodes[active_node_len] = plan.node;
+        connections[active_connection_len] = plan.connection;
+        node_len.* = active_node_len + 1;
+        connection_len.* = active_connection_len + 1;
+        self.connection_spawn_request = null;
+        self.pending_connection = null;
+        _ = self.setSingleSelection(plan.node.id);
+        self.connection_spawn_commit_count +%= 1;
+        return .{ .committed = true, .node_id = plan.node.id, .new_port_index = plan.new_port_index, .connection = plan.connection };
+    }
+
     pub fn appendConnection(self: *State, connections: []Connection, len: *usize, connection: Connection) bool {
         return self.appendConnectionChecked(connections, len, connection, &.{});
     }
@@ -4538,6 +4769,8 @@ pub const State = struct {
         self.reconnecting_connection_end = endpoint;
         self.dragging_connection_from_id = null;
         self.dragging_connection_from_port = 0;
+        self.dragging_connection_to_id = null;
+        self.dragging_connection_to_port = 0;
         self.connection_preview_valid = true;
         self.dragging_canvas = false;
         self.dragging_node_id = null;
@@ -4731,6 +4964,16 @@ fn editorConnectionCutOptions(editor: anytype) ConnectionCutOptions {
     return if (@hasField(Editor, "connection_cut")) editor.connection_cut else .{};
 }
 
+fn editorConnectionSpawnOptions(editor: anytype) ConnectionSpawnOptions {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "connection_spawn")) editor.connection_spawn else .{};
+}
+
+fn editorTemplatePalette(editor: anytype) ?*TemplatePaletteState {
+    const Editor = @TypeOf(editor);
+    return if (@hasField(Editor, "template_palette")) editor.template_palette else null;
+}
+
 fn navigateEditorNodeSelection(rect: Rect, input: EventInputModifiers, editor: anytype, viewport_index: ?*ViewportIndex, direction: NodeNavigationDirection) bool {
     const options = editorSpatialNavigationOptions(editor);
     if (!options.enabled or input.control_down or input.super_down or input.alt_down) return false;
@@ -4798,7 +5041,7 @@ fn topologyDirectionForNavigation(flow_direction: ?graph_layout.LayeredLayoutDir
 fn editorDragAutoPanActive(editor: anytype) bool {
     return editor.state.dragging_node_id != null or editor.state.dragging_group_id != null or
         editor.state.resizing_group_id != null or editor.state.resizing_node_id != null or editor.state.dragging_connection_from_id != null or
-        editor.state.reconnecting_connection != null or editor.state.dragging_connection_waypoint != null or editor.state.connection_cut_stroke.active or editor.state.box_selecting;
+        editor.state.dragging_connection_to_id != null or editor.state.reconnecting_connection != null or editor.state.dragging_connection_waypoint != null or editor.state.connection_cut_stroke.active or editor.state.box_selecting;
 }
 
 fn editorDragAutoPanDelta(rect: Rect, editor: anytype, point: [2]f32) [2]f32 {
@@ -5216,6 +5459,13 @@ fn appendNodeEditorConnectionPreviewOverlay(allocator: std.mem.Allocator, out: *
             return;
         }
     }
+    if (editor.state.dragging_connection_to_id) |to_id| {
+        if (nodeById(editor.nodes, to_id)) |to| {
+            const preview_color = nodeEditorPreviewConnectionColor(editor);
+            try appendNodeEditorConnection(allocator, out, editorConnectionPathCache(editor), editor.state.connection_preview, inputPortPositionAt(rect, editor.state.*, to, editor.state.dragging_connection_to_port), preview_color, if (editor.state.connection_preview_valid) 2.0 else 2.8, layer);
+            return;
+        }
+    }
     if (editor.state.reconnecting_connection) |connection| {
         if (nodeById(editor.nodes, connection.from_id)) |from| {
             if (nodeById(editor.nodes, connection.to_id)) |to| {
@@ -5226,6 +5476,19 @@ fn appendNodeEditorConnectionPreviewOverlay(allocator: std.mem.Allocator, out: *
                 try appendNodeEditorConnection(allocator, out, editorConnectionPathCache(editor), start, end, nodeEditorPreviewConnectionColor(editor), if (editor.state.connection_preview_valid) 2.7 else 3.2, layer);
                 return;
             }
+        }
+    }
+    if (editor.state.connection_spawn_request) |request| {
+        if (nodeById(editor.nodes, request.node_id)) |node| {
+            const endpoint = if (request.existing_end == .from)
+                outputPortPositionAt(rect, editor.state.*, node, request.port_index)
+            else
+                inputPortPositionAt(rect, editor.state.*, node, request.port_index);
+            const target = graphToScreen(rect, editor.state.*, request.graph_pos);
+            const start = if (request.existing_end == .from) endpoint else target;
+            const end = if (request.existing_end == .from) target else endpoint;
+            try appendNodeEditorConnection(allocator, out, editorConnectionPathCache(editor), start, end, editor.selected_color.withAlpha(0.48), 1.5, layer);
+            return;
         }
     }
     try out.append(allocator, .{ .line = .{
@@ -5946,6 +6209,81 @@ fn dragPreviewCompatible(editor: anytype, input_hover: ?PortHit) bool {
     return connectionAllowed(editor.nodes, editorActiveConnections(editor), connection, editorConnectionPolicy(editor), .{});
 }
 
+fn reverseDragPreviewCompatible(editor: anytype, output_hover: ?PortHit) bool {
+    const to_id = editor.state.dragging_connection_to_id orelse return true;
+    const hit = output_hover orelse return true;
+    const from_id = editor.nodes[hit.node_index].id;
+    const connection = Connection{
+        .from_id = from_id,
+        .from_port = hit.port_index,
+        .to_id = to_id,
+        .to_port = editor.state.dragging_connection_to_port,
+    };
+    return connectionAllowed(editor.nodes, editorActiveConnections(editor), connection, editorConnectionPolicy(editor), .{});
+}
+
+fn beginDanglingConnectionSpawn(rect: Rect, editor: anytype, existing_end: ConnectionEnd, node_id: u32, port_index: u8, screen_pos: [2]f32) bool {
+    if (!editorConnectionSpawnOptions(editor).enabled or editor.mutable_nodes == null or editor.mutable_node_len == null or editor.mutable_connections == null or editor.mutable_connection_len == null) return false;
+    const node = nodeById(editor.nodes, node_id) orelse return false;
+    const port_type = if (existing_end == .from) outputPortType(node, port_index) else inputPortType(node, port_index);
+    const changed = editor.state.beginConnectionSpawn(.{
+        .existing_end = existing_end,
+        .node_id = node_id,
+        .port_index = port_index,
+        .port_type = port_type,
+        .graph_pos = screenToGraph(rect, editor.state.*, screen_pos),
+    });
+    if (changed) if (editorTemplatePalette(editor)) |palette| {
+        palette.openPalette();
+        palette.selected_index = 0;
+    };
+    return changed;
+}
+
+fn connectionSpawnDropIsEmpty(rect: Rect, editor: anytype, viewport_index: ?*ViewportIndex, point: [2]f32) bool {
+    if (!rect.contains(point)) return false;
+    if (inputPortAtEditorPoint(rect, editor, viewport_index, point) != null or
+        outputPortAtEditorPoint(rect, editor, viewport_index, point) != null or
+        nodeAtEditorPoint(rect, editor, viewport_index, point) != null or
+        groupAtEditorPoint(rect, editor, viewport_index, point) != null or
+        connectionAtEditorPoint(rect, editor, viewport_index, point) != null) return false;
+    if (editor.show_minimap and minimapSnapshotPrepared(rect, editor, viewport_index).contains(point)) return false;
+    return true;
+}
+
+pub fn commitConnectionSpawnWithHistory(editor: anytype, template: NodeTemplate) bool {
+    const nodes = editor.mutable_nodes orelse return false;
+    const node_len = editor.mutable_node_len orelse return false;
+    const connections = editor.mutable_connections orelse return false;
+    const connection_len = editor.mutable_connection_len orelse return false;
+    if (!editor.state.canCommitConnectionSpawn(nodes, node_len.*, connections, connection_len.*, template, editorConnectionPolicy(editor))) {
+        editor.state.connection_spawn_rejected_count +%= 1;
+        return false;
+    }
+    if (editor.history) |history| {
+        const group_len = if (editor.mutable_group_len) |len| @min(len.*, editor.groups.len) else editor.groups.len;
+        if (!history.supportsGraphCapacityWithSelections(
+            @min(node_len.*, nodes.len) + 1,
+            group_len,
+            @min(connection_len.*, connections.len) + 1,
+            @min(@as(usize, 1), editor.state.selected_node_ids.len),
+            0,
+        )) {
+            editor.state.connection_spawn_rejected_count +%= 1;
+            return false;
+        }
+    }
+    const history_mutation = beginEditorHistory(editor) orelse {
+        editor.state.connection_spawn_rejected_count +%= 1;
+        return false;
+    };
+    const changed = editor.state.commitConnectionSpawn(nodes, node_len, connections, connection_len, template, editorConnectionPolicy(editor));
+    if (!changed) return false;
+    invalidateEditorTopology(editor);
+    if (editorTemplatePalette(editor)) |palette| palette.close();
+    return finishEditorHistory(editor, history_mutation, true);
+}
+
 fn reconnectPreviewCompatible(editor: anytype, input_hover: ?PortHit, output_hover: ?PortHit) bool {
     const connection = editor.state.reconnecting_connection orelse return true;
     var replacement = connection;
@@ -6213,6 +6551,21 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 editor.state.connection_preview_valid = valid;
                 return valid_changed or panned or true;
             }
+            if (editor.state.dragging_connection_to_id != null) {
+                const output_before_pan = outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                const auto_pan_delta = if (output_before_pan == null)
+                    editorDragAutoPanDelta(rect, editor, .{ m.x, m.y })
+                else
+                    [2]f32{ 0, 0 };
+                const panned = applyEditorDragAutoPan(editor, auto_pan_delta);
+                editor.state.connection_preview = .{ m.x, m.y };
+                const output_hover = output_before_pan orelse outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                editor.state.hover_output_node_id = if (output_hover) |hit| editor.nodes[hit.node_index].id else null;
+                const valid = reverseDragPreviewCompatible(editor, output_hover);
+                const valid_changed = editor.state.connection_preview_valid != valid;
+                editor.state.connection_preview_valid = valid;
+                return valid_changed or panned or true;
+            }
             if (editor.state.dragging_node_id) |id| {
                 const auto_pan_delta = editorDragAutoPanDelta(rect, editor, .{ m.x, m.y });
                 const drag_delta = [2]f32{ m.dx - auto_pan_delta[0], m.dy - auto_pan_delta[1] };
@@ -6400,12 +6753,16 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             if (outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
                 editor.state.resizing_node_id = null;
                 editor.state.resizing_node_edges = .{};
-                editor.state.dragging_connection_from_id = editor.nodes[hit.node_index].id;
-                editor.state.dragging_connection_from_port = hit.port_index;
-                editor.state.connection_preview = .{ m.x, m.y };
-                editor.state.connection_preview_valid = true;
-                editor.state.pending_connection = null;
-                return true;
+                if (editorTemplatePalette(editor)) |palette| palette.close();
+                return editor.state.beginConnectionDragFromOutput(editor.nodes[hit.node_index].id, hit.port_index, .{ m.x, m.y });
+            }
+            if (editorConnectionSpawnOptions(editor).enabled) {
+                if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
+                    editor.state.resizing_node_id = null;
+                    editor.state.resizing_node_edges = .{};
+                    if (editorTemplatePalette(editor)) |palette| palette.close();
+                    return editor.state.beginConnectionDragToInput(editor.nodes[hit.node_index].id, hit.port_index, .{ m.x, m.y });
+                }
             }
             if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y }) == null) {
                 if (nodeResizeAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |hit| {
@@ -6521,7 +6878,9 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                 return changed;
             }
             if (editor.state.dragging_connection_from_id) |from_id| {
-                if (inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y })) |to_hit| {
+                var connected = false;
+                const input_hit = inputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                if (input_hit) |to_hit| {
                     const to_id = editor.nodes[to_hit.node_index].id;
                     if (from_id != to_id) {
                         const connection = Connection{ .from_id = from_id, .from_port = editor.state.dragging_connection_from_port, .to_id = to_id, .to_port = to_hit.port_index };
@@ -6539,6 +6898,7 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                                         if (beginEditorHistory(editor)) |history_mutation| {
                                             const changed = editor.state.appendConnectionWithPolicy(connections, len, connection, editor.nodes, editorConnectionPolicy(editor));
                                             if (changed) invalidateEditorTopology(editor);
+                                            connected = changed;
                                             _ = finishEditorHistory(editor, history_mutation, changed);
                                         }
                                     }
@@ -6553,9 +6913,39 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
                         }
                     }
                 }
-                editor.state.dragging_connection_from_id = null;
-                editor.state.dragging_connection_from_port = 0;
-                editor.state.connection_preview_valid = true;
+                if (!connected and input_hit == null and connectionSpawnDropIsEmpty(rect, editor, viewport_index, .{ m.x, m.y })) {
+                    if (!beginDanglingConnectionSpawn(rect, editor, .from, from_id, editor.state.dragging_connection_from_port, .{ m.x, m.y })) editor.state.finishConnectionDrag();
+                } else editor.state.finishConnectionDrag();
+                return true;
+            }
+            if (editor.state.dragging_connection_to_id) |to_id| {
+                var connected = false;
+                const output_hit = outputPortAtEditorPoint(rect, editor, viewport_index, .{ m.x, m.y });
+                if (output_hit) |from_hit| {
+                    const from_id = editor.nodes[from_hit.node_index].id;
+                    if (from_id != to_id) {
+                        const connection = Connection{ .from_id = from_id, .from_port = from_hit.port_index, .to_id = to_id, .to_port = editor.state.dragging_connection_to_port };
+                        if (editor.mutable_connections) |connections| if (editor.mutable_connection_len) |len| {
+                            const before_len = len.*;
+                            const active_connections = connections[0..@min(before_len, connections.len)];
+                            const can_append = before_len < connections.len and connectionAllowed(editor.nodes, active_connections, connection, editorConnectionPolicy(editor), .{});
+                            if (can_append) {
+                                const history_capacity_ok = if (editor.history) |history|
+                                    history.supportsGraphCapacityWithSelections(if (editor.mutable_node_len) |node_len| @min(node_len.*, editor.nodes.len) else editor.nodes.len, if (editor.mutable_group_len) |group_len| @min(group_len.*, editor.groups.len) else editor.groups.len, before_len + 1, editor.state.boundedSelectionLen(), @max(editor.state.boundedConnectionSelectionLen(), 1))
+                                else
+                                    true;
+                                if (history_capacity_ok) if (beginEditorHistory(editor)) |history_mutation| {
+                                    connected = editor.state.appendConnectionWithPolicy(connections, len, connection, editor.nodes, editorConnectionPolicy(editor));
+                                    if (connected) invalidateEditorTopology(editor);
+                                    _ = finishEditorHistory(editor, history_mutation, connected);
+                                };
+                            }
+                        };
+                    }
+                }
+                if (!connected and output_hit == null and connectionSpawnDropIsEmpty(rect, editor, viewport_index, .{ m.x, m.y })) {
+                    if (!beginDanglingConnectionSpawn(rect, editor, .to, to_id, editor.state.dragging_connection_to_port, .{ m.x, m.y })) editor.state.finishConnectionDrag();
+                } else editor.state.finishConnectionDrag();
                 return true;
             }
             if (editor.state.dragging_connection_waypoint != null) return editor.state.endDrag();
@@ -6569,10 +6959,19 @@ pub fn handleEditorEvent(rect: Rect, input: EventInputModifiers, editor: anytype
             if (!rect.contains(.{ p.x, p.y })) return false;
             return editor.state.zoomAt(rect, .{ p.x, p.y }, @floatCast(p.scale_delta));
         },
-        .pointer_capture_lost, .interaction_cancel, .focus_lost => return editor.state.cancelConnectionCut(),
+        .pointer_capture_lost, .interaction_cancel, .focus_lost => {
+            const changed = editor.state.cancelConnectionCut() or
+                editor.state.dragging_connection_from_id != null or editor.state.dragging_connection_to_id != null;
+            editor.state.finishConnectionDrag();
+            return changed;
+        },
         .key_down => |key| switch (key) {
             .escape => {
                 if (editor.state.connection_cut_stroke.active) return editor.state.cancelConnectionCut();
+                if (editor.state.connection_spawn_request != null) {
+                    if (editorTemplatePalette(editor)) |palette| palette.close();
+                    return editor.state.cancelConnectionSpawn();
+                }
                 return false;
             },
             .delete, .backspace => {
@@ -8231,4 +8630,147 @@ test "NodeEditor paint reuses connection path cache payload" {
     const summary = path_cache.summary();
     try std.testing.expect(summary.rebuild_count > 0);
     try std.testing.expect(summary.hit_count > 0);
+}
+
+test "NodeEditor connection spawn aligns deterministic ports in both directions" {
+    var selected: [4]u32 = .{0} ** 4;
+    var state = State{ .selected_node_ids = &selected };
+    var nodes: [4]Node = .{Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 4;
+    nodes[0] = .{
+        .id = 10,
+        .title = "Image Source",
+        .pos = .{ 0, 0 },
+        .output_types = &.{.image},
+    };
+    var node_len: usize = 1;
+    var connections: [4]Connection = .{Connection{ .from_id = 0, .to_id = 0 }} ** 4;
+    var connection_len: usize = 0;
+    const filter_template = NodeTemplate{
+        .title = "Filter",
+        .size = .{ .w = 180, .h = 96 },
+        .input_count = 3,
+        .input_types = &.{ .any, .color, .image },
+        .output_types = &.{.image},
+    };
+    const forward_drop = [2]f32{ 320, 140 };
+
+    try std.testing.expect(state.beginConnectionSpawn(.{
+        .existing_end = .from,
+        .node_id = 10,
+        .port_index = 0,
+        .port_type = .image,
+        .graph_pos = forward_drop,
+    }));
+    const forward_plan = state.planConnectionSpawn(&nodes, node_len, filter_template).?;
+    try std.testing.expectEqual(@as(u8, 2), forward_plan.new_port_index);
+    try std.testing.expectEqual(forward_drop, inputPortGraphPositionAt(forward_plan.node, forward_plan.new_port_index));
+    try std.testing.expectEqual(Connection{ .from_id = 10, .to_id = forward_plan.node.id, .to_port = 2 }, forward_plan.connection);
+
+    const forward = state.commitConnectionSpawnDetailed(&nodes, &node_len, &connections, &connection_len, filter_template, .strict_dataflow);
+    try std.testing.expect(forward.committed);
+    try std.testing.expectEqual(@as(usize, 2), node_len);
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(forward_drop, inputPortGraphPositionAt(nodes[1], 2));
+    try std.testing.expectEqual(@as(?u32, nodes[1].id), state.selected_node_id);
+    try std.testing.expectEqual(@as(?ConnectionSpawnRequest, null), state.connection_spawn_request);
+
+    var reverse_state = State{ .selected_node_ids = &selected };
+    var reverse_nodes: [3]Node = .{Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 3;
+    reverse_nodes[0] = .{
+        .id = 20,
+        .title = "Mask Sink",
+        .pos = .{ 420, 40 },
+        .input_types = &.{.mask},
+    };
+    var reverse_node_len: usize = 1;
+    var reverse_connections: [2]Connection = .{Connection{ .from_id = 0, .to_id = 0 }} ** 2;
+    var reverse_connection_len: usize = 0;
+    const producer_template = NodeTemplate{
+        .title = "Producer",
+        .size = .{ .w = 120, .h = 84 },
+        .output_count = 3,
+        .output_types = &.{ .any, .float, .image },
+    };
+    const reverse_drop = [2]f32{ 160, 90 };
+    try std.testing.expect(reverse_state.beginConnectionSpawn(.{
+        .existing_end = .to,
+        .node_id = 20,
+        .port_index = 0,
+        .port_type = .mask,
+        .graph_pos = reverse_drop,
+    }));
+    const reverse_plan = reverse_state.planConnectionSpawn(&reverse_nodes, reverse_node_len, producer_template).?;
+    try std.testing.expectEqual(@as(u8, 1), reverse_plan.new_port_index);
+    try std.testing.expectEqual(reverse_drop, outputPortGraphPositionAt(reverse_plan.node, reverse_plan.new_port_index));
+    try std.testing.expectEqual(Connection{ .from_id = reverse_plan.node.id, .from_port = 1, .to_id = 20 }, reverse_plan.connection);
+    try std.testing.expect(reverse_state.commitConnectionSpawn(&reverse_nodes, &reverse_node_len, &reverse_connections, &reverse_connection_len, producer_template, .strict_dataflow));
+    try std.testing.expectEqual(reverse_drop, outputPortGraphPositionAt(reverse_nodes[1], 1));
+    try std.testing.expectEqual(reverse_plan.connection, reverse_connections[0]);
+}
+
+test "NodeEditor connection spawn rejection preserves graph and request atomically" {
+    var selected: [2]u32 = .{0} ** 2;
+    var state = State{ .selected_node_ids = &selected };
+    var nodes = [_]Node{
+        .{ .id = 1, .title = "Source", .pos = .{ 0, 0 }, .output_types = &.{.image} },
+        .{ .id = 77, .title = "sentinel", .pos = .{ 11, 22 } },
+    };
+    var node_len: usize = 1;
+    var connections = [_]Connection{
+        .{ .from_id = 77, .to_id = 88 },
+        .{ .from_id = 99, .to_id = 100 },
+    };
+    var connection_len: usize = 0;
+    const nodes_before = nodes;
+    const connections_before = connections;
+    try std.testing.expect(state.beginConnectionSpawn(.{
+        .existing_end = .from,
+        .node_id = 1,
+        .port_index = 0,
+        .port_type = .image,
+        .graph_pos = .{ 200, 80 },
+    }));
+
+    const result = state.commitConnectionSpawnDetailed(
+        &nodes,
+        &node_len,
+        &connections,
+        &connection_len,
+        .{ .title = "Geometry Only", .input_types = &.{.geometry} },
+        .strict_dataflow,
+    );
+    try std.testing.expect(!result.committed);
+    try std.testing.expectEqual(@as(usize, 1), node_len);
+    try std.testing.expectEqual(@as(usize, 0), connection_len);
+    try std.testing.expect(std.meta.eql(nodes_before, nodes));
+    try std.testing.expect(std.meta.eql(connections_before, connections));
+    try std.testing.expect(state.connection_spawn_request != null);
+    try std.testing.expectEqual(@as(u64, 1), state.connection_spawn_rejected_count);
+}
+
+test "NodeEditor template palette filters and submits compatible spawn templates" {
+    const items = [_]TemplatePaletteItem{
+        .{ .label = "Image Input", .command = .insert_image_input, .template = .{ .title = "Image Input", .output_types = &.{.image} }, .accepts_incoming_spawn = false },
+        .{ .label = "Color Filter", .description = "image grade", .command = .insert_processing_node, .template = .{ .title = "Color Filter", .input_types = &.{.color}, .output_types = &.{.image} } },
+        .{ .label = "Generic Filter", .command = .insert_processing_node, .template = .{ .title = "Generic Filter", .input_types = &.{.any}, .output_types = &.{.any} } },
+        .{ .label = "Output", .command = .insert_output_node, .template = .{ .title = "Output", .input_types = &.{.image} }, .provides_outgoing_spawn = false },
+        .{ .label = "Command only", .command = .insert_processing_node },
+        .{ .label = "Chain", .command = .insert_processing_chain, .kind = .chain, .template = .{ .title = "Chain" } },
+    };
+    const forward = ConnectionSpawnRequest{ .existing_end = .from, .node_id = 1, .port_index = 0, .port_type = .image, .graph_pos = .{ 0, 0 } };
+    var palette = TemplatePaletteState{ .open = true };
+    try std.testing.expectEqual(@as(usize, 3), palette.matchCountForConnection(&items, forward));
+    try std.testing.expectEqualStrings("Color Filter", palette.selectedItemForConnection(&items, forward).?.label);
+    palette.moveSelectionForConnection(&items, 2, forward);
+    try std.testing.expectEqualStrings("Output", palette.selectedItemForConnection(&items, forward).?.label);
+    palette.setQuery("gen");
+    try std.testing.expectEqual(@as(usize, 1), palette.matchCountForConnection(&items, forward));
+    const submitted = palette.submitSelectedItemForConnection(&items, forward).?;
+    try std.testing.expectEqualStrings("Generic Filter", submitted.label);
+    try std.testing.expect(!palette.open);
+
+    const reverse = ConnectionSpawnRequest{ .existing_end = .to, .node_id = 2, .port_index = 0, .port_type = .image, .graph_pos = .{ 0, 0 } };
+    palette.setQuery("input");
+    try std.testing.expectEqual(@as(usize, 1), palette.matchCountForConnection(&items, reverse));
+    try std.testing.expectEqualStrings("Image Input", palette.selectedItemForConnection(&items, reverse).?.label);
 }

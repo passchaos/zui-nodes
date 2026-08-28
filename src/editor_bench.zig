@@ -12,6 +12,7 @@ const default_iterations: usize = 1000;
 const draw_command_capacity: usize = 16384;
 const input_labels = [_][]const u8{ "input", "mask" };
 const output_labels = [_][]const u8{ "value", "image" };
+const spawn_template_count: usize = 10_000;
 
 const Options = struct {
     iterations: usize = default_iterations,
@@ -20,6 +21,8 @@ const Options = struct {
     max_box_connection_ns: ?f64 = null,
     max_cut_preview_ns: ?f64 = null,
     max_navigation_ns: ?f64 = null,
+    max_spawn_filter_ns: ?f64 = null,
+    max_spawn_commit_ns: ?f64 = null,
 };
 
 const Report = struct {
@@ -50,6 +53,10 @@ const Report = struct {
     max_navigation_candidates: usize,
     topology_navigation_ns_per_iteration: f64,
     max_topology_navigation_candidates: usize,
+    spawn_template_count: usize,
+    spawn_compatible_template_count: usize,
+    spawn_filter_ns_per_iteration: f64,
+    spawn_commit_ns_per_iteration: f64,
     max_visible_nodes: usize,
     max_visible_connections: usize,
     max_draw_commands: usize,
@@ -579,6 +586,54 @@ fn run(init: std.process.Init, options: Options) !Report {
     const topology_navigation_correct = navigation_state.navigation_topology_hit_count == options.iterations and
         navigation_state.navigation_spatial_fallback_count == 0 and max_topology_navigation_candidates == 2 and
         navigation_topology.summary().rebuild_count == 1;
+
+    const compatible_template = node_editor.NodeTemplate{ .title = "Image Filter", .input_types = &.{.image}, .output_types = &.{.image} };
+    const incompatible_template = node_editor.NodeTemplate{ .title = "Geometry Filter", .input_types = &.{.geometry}, .output_types = &.{.geometry} };
+    const spawn_items = try allocator.alloc(node_editor.TemplatePaletteItem, spawn_template_count);
+    defer allocator.free(spawn_items);
+    for (spawn_items, 0..) |*item, index| item.* = .{
+        .label = "Template",
+        .command = .insert_processing_node,
+        .template = if (index & 1 == 0) compatible_template else incompatible_template,
+    };
+    const spawn_request = node_editor.ConnectionSpawnRequest{ .existing_end = .from, .node_id = nodes[node_count / 2].id, .port_index = 0, .port_type = .image, .graph_pos = .{ 160, 80 } };
+    var spawn_palette = node_editor.TemplatePaletteState{};
+    var spawn_filter_elapsed_ns: u64 = 0;
+    var spawn_compatible_template_count: usize = 0;
+    for (0..options.iterations) |_| {
+        const spawn_filter_started = std.Io.Clock.awake.now(init.io);
+        spawn_compatible_template_count = spawn_palette.matchCountForConnection(spawn_items, spawn_request);
+        spawn_filter_elapsed_ns += @intCast(spawn_filter_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+    }
+    const spawn_filter_ns_per_iteration = @as(f64, @floatFromInt(spawn_filter_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+
+    const spawn_nodes = try allocator.alloc(node_editor.Node, node_count + 1);
+    defer allocator.free(spawn_nodes);
+    @memcpy(spawn_nodes[0..node_count], nodes);
+    spawn_nodes[node_count / 2].output_types = &.{.image};
+    const spawn_connections = try allocator.alloc(node_editor.Connection, connection_count + 1);
+    defer allocator.free(spawn_connections);
+    @memcpy(spawn_connections[0..connection_count], connections);
+    var spawn_selected: [1]u32 = .{0};
+    var spawn_state = node_editor.State{ .selected_node_ids = &spawn_selected };
+    var spawn_node_len: usize = node_count;
+    var spawn_connection_len: usize = connection_count;
+    var spawn_commit_elapsed_ns: u64 = 0;
+    var spawn_commit_correct = true;
+    for (0..options.iterations) |_| {
+        spawn_node_len = node_count;
+        spawn_connection_len = connection_count;
+        _ = spawn_state.beginConnectionSpawn(spawn_request);
+        const spawn_commit_started = std.Io.Clock.awake.now(init.io);
+        const result = spawn_state.commitConnectionSpawnDetailed(spawn_nodes, &spawn_node_len, spawn_connections, &spawn_connection_len, compatible_template, .strict_dataflow);
+        spawn_commit_elapsed_ns += @intCast(spawn_commit_started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds());
+        spawn_commit_correct = spawn_commit_correct and result.committed and spawn_node_len == node_count + 1 and spawn_connection_len == connection_count + 1;
+        checksum = (checksum ^ @as(u64, result.node_id orelse 0)) *% 0x0000_0100_0000_01b3;
+    }
+    const spawn_commit_ns_per_iteration = @as(f64, @floatFromInt(spawn_commit_elapsed_ns)) / @as(f64, @floatFromInt(options.iterations));
+    const spawned_port = node_editor.inputPortGraphPositionAt(spawn_nodes[node_count], 0);
+    spawn_commit_correct = spawn_commit_correct and spawn_state.connection_spawn_commit_count == options.iterations and
+        @abs(spawned_port[0] - spawn_request.graph_pos[0]) <= 0.001 and @abs(spawned_port[1] - spawn_request.graph_pos[1]) <= 0.001;
     const quality_passed = connection_index == connection_count and routed_connection_count > 0 and paint_summary.valid and paint_summary.rebuild_count == 1 and
         paint_summary.node_count == node_count and
         max_visible_nodes > 0 and max_visible_nodes < node_count / 20 and
@@ -587,7 +642,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         draw_summary.frame_count == options.iterations * 2 + 2 and draw_summary.borrowed_connection_count == selected_paint_visible_connection_count and
         draw_summary.allocationFree() and owning_payload_count > 0 and paint_ns_per_frame <= owning_paint_ns_per_frame * 1.1 and
         overview_adaptive_commands * 3 < overview_full_commands and drag_correct and alignment_snap_count > 0 and distribution_correct and resize_correct and
-        selected_connection_correct and box_selection_correct and cut_correct and navigation_correct and topology_navigation_correct and checksum != 0;
+        selected_connection_correct and box_selection_correct and cut_correct and navigation_correct and topology_navigation_correct and
+        spawn_compatible_template_count == spawn_template_count / 2 and spawn_commit_correct and checksum != 0;
     const performance_passed = options.max_paint_ns == null or paint_ns_per_frame <= options.max_paint_ns.?;
     const drag_performance_passed = options.max_multi_drag_ns == null or
         (multi_drag_ns_per_iteration <= options.max_multi_drag_ns.? and node_resize_ns_per_iteration <= options.max_multi_drag_ns.? and distribution_snap_ns_per_iteration <= options.max_multi_drag_ns.? and
@@ -596,6 +652,8 @@ fn run(init: std.process.Init, options: Options) !Report {
     const cut_performance_passed = options.max_cut_preview_ns == null or cut_preview_ns_per_iteration <= options.max_cut_preview_ns.?;
     const navigation_performance_passed = options.max_navigation_ns == null or
         (navigation_ns_per_iteration <= options.max_navigation_ns.? and topology_navigation_ns_per_iteration <= options.max_navigation_ns.?);
+    const spawn_performance_passed = (options.max_spawn_filter_ns == null or spawn_filter_ns_per_iteration <= options.max_spawn_filter_ns.?) and
+        (options.max_spawn_commit_ns == null or spawn_commit_ns_per_iteration <= options.max_spawn_commit_ns.?);
     return .{
         .node_count = node_count,
         .connection_count = connection_count,
@@ -624,6 +682,10 @@ fn run(init: std.process.Init, options: Options) !Report {
         .max_navigation_candidates = max_navigation_candidates,
         .topology_navigation_ns_per_iteration = topology_navigation_ns_per_iteration,
         .max_topology_navigation_candidates = max_topology_navigation_candidates,
+        .spawn_template_count = spawn_template_count,
+        .spawn_compatible_template_count = spawn_compatible_template_count,
+        .spawn_filter_ns_per_iteration = spawn_filter_ns_per_iteration,
+        .spawn_commit_ns_per_iteration = spawn_commit_ns_per_iteration,
         .max_visible_nodes = max_visible_nodes,
         .max_visible_connections = max_visible_connections,
         .max_draw_commands = max_draw_commands,
@@ -634,8 +696,8 @@ fn run(init: std.process.Init, options: Options) !Report {
         .owning_payload_count = owning_payload_count,
         .checksum = checksum,
         .quality_passed = quality_passed,
-        .performance_passed = performance_passed and drag_performance_passed and box_performance_passed and cut_performance_passed and navigation_performance_passed,
-        .passed = quality_passed and performance_passed and drag_performance_passed and box_performance_passed and cut_performance_passed and navigation_performance_passed,
+        .performance_passed = performance_passed and drag_performance_passed and box_performance_passed and cut_performance_passed and navigation_performance_passed and spawn_performance_passed,
+        .passed = quality_passed and performance_passed and drag_performance_passed and box_performance_passed and cut_performance_passed and navigation_performance_passed and spawn_performance_passed,
     };
 }
 
@@ -657,6 +719,10 @@ fn parseOptions(init: std.process.Init) !Options {
             options.max_cut_preview_ns = try std.fmt.parseFloat(f64, arg["--max-cut-preview-ns=".len..])
         else if (std.mem.startsWith(u8, arg, "--max-navigation-ns="))
             options.max_navigation_ns = try std.fmt.parseFloat(f64, arg["--max-navigation-ns=".len..])
+        else if (std.mem.startsWith(u8, arg, "--max-spawn-filter-ns="))
+            options.max_spawn_filter_ns = try std.fmt.parseFloat(f64, arg["--max-spawn-filter-ns=".len..])
+        else if (std.mem.startsWith(u8, arg, "--max-spawn-commit-ns="))
+            options.max_spawn_commit_ns = try std.fmt.parseFloat(f64, arg["--max-spawn-commit-ns=".len..])
         else
             return error.InvalidArgument;
     }
@@ -673,8 +739,8 @@ fn printReport(io: std.Io, report: Report) !void {
         .{ report.node_count, report.collapsed_node_count, report.connection_count, report.routed_connection_count, report.iterations, report.paint_ns_per_frame, report.owning_paint_ns_per_frame, report.paint_speedup, report.multi_drag_selection_count, report.multi_drag_ns_per_iteration, report.node_resize_ns_per_iteration },
     );
     try stdout.print(
-        "alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns box_connections={d:.3}ns candidates={d} misses={d} cut_preview={d:.3}ns candidates={d} misses={d} navigation={d:.3}ns candidates={d} topology_navigation={d:.3}ns candidates={d} max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
-        .{ report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.box_connection_ns_per_iteration, report.max_box_connection_candidates, report.box_connection_candidate_misses, report.cut_preview_ns_per_iteration, report.max_cut_candidates, report.cut_candidate_misses, report.navigation_ns_per_iteration, report.max_navigation_candidates, report.topology_navigation_ns_per_iteration, report.max_topology_navigation_candidates, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
+        "alignment_snaps={d} distribution_snap={d}@{d:.3}ns connection_select={d} paint={d:.3}ns delete={d:.3}ns box_connections={d:.3}ns candidates={d} misses={d} cut_preview={d:.3}ns candidates={d} misses={d} navigation={d:.3}ns candidates={d} topology_navigation={d:.3}ns candidates={d} spawn_filter={d}/{d}@{d:.3}ns spawn_commit={d:.3}ns max_visible_nodes={d} max_visible_connections={d} max_draw_commands={d} overview_commands={d}/{d} allocations={d} owned_payloads={d} owning_payloads={d} checksum={d} passed={}\n",
+        .{ report.alignment_snap_count, report.distribution_snap_count, report.distribution_snap_ns_per_iteration, report.selected_connection_count, report.selected_connection_paint_ns_per_frame, report.selected_connection_delete_ns, report.box_connection_ns_per_iteration, report.max_box_connection_candidates, report.box_connection_candidate_misses, report.cut_preview_ns_per_iteration, report.max_cut_candidates, report.cut_candidate_misses, report.navigation_ns_per_iteration, report.max_navigation_candidates, report.topology_navigation_ns_per_iteration, report.max_topology_navigation_candidates, report.spawn_compatible_template_count, report.spawn_template_count, report.spawn_filter_ns_per_iteration, report.spawn_commit_ns_per_iteration, report.max_visible_nodes, report.max_visible_connections, report.max_draw_commands, report.overview_adaptive_commands, report.overview_full_commands, report.hot_path_allocations, report.owned_payload_count, report.owning_payload_count, report.checksum, report.passed },
     );
     try stdout.flush();
 }

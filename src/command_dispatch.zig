@@ -42,6 +42,33 @@ pub const CommandContext = struct {
     layout_options: graph_layout.LayeredLayoutOptions = .{},
 };
 
+pub fn commitConnectionSpawn(context: *CommandContext, template: node_editor.NodeTemplate) node_editor.ConnectionSpawnCommitResult {
+    const connection_len = context.connection_len orelse return .{};
+    const node_count = activeNodeCount(context);
+    const connection_count = activeConnectionCount(context);
+    if (!context.state.canCommitConnectionSpawn(context.nodes, node_count, context.connections, connection_count, template, context.connection_policy)) {
+        context.state.connection_spawn_rejected_count +%= 1;
+        return .{};
+    }
+    const group_count = activeGroupCount(context);
+    const selection_capacity = @min(@as(usize, 1), context.state.selected_node_ids.len);
+    if (context.history) |history| {
+        if (!history.supportsGraphCapacityWithSelections(node_count + 1, group_count, connection_count + 1, selection_capacity, 0)) {
+            context.state.connection_spawn_rejected_count +%= 1;
+            return .{};
+        }
+    }
+    const history_mutation = beginHistoryMutation(context) orelse {
+        context.state.connection_spawn_rejected_count +%= 1;
+        return .{};
+    };
+    const result = context.state.commitConnectionSpawnDetailed(context.nodes, context.node_len, context.connections, connection_len, template, context.connection_policy);
+    if (!result.committed) return .{};
+    if (!finishTopologyHistoryMutation(context, history_mutation, true)) return .{};
+    if (context.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
+    return result;
+}
+
 pub fn commandFromId(command_id: CommandId) ?NodeEditorCommand {
     if (command_id < commands.node_editor_command_id_base) return null;
     const raw = command_id - commands.node_editor_command_id_base;
@@ -1180,4 +1207,98 @@ test "zui-nodes cut tool command is opt in and toggleable" {
     try std.testing.expect(state.connection_cut_mode);
     try std.testing.expect(dispatch(&context, .toggle_connection_cut_mode));
     try std.testing.expect(!state.connection_cut_mode);
+}
+
+test "zui-nodes connection spawn commits node and link as one undo transaction" {
+    var selected_nodes: [4]u32 = .{0} ** 4;
+    var selected_connections: [4]node_editor.Connection = undefined;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes, .selected_connections = &selected_connections };
+    var nodes: [4]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 4;
+    nodes[0] = .{ .id = 10, .title = "Source", .pos = .{ 0, 0 }, .output_types = &.{.image} };
+    var node_len: usize = 1;
+    var connections: [4]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 4;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    var topology_storage = graph_topology.StaticWorkspace(nodes.len, connections.len){};
+    var topology = graph_topology.Index.init(topology_storage.workspace());
+    var viewport_storage = node_editor.StaticViewportWorkspace(nodes.len, 0, connections.len){};
+    var viewport_index = node_editor.ViewportIndex.init(viewport_storage.workspace());
+    try std.testing.expect(topology.ensure(nodes[0..node_len], connections[0..connection_len]).complete());
+    try std.testing.expect(viewport_index.prepare(nodes[0..node_len], &.{}, connections[0..connection_len], .{ .x = 0, .y = 0, .w = 320, .h = 200 }, .{ 0, 0 }, 1).ready);
+    try std.testing.expect(state.beginConnectionSpawn(.{
+        .existing_end = .from,
+        .node_id = 10,
+        .port_index = 0,
+        .port_type = .image,
+        .graph_pos = .{ 260, 96 },
+    }));
+    var context = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .history = &history,
+        .topology_index = &topology,
+        .viewport_index = &viewport_index,
+        .connection_policy = .strict_dataflow,
+    };
+    const template = node_editor.NodeTemplate{ .title = "Filter", .input_count = 2, .input_types = &.{ .any, .image }, .output_types = &.{.image} };
+
+    const result = commitConnectionSpawn(&context, template);
+    try std.testing.expect(result.committed);
+    try std.testing.expectEqual(@as(usize, 2), node_len);
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(@as(?u8, 1), result.new_port_index);
+    try std.testing.expectEqual(node_editor.Connection{ .from_id = 10, .to_id = nodes[1].id, .to_port = 1 }, connections[0]);
+    try std.testing.expectEqual(@as(usize, 1), history.undo_len);
+    try std.testing.expect(!topology.summary().valid);
+    try std.testing.expect(!viewport_index.summary().valid);
+
+    try std.testing.expect(dispatchHistory(&context, .undo));
+    try std.testing.expectEqual(@as(usize, 1), node_len);
+    try std.testing.expectEqual(@as(usize, 0), connection_len);
+    try std.testing.expect(dispatchHistory(&context, .redo));
+    try std.testing.expectEqual(@as(usize, 2), node_len);
+    try std.testing.expectEqual(@as(usize, 1), connection_len);
+    try std.testing.expectEqual(result.connection.?, connections[0]);
+}
+
+test "zui-nodes connection spawn rejects insufficient history capacity atomically" {
+    var selected_nodes: [20]u32 = .{0} ** 20;
+    var state = node_editor.State{ .selected_node_ids = &selected_nodes };
+    var nodes: [17]node_editor.Node = undefined;
+    for (&nodes, 0..) |*node, index| node.* = .{ .id = @intCast(index + 1), .title = "Node", .pos = .{ @floatFromInt(index), 0 }, .output_types = &.{.image} };
+    var node_len: usize = 16;
+    var connections: [2]node_editor.Connection = .{node_editor.Connection{ .from_id = 90, .to_id = 91 }} ** 2;
+    var connection_len: usize = 0;
+    var history = node_editor.History{};
+    try std.testing.expect(state.beginConnectionSpawn(.{
+        .existing_end = .from,
+        .node_id = 1,
+        .port_index = 0,
+        .port_type = .image,
+        .graph_pos = .{ 200, 80 },
+    }));
+    const nodes_before = nodes;
+    const connections_before = connections;
+    var context = CommandContext{
+        .state = &state,
+        .nodes = &nodes,
+        .node_len = &node_len,
+        .connections = &connections,
+        .connection_len = &connection_len,
+        .history = &history,
+        .connection_policy = .strict_dataflow,
+    };
+
+    const result = commitConnectionSpawn(&context, .{ .title = "Filter", .input_types = &.{.image} });
+    try std.testing.expect(!result.committed);
+    try std.testing.expectEqual(@as(usize, 16), node_len);
+    try std.testing.expectEqual(@as(usize, 0), connection_len);
+    try std.testing.expect(std.meta.eql(nodes_before, nodes));
+    try std.testing.expect(std.meta.eql(connections_before, connections));
+    try std.testing.expect(state.connection_spawn_request != null);
+    try std.testing.expectEqual(@as(u64, 1), state.connection_spawn_rejected_count);
+    try std.testing.expectEqual(@as(usize, 0), history.undo_len);
 }

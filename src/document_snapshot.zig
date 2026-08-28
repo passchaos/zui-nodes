@@ -230,6 +230,9 @@ pub fn applyDocumentSnapshot(options: ApplyOptions) !ApplyResult {
     options.state.spacing_guide_y = null;
     options.state.dragging_connection_from_id = null;
     options.state.dragging_connection_from_port = 0;
+    options.state.dragging_connection_to_id = null;
+    options.state.dragging_connection_to_port = 0;
+    options.state.connection_spawn_request = null;
     options.state.reconnecting_connection = null;
     options.state.resizing_node_id = null;
     options.state.resizing_node_edges = .{};

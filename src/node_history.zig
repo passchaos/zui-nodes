@@ -484,6 +484,11 @@ pub fn Types(comptime Node: type, comptime Group: type, comptime Connection: typ
             state.spacing_guide_y = null;
             state.dragging_connection_from_id = null;
             state.dragging_connection_from_port = 0;
+            if (comptime @hasField(@TypeOf(state.*), "dragging_connection_to_id")) {
+                state.dragging_connection_to_id = null;
+                state.dragging_connection_to_port = 0;
+                state.connection_spawn_request = null;
+            }
             state.reconnecting_connection = null;
             if (comptime @hasField(@TypeOf(state.*), "selected_connection_waypoint")) {
                 state.selected_connection_waypoint = null;

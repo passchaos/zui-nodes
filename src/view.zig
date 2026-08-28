@@ -106,6 +106,10 @@ pub const NodeEditorViewOptions = struct {
     /// Opt-in freehand link cutting. Applications activate the tool through
     /// `State.setConnectionCutMode` or the corresponding editor command.
     connection_cut: node_editor.ConnectionCutOptions = .{},
+    /// Opt-in type-filtered node creation after releasing a connection on
+    /// empty canvas. The host presents `template_palette`.
+    connection_spawn: node_editor.ConnectionSpawnOptions = .{},
+    template_palette: ?*node_editor.TemplatePaletteState = null,
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
     style: Style = .{},
@@ -156,6 +160,8 @@ const Binding = struct {
     node_resize: node_editor.NodeResizeOptions = .{},
     connection_reroute: node_editor.ConnectionRerouteOptions = .{},
     connection_cut: node_editor.ConnectionCutOptions = .{},
+    connection_spawn: node_editor.ConnectionSpawnOptions = .{},
+    template_palette: ?*node_editor.TemplatePaletteState = null,
     clipboard: ?*node_editor.Clipboard = null,
     connection_policy: node_editor.ConnectionPolicy = .default,
 
@@ -197,6 +203,8 @@ const Binding = struct {
             .node_resize = self.node_resize,
             .connection_reroute = self.connection_reroute,
             .connection_cut = self.connection_cut,
+            .connection_spawn = self.connection_spawn,
+            .template_palette = self.template_palette,
             .clipboard = self.clipboard,
             .connection_path_cache = self.connection_path_cache,
             .connection_draw_workspace = self.connection_draw_workspace,
@@ -256,6 +264,8 @@ pub fn nodeEditorView(ctx: *ViewContext, options: NodeEditorViewOptions) !*Eleme
         .node_resize = options.node_resize,
         .connection_reroute = options.connection_reroute,
         .connection_cut = options.connection_cut,
+        .connection_spawn = options.connection_spawn,
+        .template_palette = options.template_palette,
         .clipboard = options.clipboard,
         .connection_policy = options.connection_policy,
     };
@@ -344,6 +354,7 @@ const InteractionSnapshot = struct {
     node_collapse_mutation_count: u64 = 0,
     connection_reroute_mutation_count: u64 = 0,
     connection_cut_operation_count: u64 = 0,
+    connection_spawn_commit_count: u64 = 0,
     non_node_structural_drag: bool = false,
 
     fn capture(state: *const node_editor.State) InteractionSnapshot {
@@ -354,11 +365,13 @@ const InteractionSnapshot = struct {
             .node_collapse_mutation_count = state.node_collapse_mutation_count,
             .connection_reroute_mutation_count = state.connection_reroute_mutation_count,
             .connection_cut_operation_count = state.connection_cut_operation_count,
+            .connection_spawn_commit_count = state.connection_spawn_commit_count,
             .non_node_structural_drag = state.dragging_group_id != null or
                 state.resizing_group_id != null or
                 state.resizing_node_id != null or
                 state.resizing_group_edges.any() or
                 state.dragging_connection_from_id != null or
+                state.dragging_connection_to_id != null or
                 state.dragging_connection_waypoint != null or
                 state.reconnecting_connection != null,
         };
@@ -375,19 +388,21 @@ const InteractionSnapshot = struct {
             @abs(self.node_drag_applied_delta[1] - state.node_drag_applied_delta[1]) > 0.001 or
             self.node_collapse_mutation_count != state.node_collapse_mutation_count or
             self.connection_reroute_mutation_count != state.connection_reroute_mutation_count or
-            self.connection_cut_operation_count != state.connection_cut_operation_count;
+            self.connection_cut_operation_count != state.connection_cut_operation_count or
+            self.connection_spawn_commit_count != state.connection_spawn_commit_count;
     }
 };
 
 fn markCanvasInvalidation(binding: *Binding, rect: Rect, event: ElementEvent, before: InteractionSnapshot, changed: bool) void {
     if (!changed) return;
-    const connection_cut_changed = before.connection_cut_operation_count != binding.state.connection_cut_operation_count;
+    const topology_changed = before.connection_cut_operation_count != binding.state.connection_cut_operation_count or
+        before.connection_spawn_commit_count != binding.state.connection_spawn_commit_count;
     const geometry_changed = before.nodeGeometryChanged(binding.state) or before.non_node_structural_drag or
         binding.state.dragging_group_id != null or binding.state.resizing_group_id != null or binding.state.resizing_node_id != null or binding.state.reconnecting_connection != null;
     if (geometry_changed) {
         if (binding.viewport_index) |viewport_index| viewport_index.invalidateGeometry();
     }
-    if (connection_cut_changed) {
+    if (topology_changed) {
         if (binding.topology_index) |topology_index| topology_index.invalidate();
     }
     const canvas_state = binding.canvas_state orelse return;
@@ -1369,6 +1384,123 @@ test "node editor view creates connections from output to input ports" {
     try std.testing.expectEqual(@as(usize, 1), connection_len);
     try std.testing.expectEqual(node_editor.Connection{ .from_id = 1, .to_id = 2 }, connections[0]);
     try std.testing.expectEqual(@as(?node_editor.Connection, connections[0]), state.selected_connection);
+}
+
+test "node editor view opens typed spawn palette from either dangling endpoint" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 420, .h = 260 };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes: [4]node_editor.Node = .{node_editor.Node{ .id = 0, .title = "", .pos = .{ 0, 0 } }} ** 4;
+    nodes[0] = .{
+        .id = 1,
+        .title = "Typed",
+        .pos = .{ -100, -40 },
+        .input_types = &.{.mask},
+        .output_types = &.{.image},
+    };
+    var node_len: usize = 1;
+    var connections: [4]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 4;
+    var connection_len: usize = 0;
+    var palette = node_editor.TemplatePaletteState{};
+    var view = try zui.View.init(std.testing.allocator, viewport, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = viewport.w, .h = viewport.h } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9442,
+        .state = &state,
+        .nodes = nodes[0..node_len],
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .connection_spawn = .{ .enabled = true },
+        .template_palette = &palette,
+        .show_minimap = false,
+        .style = .{ .width = .{ .px = viewport.w }, .height = .{ .px = viewport.h } },
+    });
+    editor_node.rect = viewport;
+    const output = node_editor.outputPortPosition(viewport, state, nodes[0]);
+    const forward_drop = [2]f32{ 385, 220 };
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = output[0], .y = output[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var move = ElementEvent{ .mouse_move = .{ .x = forward_drop[0], .y = forward_drop[1], .dx = forward_drop[0] - output[0], .dy = forward_drop[1] - output[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = forward_drop[0], .y = forward_drop[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    const forward = state.connection_spawn_request.?;
+    try std.testing.expectEqual(node_editor.ConnectionEnd.from, forward.existing_end);
+    try std.testing.expectEqual(node_editor.PortType.image, forward.port_type);
+    try std.testing.expectEqual(node_editor.screenToGraph(viewport, state, forward_drop), forward.graph_pos);
+    try std.testing.expect(palette.open);
+    try std.testing.expectEqual(@as(usize, 0), connection_len);
+
+    try std.testing.expect(state.cancelConnectionSpawn());
+    palette.close();
+    const input = node_editor.inputPortPosition(viewport, state, nodes[0]);
+    const reverse_drop = [2]f32{ 28, 220 };
+    down = .{ .mouse_down = .{ .button = .left, .x = input[0], .y = input[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    move = .{ .mouse_move = .{ .x = reverse_drop[0], .y = reverse_drop[1], .dx = reverse_drop[0] - input[0], .dy = reverse_drop[1] - input[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &move, editor_node.paint_user_data));
+    up = .{ .mouse_up = .{ .button = .left, .x = reverse_drop[0], .y = reverse_drop[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    const reverse = state.connection_spawn_request.?;
+    try std.testing.expectEqual(node_editor.ConnectionEnd.to, reverse.existing_end);
+    try std.testing.expectEqual(node_editor.PortType.mask, reverse.port_type);
+    try std.testing.expectEqual(node_editor.screenToGraph(viewport, state, reverse_drop), reverse.graph_pos);
+    try std.testing.expect(palette.open);
+    try std.testing.expectEqual(@as(u64, 2), state.connection_spawn_request_count);
+    var escape = ElementEvent{ .key_down = .escape };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &escape, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?node_editor.ConnectionSpawnRequest, null), state.connection_spawn_request);
+    try std.testing.expect(!palette.open);
+}
+
+test "node editor view does not spawn when dropped on an incompatible port" {
+    const viewport = Rect{ .x = 0, .y = 0, .w = 420, .h = 240 };
+    var selected: [4]u32 = .{0} ** 4;
+    var state = node_editor.State{ .selected_node_ids = &selected };
+    var nodes = [_]node_editor.Node{
+        .{ .id = 1, .title = "Image", .pos = .{ -150, -30 }, .size = .{ .w = 90, .h = 60 }, .output_types = &.{.image} },
+        .{ .id = 2, .title = "Geometry", .pos = .{ 80, -30 }, .size = .{ .w = 90, .h = 60 }, .input_types = &.{.geometry} },
+    };
+    var node_len: usize = nodes.len;
+    var connections: [2]node_editor.Connection = .{node_editor.Connection{ .from_id = 0, .to_id = 0 }} ** 2;
+    var connection_len: usize = 0;
+    var palette = node_editor.TemplatePaletteState{};
+    var view = try zui.View.init(std.testing.allocator, viewport, 0);
+    defer view.deinit();
+    var ctx = ViewContext{ .allocator = view.arena.allocator(), .view = &view, .constraints = .{ .min = .{ .w = 0, .h = 0 }, .max = .{ .w = viewport.w, .h = viewport.h } }, .user = null };
+    const editor_node = try nodeEditorView(&ctx, .{
+        .tag = 9443,
+        .state = &state,
+        .nodes = &nodes,
+        .mutable_nodes = &nodes,
+        .mutable_node_len = &node_len,
+        .mutable_connections = &connections,
+        .mutable_connection_len = &connection_len,
+        .connection_spawn = .{ .enabled = true },
+        .template_palette = &palette,
+        .show_minimap = false,
+    });
+    editor_node.rect = viewport;
+    const output = node_editor.outputPortPosition(viewport, state, nodes[0]);
+    const input = node_editor.inputPortPosition(viewport, state, nodes[1]);
+    var down = ElementEvent{ .mouse_down = .{ .button = .left, .x = output[0], .y = output[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    var up = ElementEvent{ .mouse_up = .{ .button = .left, .x = input[0], .y = input[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(usize, 0), connection_len);
+    try std.testing.expectEqual(@as(?node_editor.ConnectionSpawnRequest, null), state.connection_spawn_request);
+    try std.testing.expect(!palette.open);
+
+    const body = node_editor.nodeRectFromState(viewport, state, nodes[1]);
+    down = .{ .mouse_down = .{ .button = .left, .x = output[0], .y = output[1] } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &down, editor_node.paint_user_data));
+    up = .{ .mouse_up = .{ .button = .left, .x = body.x + body.w * 0.5, .y = body.y + body.h * 0.5 } };
+    try std.testing.expect(nodeEditorViewEvent(editor_node, &up, editor_node.paint_user_data));
+    try std.testing.expectEqual(@as(?node_editor.ConnectionSpawnRequest, null), state.connection_spawn_request);
+    try std.testing.expect(!palette.open);
 }
 
 test "node editor view shift-click toggles multiple connections and paints all selected" {
